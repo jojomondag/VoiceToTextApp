@@ -7,9 +7,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 
 # ---------------------------------------------------------------------------
-# whisper.cpp  (with CUDA / GPU support)
+# whisper.cpp  (with optional CUDA / GPU support)
 # ---------------------------------------------------------------------------
-set(GGML_CUDA ON CACHE BOOL "Enable CUDA support for whisper.cpp" FORCE)
+option(VTT_CUDA "Enable CUDA GPU acceleration" OFF)
+if(VTT_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "Enable CUDA support for whisper.cpp" FORCE)
+else()
+    set(GGML_CUDA OFF CACHE BOOL "Enable CUDA support for whisper.cpp" FORCE)
+endif()
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
@@ -23,7 +28,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(whisper)
 
 # ---------------------------------------------------------------------------
-# miniaudio  (single-header library)
+# miniaudio  (single-header library -- only need the header, not its build)
 # ---------------------------------------------------------------------------
 FetchContent_Declare(
     miniaudio
@@ -31,10 +36,10 @@ FetchContent_Declare(
     GIT_TAG        master
     GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(miniaudio)
+FetchContent_Populate(miniaudio)
 
-add_library(miniaudio INTERFACE)
-target_include_directories(miniaudio INTERFACE ${miniaudio_SOURCE_DIR})
+add_library(miniaudio_header INTERFACE)
+target_include_directories(miniaudio_header INTERFACE ${miniaudio_SOURCE_DIR})
 
 # ---------------------------------------------------------------------------
 # nlohmann/json
@@ -74,7 +79,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     whisper
-    miniaudio
+    miniaudio_header
     nlohmann_json::nlohmann_json
     user32
     shell32

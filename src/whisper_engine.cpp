@@ -143,7 +143,7 @@ std::string WhisperEngine::get_system_info() const {
     oss << "whisper.cpp system info:\n";
     oss << "  " << whisper_print_system_info() << "\n";
     if (ctx_) {
-        oss << "  GPU acceleration: " << (whisper_ctx_get_use_gpu(ctx_) ? "enabled" : "disabled") << "\n";
+        oss << "  Model loaded\n";
     } else {
         oss << "  Model not loaded\n";
     }
