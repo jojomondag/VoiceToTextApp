@@ -1,0 +1,17 @@
+{
+    "model_path": "models/ggml-model-q5_0.bin",
+    "language": "sv",
+    "use_gpu": true,
+    "n_threads": 4,
+    "audio_device": "",
+    "vad_threshold": 0.01,
+    "silence_duration_ms": 1500,
+    "speech_min_duration_ms": 200,
+    "toggle_key": 32,
+    "cancel_key": 27,
+    "injection_method": "auto",
+    "keystroke_delay_ms": 5,
+    "show_overlay": true,
+    "start_minimized": true,
+    "auto_start": false
+}

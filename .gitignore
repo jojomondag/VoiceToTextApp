@@ -1,0 +1,41 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+x64/
+Debug/
+Release/
+
+# Models (large binary files)
+models/*.bin
+models/*.ggml
+
+# IDE files
+.vs/
+.vscode/
+*.sln
+*.vcxproj*
+*.user
+.idea/
+
+# Compiled files
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Config (may contain user preferences)
+config.json
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Third party fetched content
+third_party/
+_deps/
