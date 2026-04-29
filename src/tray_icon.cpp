@@ -8,6 +8,7 @@
 #define IDM_LANGUAGE  40002
 #define IDM_SETTINGS  40003
 #define IDM_QUIT      40004
+#define IDM_HISTORY   40005
 
 namespace vtt {
 
@@ -230,6 +231,7 @@ void TrayIcon::show_context_menu() {
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_LANGUAGE, L"Switch Language");
+    AppendMenuW(menu, MF_STRING, IDM_HISTORY, L"History...");
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_QUIT, L"Quit");
@@ -255,6 +257,9 @@ void TrayIcon::show_context_menu() {
             break;
         case IDM_LANGUAGE:
             callback_(TrayAction::SwitchLanguage);
+            break;
+        case IDM_HISTORY:
+            callback_(TrayAction::OpenHistory);
             break;
         case IDM_SETTINGS:
             callback_(TrayAction::OpenSettings);

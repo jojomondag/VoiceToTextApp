@@ -11,6 +11,7 @@ Inspired by [Wispr Flow](https://wisprflow.ai) - designed for dictating thoughts
 - **KB-Whisper Swedish** - State-of-the-art Swedish speech recognition (47% lower error rate than OpenAI Whisper)
 - **Multi-language** - Swedish, English, and auto-detect. Switch with Ctrl+Shift+L
 - **Works Everywhere** - Transcribed text is injected into any focused application via clipboard/keystrokes
+- **Optional LM Studio cleanup** - Send the finished transcription through a local OpenAI-compatible LM Studio model before insertion
 - **Press-to-Talk** - Hold Ctrl+Shift+Space to record, release to transcribe
 - **Voice Activity Detection** - Energy-based VAD with configurable thresholds
 - **System Tray** - Runs quietly in the background with status notifications
@@ -98,9 +99,27 @@ Edit `config.json` (created automatically next to the executable):
     "speech_min_duration_ms": 200,
     "injection_method": "auto",
     "keystroke_delay_ms": 5,
+    "llm_cleanup_enabled": false,
+    "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+    "llm_model": "local-model",
+    "llm_pre_prompt": "Du städar upp dikterade instruktioner innan de skickas till en AI-kodmodell. Rätta transkriberingsfel, fel ord som tydligt inte passar i sammanhanget, skiljetecken, versaler, grammatik och struktur. Gör texten tydlig, konkret och lätt för en kodmodell att agera på. Använd kodkontext när det är uppenbart, till exempel LM Studio, app.cpp, C++, CMake, PowerShell, JSON, API, endpoint och config. Bevara användarens avsikt, språk, ton, namn, sökvägar, kommandon, kodidentifierare, siffror och tekniska termer. Lägg inte till nya krav, antaganden eller förklaringar. Svara endast med den städade instruktionen.",
+    "llm_timeout_ms": 30000,
+    "llm_max_tokens": 4096,
+    "llm_corrections_enabled": true,
+    "llm_corrections_path": "transcription_corrections.json",
+    "llm_corrections_max_entries": 200,
+    "llm_corrections_prompt_limit": 20,
+    "llm_corrections_min_count": 1,
+    "llm_ai_language_enabled": true,
+    "llm_ai_language_prompt": "Skapa en ultrakompakt AI-läsbar instruktionsdialekt från användarens städade instruktion. Komprimera aggressivt men bevara avsikt, krav, begränsningar, entiteter, kodnamn, sökvägar, siffror och åtgärdsordning. Identifiera och ta bort upprepningar, utfyllnad och otydlighet. Strukturera tätt med etiketter som Goal, Context, Tasks, Constraints och Output när det hjälper. Använd förkortningar bara när en kodmodell entydigt förstår dem. Lägg inte till nya krav eller antaganden. Svara endast med AI-språkversionen.",
+    "llm_intent_profiles_enabled": true,
+    "llm_intent_detection_prompt": "Identifiera användarens avsikt från texten och välj exakt en profil: coding, email, discussion, translation eller general. Svara endast med strikt JSON: {\"profile\":\"coding|email|discussion|translation|general\"}.",
+    "llm_profile_transform_prompt": "Transformera texten enligt vald profil. coding: gör texten konkret, åtgärdsbar och tydlig för en kodmodell. email: gör den till ett tydligt mailutkast med passande ton. Lägg inte till placeholders, signatur eller ämnesrad om användaren inte bad om det. discussion: bevara samtalston och gör resonemanget klart. translation: översätt eller förbered översättning enligt användarens begäran och bevara betydelsen. general: städa texten utan särskild formatering. Lägg inte till nya krav. Svara endast med den transformerade texten.",
     "show_overlay": true,
     "start_minimized": true,
-    "auto_start": false
+    "auto_start": false,
+    "transcript_history_path": "transcript_history.json",
+    "transcript_history_max_entries": 100
 }
 ```
 
@@ -112,6 +131,41 @@ Edit `config.json` (created automatically next to the executable):
 - **`n_threads`** - CPU threads for inference (when using CPU)
 - **`vad_threshold`** - Voice activity detection sensitivity (lower = more sensitive)
 - **`injection_method`** - `"auto"`, `"clipboard"`, or `"keystrokes"`
+- **`llm_cleanup_enabled`** - `true` to clean transcription text through LM Studio before insertion
+- **`llm_endpoint`** - LM Studio OpenAI-compatible chat completions URL, usually `http://127.0.0.1:1234/v1/chat/completions`
+- **`llm_model`** - Model identifier shown by LM Studio for your loaded Gemma model
+- **`llm_pre_prompt`** - Instruction that tells the local LLM how to clean dictated text before insertion
+- **`llm_timeout_ms`** - How long to wait for cleanup before falling back to raw transcription
+- **`llm_corrections_enabled`** - `true` to learn recurring raw-to-cleaned transcription corrections
+- **`llm_corrections_path`** - JSON file where learned corrections are stored next to the executable
+- **`llm_corrections_prompt_limit`** - Maximum learned corrections included in each LM Studio prompt
+- **`llm_ai_language_enabled`** - `true` to generate a third compact AI-readable history version
+- **`llm_ai_language_prompt`** - Prompt used to compress cleaned text into AI Language
+- **`llm_intent_profiles_enabled`** - `true` to auto-detect intent and apply a profile during cleanup
+- **`llm_intent_detection_prompt`** - Prompt used for the second pass that classifies the user's intent
+- **`llm_profile_transform_prompt`** - Prompt used for the third pass that transforms text according to the detected profile
+- **`transcript_history_path`** - JSON file where raw and cleaned transcription history is stored
+- **`transcript_history_max_entries`** - Maximum number of history entries kept for the History window
+
+### LM Studio cleanup
+
+1. Start LM Studio and load your Gemma model.
+2. Open the Local Server tab and start the OpenAI-compatible server on port `1234`.
+3. In `config.json` next to `VoiceToText.exe`, set:
+
+```json
+{
+    "llm_cleanup_enabled": true,
+    "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+    "llm_model": "local-model",
+    "llm_pre_prompt": "Du städar upp dikterade instruktioner innan de skickas till en AI-kodmodell. Rätta transkriberingsfel, fel ord som tydligt inte passar i sammanhanget, skiljetecken, versaler, grammatik och struktur. Gör texten tydlig, konkret och lätt för en kodmodell att agera på. Använd kodkontext när det är uppenbart, till exempel LM Studio, app.cpp, C++, CMake, PowerShell, JSON, API, endpoint och config. Bevara användarens avsikt, språk, ton, namn, sökvägar, kommandon, kodidentifierare, siffror och tekniska termer. Lägg inte till nya krav, antaganden eller förklaringar. Svara endast med den städade instruktionen.",
+    "llm_corrections_enabled": true,
+    "llm_corrections_path": "transcription_corrections.json",
+    "llm_ai_language_enabled": true
+}
+```
+
+If LM Studio is not running or the request fails, VoiceToText writes the raw Whisper transcription instead.
 
 ## How It Works
 
@@ -119,7 +173,9 @@ Edit `config.json` (created automatically next to the executable):
 2. **Speak naturally** → Audio is captured at 16kHz from your microphone
 3. **Press Ctrl+Shift+Space again** → Recording stops, overlay shows yellow "Processing..."
 4. **Whisper processes audio** → KB-Whisper model runs inference on your GPU
-5. **Text is injected** → Transcribed text appears in whatever application has focus
+5. **Optional LM Studio cleanup** → Text is polished locally through your loaded model
+6. **Optional AI Language pass** → A compact model-readable version is stored in history
+7. **Text is injected** → Transcribed text appears in whatever application has focus
 
 ## Architecture
 

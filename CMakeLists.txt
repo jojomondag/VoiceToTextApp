@@ -64,6 +64,10 @@ set(SOURCES
     src/audio_capture.cpp
     src/hotkey_manager.cpp
     src/text_injector.cpp
+    src/llm_cleaner.cpp
+    src/correction_store.cpp
+    src/transcript_history.cpp
+    src/history_window.cpp
     src/overlay_window.cpp
     src/config_manager.cpp
     src/tray_icon.cpp
@@ -82,6 +86,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     miniaudio_header
     nlohmann_json::nlohmann_json
     user32
+    winhttp
     shell32
     ole32
     winmm

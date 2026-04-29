@@ -14,6 +14,10 @@
 #include "overlay_window.h"
 #include "tray_icon.h"
 #include "config_manager.h"
+#include "llm_cleaner.h"
+#include "correction_store.h"
+#include "transcript_history.h"
+#include "history_window.h"
 
 namespace vtt {
 
@@ -54,6 +58,10 @@ private:
     std::unique_ptr<TextInjector> injector_;
     std::unique_ptr<OverlayWindow> overlay_;
     std::unique_ptr<TrayIcon> tray_;
+    std::unique_ptr<LlmCleaner> llm_cleaner_;
+    std::unique_ptr<CorrectionStore> correction_store_;
+    std::unique_ptr<TranscriptHistory> transcript_history_;
+    std::unique_ptr<HistoryWindow> history_window_;
 
     // State
     HWND hwnd_ = nullptr;

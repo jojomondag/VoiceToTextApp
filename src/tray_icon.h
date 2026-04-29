@@ -8,6 +8,7 @@ namespace vtt {
 enum class TrayAction {
     ToggleRecording,
     OpenSettings,
+    OpenHistory,
     SwitchLanguage,
     Quit
 };

@@ -5,6 +5,8 @@ cmake-build-*/
 x64/
 Debug/
 Release/
+build_log.txt
+nul
 
 # Models (large binary files)
 models/*.bin

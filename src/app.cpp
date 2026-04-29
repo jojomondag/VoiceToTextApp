@@ -1,9 +1,57 @@
 #include "app.h"
 #include <sstream>
+#include <cmath>
+#include <cctype>
+#include <cstdio>
+#include <chrono>
+#include <mutex>
+#include <filesystem>
 
 #define WM_TRAYICON (WM_APP + 1)
 
 static const wchar_t* APP_CLASS_NAME = L"VoiceToTextMainWindow";
+
+namespace {
+// Diagnostic logging — writes to voicetotext.log next to the exe so the user
+// can see recording/transcription flow even when launched detached from a
+// console. Thread-safe.
+std::mutex g_log_mutex;
+FILE* g_log_file = nullptr;
+
+FILE* log_file() {
+    if (!g_log_file) {
+        char exe_path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+        std::string log_path(exe_path);
+        auto pos = log_path.find_last_of("\\/");
+        if (pos != std::string::npos) log_path = log_path.substr(0, pos + 1);
+        log_path += "voicetotext.log";
+        g_log_file = fopen(log_path.c_str(), "a");
+    }
+    return g_log_file;
+}
+
+void vtlog(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    FILE* f = log_file();
+    if (!f) return;
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()).count() % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+    localtime_s(&tm_buf, &t);
+    fprintf(f, "[%02d:%02d:%02d.%03lld] ",
+            tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+            static_cast<long long>(ms));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+}
+}  // anon namespace
 
 namespace vtt {
 
@@ -95,11 +143,12 @@ bool App::initialize(HINSTANCE hInstance) {
         on_hotkey(action);
     });
 
-    // Register hotkeys from config
+    // Register hotkeys from config.
+    // NOTE: CancelRecording (ESC by default) is registered *only* while
+    // recording is active. A bare-ESC global hotkey would otherwise swallow
+    // every ESC press system-wide and break the key in other applications.
     hotkeys_->register_hotkey(HotkeyAction::ToggleRecording,
                               cfg.toggle_modifiers, cfg.toggle_key);
-    hotkeys_->register_hotkey(HotkeyAction::CancelRecording,
-                              cfg.cancel_modifiers, cfg.cancel_key);
     hotkeys_->register_hotkey(HotkeyAction::SwitchLanguage,
                               MOD_CONTROL | MOD_SHIFT, 'L');
 
@@ -109,13 +158,48 @@ bool App::initialize(HINSTANCE hInstance) {
     injector_->set_method(cfg.injection_method);
     injector_->set_keystroke_delay_ms(cfg.keystroke_delay_ms);
 
-    // --- 8. Initialize overlay ---
+    // --- 8. Initialize local LLM cleanup ---
+    llm_cleaner_ = std::make_unique<LlmCleaner>();
+    llm_cleaner_->configure({
+        cfg.llm_cleanup_enabled,
+        cfg.llm_endpoint,
+        cfg.llm_model,
+        cfg.llm_pre_prompt,
+        cfg.llm_timeout_ms,
+        cfg.llm_max_tokens,
+        cfg.llm_intent_profiles_enabled,
+        cfg.llm_intent_detection_prompt,
+        cfg.llm_profile_transform_prompt,
+    });
+
+    correction_store_ = std::make_unique<CorrectionStore>();
+    std::filesystem::path correction_path(cfg.llm_corrections_path);
+    if (correction_path.is_relative()) {
+        correction_path = std::filesystem::path(config_->get_config_path())
+                              .parent_path() / correction_path;
+    }
+    correction_store_->initialize(correction_path.string(),
+                                  cfg.llm_corrections_max_entries);
+
+    transcript_history_ = std::make_unique<TranscriptHistory>();
+    std::filesystem::path history_path(cfg.transcript_history_path);
+    if (history_path.is_relative()) {
+        history_path = std::filesystem::path(config_->get_config_path())
+                           .parent_path() / history_path;
+    }
+    transcript_history_->initialize(history_path.string(),
+                                    cfg.transcript_history_max_entries);
+
+    history_window_ = std::make_unique<HistoryWindow>();
+    history_window_->initialize(hInstance_, transcript_history_.get());
+
+    // --- 9. Initialize overlay ---
     overlay_ = std::make_unique<OverlayWindow>();
     if (cfg.show_overlay) {
         overlay_->initialize(hInstance_);
     }
 
-    // --- 9. Initialize system tray ---
+    // --- 10. Initialize system tray ---
     tray_ = std::make_unique<TrayIcon>();
     if (!tray_->initialize(hwnd_, hInstance_)) {
         MessageBoxW(nullptr, L"Failed to create system tray icon.",
@@ -171,6 +255,7 @@ void App::shutdown() {
     }
 
     if (tray_) tray_->shutdown();
+    if (history_window_) history_window_->shutdown();
     if (overlay_) overlay_->shutdown();
     if (hotkeys_) hotkeys_->shutdown();
     if (injector_) injector_->shutdown();
@@ -220,10 +305,12 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 void App::on_hotkey(HotkeyAction action) {
+    vtlog("on_hotkey: action=%d recording=%d processing=%d",
+          static_cast<int>(action), recording_.load(), processing_.load());
     switch (action) {
         case HotkeyAction::ToggleRecording:
             if (processing_.load()) {
-                // Currently processing, ignore
+                vtlog("on_hotkey: ignored (processing in progress)");
                 break;
             }
             if (recording_.load()) {
@@ -265,6 +352,12 @@ void App::on_tray_action(TrayAction action) {
             on_hotkey(HotkeyAction::OpenSettings);
             break;
 
+        case TrayAction::OpenHistory:
+            if (history_window_) {
+                history_window_->show();
+            }
+            break;
+
         case TrayAction::Quit:
             if (recording_.load()) {
                 cancel_recording();
@@ -275,17 +368,30 @@ void App::on_tray_action(TrayAction action) {
 }
 
 void App::start_recording() {
-    if (recording_.load() || processing_.load()) return;
+    vtlog("start_recording: enter (recording=%d processing=%d)",
+          recording_.load(), processing_.load());
+    if (recording_.load() || processing_.load()) {
+        vtlog("start_recording: early-exit (already active)");
+        return;
+    }
 
     vad_->reset();
 
-    if (!audio_->start_recording()) {
+    bool audio_ok = audio_->start_recording();
+    vtlog("start_recording: audio_->start_recording() returned %d", audio_ok);
+    if (!audio_ok) {
         if (overlay_) overlay_->show(OverlayState::Error, "Mic error");
         tray_->show_notification("VoiceToText", "Failed to start recording. Check microphone.");
         return;
     }
 
     recording_ = true;
+
+    // Register the cancel hotkey only while recording, so a bare ESC binding
+    // does not block the ESC key in other applications.
+    const auto& cfg = config_->config();
+    hotkeys_->register_hotkey(HotkeyAction::CancelRecording,
+                              cfg.cancel_modifiers, cfg.cancel_key);
 
     if (overlay_) overlay_->show(OverlayState::Listening);
     if (tray_) tray_->set_recording(true);
@@ -303,9 +409,14 @@ void App::start_recording() {
 }
 
 void App::stop_recording() {
-    if (!recording_.load()) return;
+    vtlog("stop_recording: enter");
+    if (!recording_.load()) {
+        vtlog("stop_recording: early-exit (not recording)");
+        return;
+    }
 
     recording_ = false;
+    hotkeys_->unregister_hotkey(HotkeyAction::CancelRecording);
     audio_->stop_recording();
 
     if (overlay_) overlay_->show(OverlayState::Processing);
@@ -327,6 +438,7 @@ void App::cancel_recording() {
     if (!recording_.load()) return;
 
     recording_ = false;
+    hotkeys_->unregister_hotkey(HotkeyAction::CancelRecording);
     audio_->stop_recording();
 
     // Discard the audio buffer
@@ -339,27 +451,123 @@ void App::cancel_recording() {
 }
 
 void App::process_audio() {
+    vtlog("process_audio: enter");
+
     // Get all recorded audio
     std::vector<float> audio_data = audio_->get_audio_buffer();
+    vtlog("process_audio: audio buffer size = %zu samples (%.2f s @16kHz)",
+          audio_data.size(), audio_data.size() / 16000.0);
 
     if (audio_data.empty()) {
+        vtlog("process_audio: BUFFER EMPTY -- audio capture produced no samples");
         if (overlay_) overlay_->hide();
         return;
     }
 
     // Check minimum audio length (at least 0.5 seconds at 16kHz)
     if (audio_data.size() < 8000) {
+        vtlog("process_audio: too short (<0.5s), aborting");
         if (overlay_) overlay_->hide();
         tray_->set_tooltip("VoiceToText - Too short");
         return;
     }
 
-    // Run transcription
-    TranscriptionResult result = engine_->transcribe(audio_data);
+    // Check if the audio has enough energy (skip if it's basically silence)
+    {
+        float sum_sq = 0.0f;
+        for (float s : audio_data) {
+            sum_sq += s * s;
+        }
+        float rms = std::sqrt(sum_sq / static_cast<float>(audio_data.size()));
+        vtlog("process_audio: RMS=%.6f (threshold 0.0005)", rms);
+        if (rms < 0.0005f) {
+            vtlog("process_audio: silence detected, aborting");
+            if (overlay_) overlay_->hide();
+            tray_->set_tooltip("VoiceToText - No speech detected");
+            return;
+        }
+    }
 
-    if (overlay_) overlay_->hide();
+    // Run transcription
+    vtlog("process_audio: calling whisper transcribe...");
+    TranscriptionResult result = engine_->transcribe(audio_data);
+    vtlog("process_audio: transcribe returned, text length = %zu", result.text.size());
+
+    // Filter out common whisper hallucinations on silence/noise
+    {
+        std::string t = result.text;
+        // Strip whitespace and punctuation for comparison
+        std::string stripped;
+        for (char c : t) {
+            if (!std::isspace(static_cast<unsigned char>(c)) &&
+                c != '.' && c != ',' && c != '!' && c != '?' &&
+                c != '-' && c != '*' && c != '[' && c != ']' &&
+                c != '(' && c != ')') {
+                stripped += std::tolower(static_cast<unsigned char>(c));
+            }
+        }
+        if (stripped.empty() || stripped == "blank" ||
+            stripped == "blankaudio" || stripped == "silence" ||
+            stripped == "inaudible" || stripped == "music" ||
+            stripped == "applause" || stripped == "thankyou" ||
+            stripped == "youtu" || stripped == "subscribenow" ||
+            stripped == "thanksfowatching" || stripped == "thankyouforwatching") {
+            result.text.clear();
+        }
+    }
 
     if (!result.text.empty()) {
+        std::string recorded_text = result.text;
+        std::string ai_language_text;
+        std::string intent_profile = "general";
+
+        if (config_->config().llm_cleanup_enabled && llm_cleaner_) {
+            vtlog("process_audio: calling LM Studio profile + transform passes...");
+            std::string learned_corrections;
+            if (config_->config().llm_corrections_enabled && correction_store_) {
+                learned_corrections = correction_store_->build_prompt_block(
+                    config_->config().llm_corrections_prompt_limit,
+                    config_->config().llm_corrections_min_count);
+            }
+
+            LlmProfileResult profile_result;
+            if (llm_cleaner_->clean_text_with_profile(result.text,
+                                                      learned_corrections,
+                                                      profile_result)) {
+                vtlog("process_audio: transform succeeded, profile=%s, text length = %zu",
+                      profile_result.profile.c_str(), profile_result.text.size());
+                result.text = profile_result.text;
+                intent_profile = profile_result.profile;
+                if (config_->config().llm_corrections_enabled &&
+                    correction_store_) {
+                    correction_store_->learn_from(recorded_text,
+                                                  profile_result.text);
+                }
+            } else {
+                vtlog("process_audio: cleanup failed, using raw transcription");
+            }
+        }
+
+        if (config_->config().llm_cleanup_enabled &&
+            config_->config().llm_ai_language_enabled && llm_cleaner_) {
+            vtlog("process_audio: calling AI language transform...");
+            if (llm_cleaner_->transform_text(result.text,
+                                            config_->config().llm_ai_language_prompt,
+                                            ai_language_text)) {
+                vtlog("process_audio: AI language succeeded, text length = %zu",
+                      ai_language_text.size());
+            } else {
+                vtlog("process_audio: AI language failed");
+            }
+        }
+
+        if (transcript_history_) {
+            transcript_history_->append(recorded_text, result.text,
+                                        ai_language_text, intent_profile);
+        }
+
+        if (overlay_) overlay_->hide();
+        vtlog("process_audio: injecting text: \"%s\"", result.text.c_str());
         // Small delay to let the user release the hotkey
         Sleep(100);
 
@@ -372,8 +580,11 @@ void App::process_audio() {
         if (result.text.size() > 50) oss << "...";
         tray_->set_tooltip(oss.str());
     } else {
+        if (overlay_) overlay_->hide();
+        vtlog("process_audio: transcription text was empty (or filtered)");
         tray_->set_tooltip("VoiceToText - No speech detected");
     }
+    vtlog("process_audio: exit");
 }
 
 void App::switch_language() {

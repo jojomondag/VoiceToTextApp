@@ -21,14 +21,18 @@ if (-not (Test-Path $modelsDir)) {
 
 $baseUrl = "https://huggingface.co/KBLab/kb-whisper-$Size/resolve/main"
 
+# Remote (HuggingFace) filenames are the same across sizes; we rename on disk
+# to include the size so multiple variants can coexist in models/.
 if ($Quantized) {
-    $fileName = "ggml-model-q5_0.bin"
+    $remoteName = "ggml-model-q5_0.bin"
+    $localName  = "ggml-model-$Size-q5_0.bin"
 } else {
-    $fileName = "ggml-model.bin"
+    $remoteName = "ggml-model.bin"
+    $localName  = "ggml-model-$Size.bin"
 }
 
-$url = "$baseUrl/$fileName"
-$outputPath = Join-Path $modelsDir $fileName
+$url = "$baseUrl/$remoteName"
+$outputPath = Join-Path $modelsDir $localName
 
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host " VoiceToText - KB-Whisper Model Downloader" -ForegroundColor Cyan
