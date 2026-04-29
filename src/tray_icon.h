@@ -36,11 +36,13 @@ private:
     HICON create_color_icon(COLORREF color);
 
     HWND hwnd_ = nullptr;
+    HWND menu_hwnd_ = nullptr;
     HINSTANCE hInstance_ = nullptr;
     NOTIFYICONDATAW nid_ = {};
     TrayCallback callback_;
     bool recording_ = false;
     bool initialized_ = false;
+    bool menu_open_ = false;
     HICON icon_idle_ = nullptr;
     HICON icon_recording_ = nullptr;
 };

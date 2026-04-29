@@ -24,6 +24,7 @@ public:
                 const std::string& transcribed,
                 const std::string& ai_language,
                 const std::string& intent_profile);
+    void clear();
 
     std::string format_recorded() const;
     std::string format_transcribed() const;

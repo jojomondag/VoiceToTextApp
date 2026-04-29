@@ -52,10 +52,12 @@ int estimate_token_count(const std::string& text) {
 void append_entry_text(std::ostringstream& oss,
                        const TranscriptHistoryEntry& entry,
                        const std::string& text,
+                       int display_index,
                        int token_count) {
+    oss << "[[VTT_ENTRY_BEGIN:" << display_index << "]]";
     oss << "[" << entry.timestamp << "]    Profile: " << entry.intent_profile
         << "    Tokens: " << token_count << "\r\n";
-    oss << text << "\r\n\r\n";
+    oss << text << "[[VTT_ENTRY_END:" << display_index << "]]\r\n\r\n";
 }
 
 } // namespace
@@ -92,11 +94,19 @@ void TranscriptHistory::append(const std::string& recorded,
     save_locked();
 }
 
+void TranscriptHistory::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.clear();
+    save_locked();
+}
+
 std::string TranscriptHistory::format_recorded() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream oss;
+    int display_index = 0;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-        append_entry_text(oss, *it, it->recorded, it->recorded_tokens);
+        append_entry_text(oss, *it, it->recorded, display_index++,
+                          it->recorded_tokens);
     }
     return oss.str();
 }
@@ -104,8 +114,10 @@ std::string TranscriptHistory::format_recorded() const {
 std::string TranscriptHistory::format_transcribed() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream oss;
+    int display_index = 0;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-        append_entry_text(oss, *it, it->transcribed, it->transcribed_tokens);
+        append_entry_text(oss, *it, it->transcribed, display_index++,
+                          it->transcribed_tokens);
     }
     return oss.str();
 }
@@ -113,8 +125,10 @@ std::string TranscriptHistory::format_transcribed() const {
 std::string TranscriptHistory::format_ai_language() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream oss;
+    int display_index = 0;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-        append_entry_text(oss, *it, it->ai_language, it->ai_language_tokens);
+        append_entry_text(oss, *it, it->ai_language, display_index++,
+                          it->ai_language_tokens);
     }
     return oss.str();
 }

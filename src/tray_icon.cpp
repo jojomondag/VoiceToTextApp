@@ -97,6 +97,13 @@ bool TrayIcon::initialize(HWND hwnd, HINSTANCE hInstance) {
 
     hwnd_ = hwnd;
     hInstance_ = hInstance;
+    menu_hwnd_ = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        L"STATIC",
+        L"VoiceToTextMenuOwner",
+        WS_POPUP,
+        0, 0, 0, 0,
+        nullptr, nullptr, hInstance_, nullptr);
 
     // Create icons: green for idle, red for recording
     icon_idle_ = create_color_icon(RGB(80, 180, 80));
@@ -135,6 +142,11 @@ void TrayIcon::shutdown() {
     if (!initialized_) return;
 
     Shell_NotifyIconW(NIM_DELETE, &nid_);
+
+    if (menu_hwnd_) {
+        DestroyWindow(menu_hwnd_);
+        menu_hwnd_ = nullptr;
+    }
 
     if (icon_idle_ && icon_idle_ != LoadIcon(nullptr, IDI_APPLICATION)) {
         DestroyIcon(icon_idle_);
@@ -209,6 +221,10 @@ void TrayIcon::handle_message(WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU:
+        case NIN_KEYSELECT:
+            if (menu_open_) {
+                break;
+            }
             show_context_menu();
             break;
         case WM_LBUTTONDBLCLK:
@@ -220,8 +236,13 @@ void TrayIcon::handle_message(WPARAM wParam, LPARAM lParam) {
 }
 
 void TrayIcon::show_context_menu() {
+    menu_open_ = true;
+
     HMENU menu = CreatePopupMenu();
-    if (!menu) return;
+    if (!menu) {
+        menu_open_ = false;
+        return;
+    }
 
     if (recording_) {
         AppendMenuW(menu, MF_STRING, IDM_TOGGLE, L"Stop Recording");
@@ -237,17 +258,19 @@ void TrayIcon::show_context_menu() {
     AppendMenuW(menu, MF_STRING, IDM_QUIT, L"Quit");
 
     // Required for menu to work correctly from tray
-    SetForegroundWindow(hwnd_);
+    HWND owner = menu_hwnd_ ? menu_hwnd_ : hwnd_;
+    SetForegroundWindow(owner);
 
     POINT pt;
     GetCursorPos(&pt);
-    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
-                               pt.x, pt.y, 0, hwnd_, nullptr);
+    UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                               pt.x, pt.y, 0, owner, nullptr);
 
     DestroyMenu(menu);
+    menu_open_ = false;
 
     // Post a dummy message so the menu dismisses properly
-    PostMessage(hwnd_, WM_NULL, 0, 0);
+    PostMessage(owner, WM_NULL, 0, 0);
 
     if (!callback_) return;
 

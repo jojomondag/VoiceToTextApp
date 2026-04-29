@@ -257,17 +257,29 @@ bool LlmCleaner::transform_text_with_profile(
     const std::string& profile,
     std::string& output) const {
     std::string selected_profile = is_valid_profile(profile) ? profile : "general";
-    std::string system_prompt = config_.pre_prompt;
-    if (!learned_corrections.empty()) {
-        system_prompt += "\n\n";
-        system_prompt += learned_corrections;
-    }
-    system_prompt += "\n\nSelected profile: ";
-    system_prompt += selected_profile;
-    system_prompt += "\n\n";
-    system_prompt += config_.profile_transform_prompt;
 
-    return request_completion(input, system_prompt, output);
+    // Step 1 — pre-prompt cleanup: fix transcription mistakes, punctuation,
+    // casing, grammar, and structure on the raw dictated text. Learned
+    // corrections (per-user vocabulary) ride along with the cleanup role
+    // since both operate at the lexical/grammar layer.
+    std::string cleanup_prompt = config_.pre_prompt;
+    if (!learned_corrections.empty()) {
+        cleanup_prompt += "\n\n";
+        cleanup_prompt += learned_corrections;
+    }
+
+    std::string cleaned;
+    if (!request_completion(input, cleanup_prompt, cleaned)) return false;
+
+    // Step 2 — role transform: feed the cleaned text into the per-profile
+    // rewrite role. Kept as a separate LLM call so each prompt has a single
+    // narrow responsibility and can be edited in isolation.
+    std::string transform_prompt = "Selected profile: ";
+    transform_prompt += selected_profile;
+    transform_prompt += "\n\n";
+    transform_prompt += config_.profile_transform_prompt;
+
+    return request_completion(cleaned, transform_prompt, output);
 }
 
 bool LlmCleaner::transform_text(const std::string& input,

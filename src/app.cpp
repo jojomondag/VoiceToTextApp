@@ -8,6 +8,7 @@
 #include <filesystem>
 
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_OPEN_HISTORY (WM_APP + 2)
 
 static const wchar_t* APP_CLASS_NAME = L"VoiceToTextMainWindow";
 
@@ -191,7 +192,8 @@ bool App::initialize(HINSTANCE hInstance) {
                                     cfg.transcript_history_max_entries);
 
     history_window_ = std::make_unique<HistoryWindow>();
-    history_window_->initialize(hInstance_, transcript_history_.get());
+    history_window_->initialize(hInstance_, transcript_history_.get(),
+                                config_.get());
 
     // --- 9. Initialize overlay ---
     overlay_ = std::make_unique<OverlayWindow>();
@@ -296,6 +298,12 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
 
+        case WM_OPEN_HISTORY:
+            if (self->history_window_) {
+                self->history_window_->show();
+            }
+            return 0;
+
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -353,9 +361,7 @@ void App::on_tray_action(TrayAction action) {
             break;
 
         case TrayAction::OpenHistory:
-            if (history_window_) {
-                history_window_->show();
-            }
+            PostMessage(hwnd_, WM_OPEN_HISTORY, 0, 0);
             break;
 
         case TrayAction::Quit:
