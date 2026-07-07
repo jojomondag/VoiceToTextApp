@@ -29,6 +29,7 @@ public:
     bool select_device(const std::string& device_id); // empty = default
 
     // Recording control
+    bool prepare_device();
     bool start_recording();
     void stop_recording();
     bool is_recording() const;

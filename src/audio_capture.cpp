@@ -19,10 +19,53 @@ struct AudioCapture::Impl {
 
     AudioCallback callback;
     std::mutex callback_mutex;
+    std::atomic<bool> has_callback{false};
 
     std::atomic<float> audio_level{0.0f};
 
     std::string selected_device_id;
+
+    bool initialize_device() {
+        if (device_initialized) return true;
+
+        ma_device_config config = ma_device_config_init(ma_device_type_capture);
+        config.capture.format = ma_format_f32;
+        config.capture.channels = 1;
+        config.sampleRate = 16000;
+        config.dataCallback = Impl::data_callback;
+        config.pUserData = this;
+
+        // If a specific device was selected, look it up.
+        ma_device_id* target_device_id = nullptr;
+        ma_device_info* capture_infos = nullptr;
+        ma_uint32 capture_count = 0;
+
+        if (!selected_device_id.empty()) {
+            ma_result res = ma_context_get_devices(&context, nullptr, nullptr,
+                                                    &capture_infos, &capture_count);
+            if (res == MA_SUCCESS) {
+                try {
+                    int idx = std::stoi(selected_device_id);
+                    if (idx >= 0 && static_cast<ma_uint32>(idx) < capture_count) {
+                        target_device_id = &capture_infos[idx].id;
+                    }
+                } catch (...) {
+                    target_device_id = nullptr;
+                }
+            }
+        }
+
+        if (target_device_id) {
+            config.capture.pDeviceID = target_device_id;
+        }
+
+        ma_result result = ma_device_init(&context, &config, &device);
+        if (result != MA_SUCCESS) {
+            return false;
+        }
+        device_initialized = true;
+        return true;
+    }
 
     static void data_callback(ma_device* device, void* output, const void* input,
                               ma_uint32 frame_count) {
@@ -51,7 +94,7 @@ struct AudioCapture::Impl {
         }
 
         // Fire callback with the chunk
-        {
+        if (self->has_callback.load()) {
             std::lock_guard<std::mutex> lock(self->callback_mutex);
             if (self->callback) {
                 std::vector<float> chunk(samples, samples + frame_count);
@@ -129,57 +172,29 @@ bool AudioCapture::select_device(const std::string& device_id) {
     return true;
 }
 
+bool AudioCapture::prepare_device() {
+    if (!impl_->context_initialized) return false;
+    if (impl_->recording.load()) return true;
+    return impl_->initialize_device();
+}
+
 bool AudioCapture::start_recording() {
     if (!impl_->context_initialized) return false;
     if (impl_->recording.load()) return true;
 
-    // Tear down existing device if any
-    if (impl_->device_initialized) {
-        ma_device_uninit(&impl_->device);
-        impl_->device_initialized = false;
-    }
-
-    ma_device_config config = ma_device_config_init(ma_device_type_capture);
-    config.capture.format = ma_format_f32;
-    config.capture.channels = 1;
-    config.sampleRate = 16000;
-    config.dataCallback = Impl::data_callback;
-    config.pUserData = impl_.get();
-
-    // If a specific device was selected, look it up
-    ma_device_id* target_device_id = nullptr;
-    ma_device_info* capture_infos = nullptr;
-    ma_uint32 capture_count = 0;
-
-    if (!impl_->selected_device_id.empty()) {
-        ma_result res = ma_context_get_devices(&impl_->context, nullptr, nullptr,
-                                                &capture_infos, &capture_count);
-        if (res == MA_SUCCESS) {
-            int idx = std::stoi(impl_->selected_device_id);
-            if (idx >= 0 && static_cast<ma_uint32>(idx) < capture_count) {
-                target_device_id = &capture_infos[idx].id;
-            }
-        }
-    }
-
-    if (target_device_id) {
-        config.capture.pDeviceID = target_device_id;
-    }
-
-    ma_result result = ma_device_init(&impl_->context, &config, &impl_->device);
-    if (result != MA_SUCCESS) {
+    if (!impl_->initialize_device()) {
         return false;
     }
-    impl_->device_initialized = true;
 
     // Clear the buffer before starting
     {
         std::lock_guard<std::mutex> lock(impl_->buffer_mutex);
         impl_->buffer.clear();
+        impl_->buffer.reserve(16000 * 180);
     }
     impl_->audio_level.store(0.0f);
 
-    result = ma_device_start(&impl_->device);
+    ma_result result = ma_device_start(&impl_->device);
     if (result != MA_SUCCESS) {
         ma_device_uninit(&impl_->device);
         impl_->device_initialized = false;
@@ -214,6 +229,7 @@ std::vector<float> AudioCapture::get_audio_buffer() {
 void AudioCapture::set_audio_callback(AudioCallback callback) {
     std::lock_guard<std::mutex> lock(impl_->callback_mutex);
     impl_->callback = std::move(callback);
+    impl_->has_callback.store(static_cast<bool>(impl_->callback));
 }
 
 float AudioCapture::get_audio_level() const {

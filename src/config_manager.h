@@ -1,22 +1,36 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <nlohmann/json.hpp>
 #include <windows.h>
 
 namespace vtt {
 
+struct ProfileDefinition {
+    std::string name;
+    std::string instructions;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(ProfileDefinition,
+        name, instructions)
+};
+
 struct AppConfig {
     // Model settings
-    std::string model_path = "models/ggml-model-q5_0.bin";
+    std::string model_path = "models/ggml-model-large-q5_0.bin";
     std::string language = "sv";         // "sv", "en", "auto"
     bool use_gpu = true;
-    int n_threads = 4;
+    std::string compute_mode = "auto";   // "auto", "gpu", "cpu"
+    int n_threads = 0;                    // 0 = auto
+    bool whisper_fast_mode = true;
+    bool warm_up_model_on_load = true;
 
     // Audio settings
     std::string audio_device = "";       // empty = default
     float vad_threshold = 0.01f;
     int silence_duration_ms = 1500;
     int speech_min_duration_ms = 200;
+    bool trim_silence_before_transcription = true;
+    int trim_silence_padding_ms = 250;
 
     // Hotkey settings (stored as virtual key codes + modifiers)
     unsigned int toggle_modifiers = MOD_CONTROL | MOD_SHIFT;
@@ -27,6 +41,7 @@ struct AppConfig {
     // Text injection
     std::string injection_method = "auto"; // "auto", "clipboard", "keystrokes"
     int keystroke_delay_ms = 5;
+    int pre_injection_delay_ms = 25;
 
     // Local LLM cleanup (LM Studio OpenAI-compatible server)
     bool llm_cleanup_enabled = false;
@@ -60,20 +75,39 @@ struct AppConfig {
         "not add new requirements. Return only the AI-language version.";
     bool llm_intent_profiles_enabled = true;
     std::string llm_intent_detection_prompt =
-        "Identifiera användarens avsikt från texten och välj exakt en profil: "
+        u8"Identifiera anv\u00E4ndarens avsikt fr\u00E5n texten och v\u00E4lj exakt en profil: "
         "coding, email, discussion, translation eller general. Svara endast "
         "med strikt JSON: "
         "{\"profile\":\"coding|email|discussion|translation|general\"}.";
     std::string llm_profile_transform_prompt =
-        "Transformera texten enligt vald profil. coding: gör texten konkret, "
-        "åtgärdsbar och tydlig för en kodmodell. email: gör den till ett "
-        "tydligt mailutkast med passande ton. Lägg inte till placeholders, "
-        "signatur eller ämnesrad om användaren inte bad om det. discussion: "
-        "bevara samtalston och gör resonemanget "
-        "klart. translation: översätt eller förbered översättning enligt "
-        "användarens begäran och bevara betydelsen. general: städa texten utan "
-        "särskild formatering. Lägg inte till nya krav. Svara endast med den "
-        "transformerade texten.";
+        u8"Transformera texten enligt vald profil. F\u00F6lj profilens egna "
+        u8"instruktioner noggrant, bevara anv\u00E4ndarens avsikt och l\u00E4gg inte "
+        u8"till nya krav. Svara endast med den transformerade texten.";
+    std::vector<ProfileDefinition> llm_profiles = {
+        {
+            "coding",
+            u8"G\u00F6r texten konkret, \u00E5tg\u00E4rdsbar och tydlig f\u00F6r en kodmodell."
+        },
+        {
+            "email",
+            u8"G\u00F6r texten till ett tydligt mailutkast med passande ton. "
+            u8"L\u00E4gg inte till placeholders, signatur eller \u00E4mnesrad om "
+            u8"anv\u00E4ndaren inte bad om det."
+        },
+        {
+            "discussion",
+            u8"Bevara samtalston och g\u00F6r resonemanget klart."
+        },
+        {
+            "translation",
+            u8"\u00D6vers\u00E4tt eller f\u00F6rbered \u00F6vers\u00E4ttning enligt anv\u00E4ndarens "
+            u8"beg\u00E4ran och bevara betydelsen."
+        },
+        {
+            "general",
+            u8"St\u00E4da texten utan s\u00E4rskild formatering."
+        },
+    };
 
     // UI
     bool show_overlay = true;
@@ -84,17 +118,19 @@ struct AppConfig {
 
     // Serialize most fields automatically; modifiers handled separately
     NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(AppConfig,
-        model_path, language, use_gpu, n_threads,
+        model_path, language, use_gpu, compute_mode, n_threads,
+        whisper_fast_mode, warm_up_model_on_load,
         audio_device, vad_threshold, silence_duration_ms, speech_min_duration_ms,
+        trim_silence_before_transcription, trim_silence_padding_ms,
         toggle_key, cancel_key,
-        injection_method, keystroke_delay_ms,
+        injection_method, keystroke_delay_ms, pre_injection_delay_ms,
         llm_cleanup_enabled, llm_endpoint, llm_model, llm_pre_prompt,
         llm_timeout_ms, llm_max_tokens, llm_corrections_enabled,
         llm_corrections_path, llm_corrections_max_entries,
         llm_corrections_prompt_limit, llm_corrections_min_count,
         llm_ai_language_enabled, llm_ai_language_prompt,
         llm_intent_profiles_enabled, llm_intent_detection_prompt,
-        llm_profile_transform_prompt,
+        llm_profile_transform_prompt, llm_profiles,
         show_overlay, start_minimized, auto_start,
         transcript_history_path, transcript_history_max_entries)
 };

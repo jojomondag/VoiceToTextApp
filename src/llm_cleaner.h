@@ -1,8 +1,14 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace vtt {
+
+struct LlmProfileDefinition {
+    std::string name;
+    std::string instructions;
+};
 
 struct LlmCleanerConfig {
     bool enabled = false;
@@ -35,6 +41,13 @@ struct LlmCleanerConfig {
         "translation according to the user's request; preserve meaning and "
         "target language. general: clean without special formatting. Preserve "
         "intent and do not add new requirements. Return only the transformed text.";
+    std::vector<LlmProfileDefinition> profiles = {
+        {"coding", "Make it precise, actionable, and implementation-ready for a coding model."},
+        {"email", "Format it as a clear email draft with appropriate tone."},
+        {"discussion", "Preserve conversational nuance and make the point clear."},
+        {"translation", "Translate or prepare translation according to the user's request."},
+        {"general", "Clean without special formatting."},
+    };
 };
 
 struct LlmProfileResult {

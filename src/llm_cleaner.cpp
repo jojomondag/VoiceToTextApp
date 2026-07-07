@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iterator>
+#include <sstream>
 #include <vector>
 
 namespace vtt {
@@ -115,7 +116,43 @@ bool parse_cleaned_text(const std::string& response, std::string& output) {
     }
 }
 
+const LlmProfileDefinition* find_profile(
+    const std::vector<LlmProfileDefinition>& profiles,
+    const std::string& name) {
+    for (const auto& profile : profiles) {
+        if (profile.name == name) return &profile;
+    }
+    return nullptr;
+}
+
+std::string fallback_profile_name(
+    const std::vector<LlmProfileDefinition>& profiles) {
+    return find_profile(profiles, "general") ? "general"
+                                             : (profiles.empty() ? "general"
+                                                                 : profiles.front().name);
+}
+
+bool is_valid_profile(const std::vector<LlmProfileDefinition>& profiles,
+                      const std::string& profile) {
+    return find_profile(profiles, profile) != nullptr;
+}
+
+std::string profile_list_prompt(
+    const std::vector<LlmProfileDefinition>& profiles) {
+    std::ostringstream oss;
+    oss << "\n\nAvailable profiles:\n";
+    for (const auto& profile : profiles) {
+        oss << "- " << profile.name;
+        if (!profile.instructions.empty()) {
+            oss << ": " << profile.instructions;
+        }
+        oss << "\n";
+    }
+    return oss.str();
+}
+
 bool parse_profile_content(const std::string& content,
+                           const std::vector<LlmProfileDefinition>& profiles,
                            LlmProfileResult& result) {
     std::string json_content = trim(content);
     if (json_content.rfind("```", 0) == 0) {
@@ -144,10 +181,8 @@ bool parse_profile_content(const std::string& content,
         std::string profile = trim(json.value("profile", "general"));
         if (text.empty()) return false;
 
-        if (profile != "coding" && profile != "email" &&
-            profile != "discussion" && profile != "translation" &&
-            profile != "general") {
-            profile = "general";
+        if (!is_valid_profile(profiles, profile)) {
+            profile = fallback_profile_name(profiles);
         }
 
         result.text = text;
@@ -158,13 +193,9 @@ bool parse_profile_content(const std::string& content,
     }
 }
 
-bool is_valid_profile(const std::string& profile) {
-    return profile == "coding" || profile == "email" ||
-           profile == "discussion" || profile == "translation" ||
-           profile == "general";
-}
-
-bool parse_profile_label(const std::string& content, std::string& profile) {
+bool parse_profile_label(const std::vector<LlmProfileDefinition>& profiles,
+                         const std::string& content,
+                         std::string& profile) {
     std::string cleaned = trim(content);
     if (cleaned.rfind("```", 0) == 0) {
         size_t first_newline = cleaned.find('\n');
@@ -185,8 +216,10 @@ bool parse_profile_label(const std::string& content, std::string& profile) {
         try {
             auto json = nlohmann::json::parse(
                 cleaned.substr(object_start, object_end - object_start + 1));
-            std::string parsed = trim(json.value("profile", "general"));
-            if (!is_valid_profile(parsed)) parsed = "general";
+            std::string parsed = trim(json.value("profile", fallback_profile_name(profiles)));
+            if (!is_valid_profile(profiles, parsed)) {
+                parsed = fallback_profile_name(profiles);
+            }
             profile = parsed;
             return true;
         } catch (const nlohmann::json::exception&) {
@@ -199,7 +232,7 @@ bool parse_profile_label(const std::string& content, std::string& profile) {
         if (std::isalpha(c)) lowered.push_back(static_cast<char>(std::tolower(c)));
     }
 
-    if (!is_valid_profile(lowered)) return false;
+    if (!is_valid_profile(profiles, lowered)) return false;
     profile = lowered;
     return true;
 }
@@ -226,6 +259,23 @@ bool LlmCleaner::clean_text_with_profile(const std::string& input,
                                          LlmProfileResult& result) const {
     result.profile = "general";
     if (config_.intent_profiles_enabled) {
+        std::string combined_prompt = config_.pre_prompt;
+        if (!learned_corrections.empty()) {
+            combined_prompt += "\n\n";
+            combined_prompt += learned_corrections;
+        }
+        combined_prompt += profile_list_prompt(config_.profiles);
+        combined_prompt += "\n\n";
+        combined_prompt += config_.profile_transform_prompt;
+        combined_prompt += "\n\nReturn strict JSON only: "
+                           "{\"profile\":\"<profile name>\",\"text\":\"<transformed text>\"}.";
+
+        std::string response_text;
+        if (request_completion(input, combined_prompt, response_text) &&
+            parse_profile_content(response_text, config_.profiles, result)) {
+            return true;
+        }
+
         if (!detect_profile(input, result.profile)) {
             return false;
         }
@@ -241,12 +291,15 @@ bool LlmCleaner::clean_text_with_profile(const std::string& input,
 bool LlmCleaner::detect_profile(const std::string& input,
                                 std::string& profile) const {
     std::string response_text;
-    if (!request_completion(input, config_.intent_detection_prompt,
+    std::string prompt = config_.intent_detection_prompt;
+    prompt += profile_list_prompt(config_.profiles);
+    prompt += "\nReturn strict JSON only: {\"profile\":\"<profile name>\"}.";
+    if (!request_completion(input, prompt,
                             response_text)) {
         return false;
     }
-    if (!parse_profile_label(response_text, profile)) {
-        profile = "general";
+    if (!parse_profile_label(config_.profiles, response_text, profile)) {
+        profile = fallback_profile_name(config_.profiles);
     }
     return true;
 }
@@ -256,7 +309,30 @@ bool LlmCleaner::transform_text_with_profile(
     const std::string& learned_corrections,
     const std::string& profile,
     std::string& output) const {
-    std::string selected_profile = is_valid_profile(profile) ? profile : "general";
+    std::string selected_profile = is_valid_profile(config_.profiles, profile)
+        ? profile
+        : fallback_profile_name(config_.profiles);
+    const LlmProfileDefinition* definition =
+        find_profile(config_.profiles, selected_profile);
+
+    std::string combined_prompt = config_.pre_prompt;
+    if (!learned_corrections.empty()) {
+        combined_prompt += "\n\n";
+        combined_prompt += learned_corrections;
+    }
+    combined_prompt += "\n\nSelected profile: ";
+    combined_prompt += selected_profile;
+    if (definition && !definition->instructions.empty()) {
+        combined_prompt += "\n\nProfile instructions:\n";
+        combined_prompt += definition->instructions;
+    }
+    combined_prompt += "\n\n";
+    combined_prompt += config_.profile_transform_prompt;
+
+    if (request_completion(input, combined_prompt, output)) {
+        return true;
+    }
+    return false;
 
     // Step 1 — pre-prompt cleanup: fix transcription mistakes, punctuation,
     // casing, grammar, and structure on the raw dictated text. Learned
@@ -276,6 +352,10 @@ bool LlmCleaner::transform_text_with_profile(
     // narrow responsibility and can be edited in isolation.
     std::string transform_prompt = "Selected profile: ";
     transform_prompt += selected_profile;
+    if (definition && !definition->instructions.empty()) {
+        transform_prompt += "\n\nProfile instructions:\n";
+        transform_prompt += definition->instructions;
+    }
     transform_prompt += "\n\n";
     transform_prompt += config_.profile_transform_prompt;
 

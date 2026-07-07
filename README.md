@@ -39,24 +39,24 @@ cd VoiceToTextApp
 ### 2. Download a KB-Whisper model
 
 ```powershell
-# Download medium model (recommended, ~1.5 GB)
+# Download large model (default, best quality, ~1.01 GB)
 .\scripts\download_model.ps1
 
 # Or choose a specific size:
-.\scripts\download_model.ps1 -Size small    # 500 MB, fast, good quality
-.\scripts\download_model.ps1 -Size large    # 3 GB, best quality
-.\scripts\download_model.ps1 -Size tiny     # 75 MB, fastest, lower quality
+.\scripts\download_model.ps1 -Size small    # 167 MB, fast, good quality
+.\scripts\download_model.ps1 -Size medium   # 514 MB, high quality
+.\scripts\download_model.ps1 -Size tiny     # 29 MB, fastest, lower quality
 ```
 
 Available models from [KBLab on Hugging Face](https://huggingface.co/KBLab):
 
 | Model | Size | Quality | Speed |
 |-------|------|---------|-------|
-| `tiny` | ~75 MB | Basic | Fastest |
-| `base` | ~150 MB | Decent | Fast |
-| `small` | ~500 MB | Good | Good balance |
-| `medium` | ~1.5 GB | High | Moderate |
-| `large` | ~3 GB | Best | Slower |
+| `tiny` | ~29 MB | Basic | Fastest |
+| `base` | ~53 MB | Decent | Fast |
+| `small` | ~167 MB | Good | Good balance |
+| `medium` | ~514 MB | High | Moderate |
+| `large` | ~1.01 GB | Best | Slower |
 
 ### 3. Build
 
@@ -89,16 +89,21 @@ Edit `config.json` (created automatically next to the executable):
 
 ```json
 {
-    "model_path": "models/ggml-model-q5_0.bin",
+    "model_path": "models/ggml-model-large-q5_0.bin",
     "language": "sv",
     "use_gpu": true,
-    "n_threads": 4,
+    "n_threads": 0,
+    "whisper_fast_mode": true,
+    "warm_up_model_on_load": true,
     "audio_device": "",
     "vad_threshold": 0.01,
     "silence_duration_ms": 1500,
     "speech_min_duration_ms": 200,
+    "trim_silence_before_transcription": true,
+    "trim_silence_padding_ms": 250,
     "injection_method": "auto",
     "keystroke_delay_ms": 5,
+    "pre_injection_delay_ms": 25,
     "llm_cleanup_enabled": false,
     "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "llm_model": "local-model",
@@ -128,9 +133,14 @@ Edit `config.json` (created automatically next to the executable):
 - **`model_path`** - Path to the GGML model file
 - **`language`** - `"sv"` (Swedish), `"en"` (English), or `"auto"` (auto-detect)
 - **`use_gpu`** - `true` for CUDA GPU acceleration, `false` for CPU only
-- **`n_threads`** - CPU threads for inference (when using CPU)
+- **`n_threads`** - CPU threads for inference (when using CPU); `0` auto-detects available hardware threads
+- **`whisper_fast_mode`** - `true` skips timestamp decoding and suppresses non-speech tokens for faster dictation output
+- **`warm_up_model_on_load`** - `true` runs a tiny background warmup after model load so the first real transcription feels faster
 - **`vad_threshold`** - Voice activity detection sensitivity (lower = more sensitive)
+- **`trim_silence_before_transcription`** - `true` trims leading/trailing silence before Whisper runs
+- **`trim_silence_padding_ms`** - Padding kept around detected speech after silence trimming
 - **`injection_method`** - `"auto"`, `"clipboard"`, or `"keystrokes"`
+- **`pre_injection_delay_ms`** - Short pause before injecting text after transcription; lower values feel snappier
 - **`llm_cleanup_enabled`** - `true` to clean transcription text through LM Studio before insertion
 - **`llm_endpoint`** - LM Studio OpenAI-compatible chat completions URL, usually `http://127.0.0.1:1234/v1/chat/completions`
 - **`llm_model`** - Model identifier shown by LM Studio for your loaded Gemma model

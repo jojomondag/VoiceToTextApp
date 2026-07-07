@@ -27,6 +27,30 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(whisper)
 
+if(VTT_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    find_file(VTT_CUBLAS_DLL
+        NAMES cublas64_13.dll cublas64_12.dll
+        HINTS
+            "${CUDAToolkit_BIN_DIR}"
+            "${CUDAToolkit_BIN_DIR}/x64"
+            "$ENV{CUDA_PATH}/bin"
+            "$ENV{CUDA_PATH}/bin/x64"
+        NO_DEFAULT_PATH
+    )
+    find_file(VTT_CUBLASLT_DLL
+        NAMES cublasLt64_13.dll cublasLt64_12.dll
+        HINTS
+            "${CUDAToolkit_BIN_DIR}"
+            "${CUDAToolkit_BIN_DIR}/x64"
+            "$ENV{CUDA_PATH}/bin"
+            "$ENV{CUDA_PATH}/bin/x64"
+        NO_DEFAULT_PATH
+    )
+
+endif()
+
 # ---------------------------------------------------------------------------
 # miniaudio  (single-header library -- only need the header, not its build)
 # ---------------------------------------------------------------------------
@@ -62,6 +86,7 @@ set(SOURCES
     src/app.cpp
     src/whisper_engine.cpp
     src/audio_capture.cpp
+    src/app_icon.cpp
     src/hotkey_manager.cpp
     src/text_injector.cpp
     src/llm_cleaner.cpp
@@ -91,10 +116,39 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ole32
     winmm
     dwmapi
+    gdiplus
+    urlmon
 )
 
 # Set working directory for debugging inside Visual Studio / IDE
 set_target_properties(${PROJECT_NAME} PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     RUNTIME_OUTPUT_DIRECTORY      "${CMAKE_BINARY_DIR}/bin"
+)
+
+if(VTT_CUDA)
+    if(VTT_CUBLAS_DLL)
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${VTT_CUBLAS_DLL}"
+                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        )
+    endif()
+    if(VTT_CUBLASLT_DLL)
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${VTT_CUBLASLT_DLL}"
+                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        )
+    endif()
+endif()
+
+add_custom_target(package-standalone
+    COMMAND powershell -ExecutionPolicy Bypass -File
+            "${CMAKE_SOURCE_DIR}/scripts/package_standalone.ps1"
+            -BuildDir "${CMAKE_BINARY_DIR}"
+            -Configuration "$<CONFIG>"
+            -OutputDir "${CMAKE_SOURCE_DIR}/dist/VoiceToText"
+    DEPENDS ${PROJECT_NAME}
+    COMMENT "Creating standalone VoiceToText package"
 )

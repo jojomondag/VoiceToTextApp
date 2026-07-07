@@ -3,6 +3,7 @@
 
 #include <sstream>
 #include <algorithm>
+#include <thread>
 
 namespace vtt {
 
@@ -22,6 +23,7 @@ bool WhisperEngine::initialize(const std::string& model_path, bool use_gpu) {
 
     struct whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = use_gpu;
+    cparams.flash_attn = use_gpu;
 
     ctx_ = whisper_init_from_file_with_params(model_path.c_str(), cparams);
     if (!ctx_) {
@@ -65,12 +67,17 @@ TranscriptionResult WhisperEngine::transcribe(const std::vector<float>& audio_da
     params.n_threads        = n_threads_;
     params.single_segment   = true;
     params.no_context       = true;
-    params.no_timestamps    = false;
+    params.no_timestamps    = fast_mode_;
     params.print_progress   = false;
     params.print_realtime   = false;
     params.print_special    = false;
     params.print_timestamps = false;
     params.translate        = translate_;
+
+    if (fast_mode_) {
+        params.suppress_blank  = true;
+        params.suppress_nst    = true;
+    }
 
     if (language_ == "auto") {
         params.language = nullptr;  // auto-detect
@@ -89,7 +96,7 @@ TranscriptionResult WhisperEngine::transcribe(const std::vector<float>& audio_da
     }
 
     std::ostringstream oss;
-    int64_t first_start = whisper_full_get_segment_t0(ctx_, 0) * 10; // convert to ms
+    int64_t first_start = fast_mode_ ? 0 : whisper_full_get_segment_t0(ctx_, 0) * 10; // convert to ms
     int64_t last_end    = 0;
 
     for (int i = 0; i < n_segments; ++i) {
@@ -97,7 +104,9 @@ TranscriptionResult WhisperEngine::transcribe(const std::vector<float>& audio_da
         if (seg_text) {
             oss << seg_text;
         }
-        last_end = whisper_full_get_segment_t1(ctx_, i) * 10; // convert to ms
+        last_end = fast_mode_
+            ? static_cast<int64_t>(audio_data.size() * 1000 / 16000)
+            : whisper_full_get_segment_t1(ctx_, i) * 10; // convert to ms
     }
 
     result.text     = oss.str();
@@ -118,6 +127,14 @@ TranscriptionResult WhisperEngine::transcribe(const std::vector<float>& audio_da
     return result;
 }
 
+bool WhisperEngine::warm_up(int duration_ms) {
+    int samples = std::max(1600, duration_ms * 16);
+    std::vector<float> silence(static_cast<size_t>(samples), 0.0f);
+    TranscriptionResult ignored = transcribe(silence);
+    (void)ignored;
+    return is_initialized();
+}
+
 void WhisperEngine::set_callback(TranscriptionCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = std::move(callback);
@@ -135,7 +152,17 @@ void WhisperEngine::set_translate(bool translate) {
 
 void WhisperEngine::set_n_threads(int threads) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (threads <= 0) {
+        unsigned int hw_threads = std::thread::hardware_concurrency();
+        n_threads_ = static_cast<int>(std::max(1u, hw_threads));
+        return;
+    }
     n_threads_ = std::max(1, threads);
+}
+
+void WhisperEngine::set_fast_mode(bool fast_mode) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fast_mode_ = fast_mode;
 }
 
 std::string WhisperEngine::get_system_info() const {

@@ -1,13 +1,13 @@
 # download_model.ps1 - Download KB-Whisper GGML model for VoiceToText
 #
 # Usage:
-#   .\scripts\download_model.ps1                  # Downloads medium (default)
+#   .\scripts\download_model.ps1                  # Downloads large (default, best quality)
 #   .\scripts\download_model.ps1 -Size large      # Downloads large
 #   .\scripts\download_model.ps1 -Size small -Quantized $false  # Non-quantized small
 
 param(
     [ValidateSet("tiny", "base", "small", "medium", "large")]
-    [string]$Size = "medium",
+    [string]$Size = "large",
 
     [bool]$Quantized = $true
 )
@@ -73,11 +73,11 @@ try {
 
 Write-Host ""
 Write-Host "Available model sizes and approximate download sizes:" -ForegroundColor Cyan
-Write-Host "  tiny     ~75 MB   (fastest, lowest quality)" -ForegroundColor Gray
-Write-Host "  base     ~150 MB  (fast, decent quality)" -ForegroundColor Gray
-Write-Host "  small    ~500 MB  (good balance)" -ForegroundColor Gray
-Write-Host "  medium   ~1.5 GB  (high quality)" -ForegroundColor Gray
-Write-Host "  large    ~3 GB    (best quality, needs good GPU)" -ForegroundColor Gray
+Write-Host "  tiny     ~29 MB    (fastest, lowest quality)" -ForegroundColor Gray
+Write-Host "  base     ~53 MB    (fast, decent quality)" -ForegroundColor Gray
+Write-Host "  small    ~167 MB   (good balance)" -ForegroundColor Gray
+Write-Host "  medium   ~514 MB   (high quality)" -ForegroundColor Gray
+Write-Host "  large    ~1.01 GB  (best quality, needs good GPU)" -ForegroundColor Gray
 Write-Host ""
 Write-Host "To download a different size, run:" -ForegroundColor Gray
 Write-Host "  .\scripts\download_model.ps1 -Size <size>" -ForegroundColor White

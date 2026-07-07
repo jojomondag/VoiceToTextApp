@@ -1,20 +1,26 @@
 {
-    "model_path": "models/ggml-model-q5_0.bin",
+    "model_path": "models/ggml-model-large-q5_0.bin",
     "language": "sv",
     "use_gpu": true,
-    "n_threads": 4,
+    "compute_mode": "auto",
+    "n_threads": 0,
+    "whisper_fast_mode": true,
+    "warm_up_model_on_load": true,
     "audio_device": "",
     "vad_threshold": 0.01,
     "silence_duration_ms": 1500,
     "speech_min_duration_ms": 200,
+    "trim_silence_before_transcription": true,
+    "trim_silence_padding_ms": 250,
     "toggle_key": 32,
     "cancel_key": 27,
     "injection_method": "auto",
     "keystroke_delay_ms": 5,
+    "pre_injection_delay_ms": 25,
     "llm_cleanup_enabled": false,
     "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "llm_model": "local-model",
-    "llm_pre_prompt": "Du städar upp dikterade instruktioner innan de skickas till en AI-kodmodell. Rätta transkriberingsfel, fel ord som tydligt inte passar i sammanhanget, skiljetecken, versaler, grammatik och struktur. Gör texten tydlig, konkret och lätt för en kodmodell att agera på. Använd kodkontext när det är uppenbart, till exempel LM Studio, app.cpp, C++, CMake, PowerShell, JSON, API, endpoint och config. Bevara användarens avsikt, språk, ton, namn, sökvägar, kommandon, kodidentifierare, siffror och tekniska termer. Lägg inte till nya krav, antaganden eller förklaringar. Svara endast med den städade instruktionen.",
+    "llm_pre_prompt": "Du st\u00e4dar upp dikterade instruktioner innan de skickas till en AI-kodmodell. R\u00e4tta transkriberingsfel, fel ord som tydligt inte passar i sammanhanget, skiljetecken, versaler, grammatik och struktur. G\u00f6r texten tydlig, konkret och l\u00e4tt f\u00f6r en kodmodell att agera p\u00e5. Bevara anv\u00e4ndarens avsikt, spr\u00e5k, ton, namn, s\u00f6kv\u00e4gar, kommandon, kodidentifierare, siffror och tekniska termer. L\u00e4gg inte till nya krav, antaganden eller f\u00f6rklaringar. Svara endast med den st\u00e4dade instruktionen.",
     "llm_timeout_ms": 30000,
     "llm_max_tokens": 4096,
     "llm_corrections_enabled": true,
@@ -23,10 +29,32 @@
     "llm_corrections_prompt_limit": 20,
     "llm_corrections_min_count": 1,
     "llm_ai_language_enabled": true,
-    "llm_ai_language_prompt": "Skapa en ultrakompakt AI-läsbar instruktionsdialekt från användarens städade instruktion. Komprimera aggressivt men bevara avsikt, krav, begränsningar, entiteter, kodnamn, sökvägar, siffror och åtgärdsordning. Identifiera och ta bort upprepningar, utfyllnad och otydlighet. Strukturera tätt med etiketter som Goal, Context, Tasks, Constraints och Output när det hjälper. Använd förkortningar bara när en kodmodell entydigt förstår dem. Lägg inte till nya krav eller antaganden. Svara endast med AI-språkversionen.",
+    "llm_ai_language_prompt": "Skapa en ultrakompakt AI-l\u00e4sbar instruktionsdialekt fr\u00e5n anv\u00e4ndarens st\u00e4dade instruktion. Komprimera aggressivt men bevara avsikt, krav, begr\u00e4nsningar, entiteter, kodnamn, s\u00f6kv\u00e4gar, siffror och \u00e5tg\u00e4rdsordning. L\u00e4gg inte till nya krav eller antaganden. Svara endast med AI-spr\u00e5kversionen.",
     "llm_intent_profiles_enabled": true,
-    "llm_intent_detection_prompt": "Identifiera användarens avsikt från texten och välj exakt en profil: coding, email, discussion, translation eller general. Svara endast med strikt JSON: {\"profile\":\"coding|email|discussion|translation|general\"}.",
-    "llm_profile_transform_prompt": "Transformera texten enligt vald profil. coding: gör texten konkret, åtgärdsbar och tydlig för en kodmodell. email: gör den till ett tydligt mailutkast med passande ton. Lägg inte till placeholders, signatur eller ämnesrad om användaren inte bad om det. discussion: bevara samtalston och gör resonemanget klart. translation: översätt eller förbered översättning enligt användarens begäran och bevara betydelsen. general: städa texten utan särskild formatering. Lägg inte till nya krav. Svara endast med den transformerade texten.",
+    "llm_intent_detection_prompt": "Identifiera anv\u00e4ndarens avsikt fr\u00e5n texten och v\u00e4lj exakt en profil. Svara endast med strikt JSON.",
+    "llm_profile_transform_prompt": "Transformera texten enligt vald profil. F\u00f6lj profilens egna instruktioner noggrant, bevara anv\u00e4ndarens avsikt och l\u00e4gg inte till nya krav. Svara endast med den transformerade texten.",
+    "llm_profiles": [
+        {
+            "name": "coding",
+            "instructions": "G\u00f6r texten konkret, \u00e5tg\u00e4rdsbar och tydlig f\u00f6r en kodmodell."
+        },
+        {
+            "name": "email",
+            "instructions": "G\u00f6r texten till ett tydligt mailutkast med passande ton."
+        },
+        {
+            "name": "discussion",
+            "instructions": "Bevara samtalston och g\u00f6r resonemanget klart."
+        },
+        {
+            "name": "translation",
+            "instructions": "\u00d6vers\u00e4tt eller f\u00f6rbered \u00f6vers\u00e4ttning enligt anv\u00e4ndarens beg\u00e4ran och bevara betydelsen."
+        },
+        {
+            "name": "general",
+            "instructions": "St\u00e4da texten utan s\u00e4rskild formatering."
+        }
+    ],
     "show_overlay": true,
     "start_minimized": true,
     "auto_start": false,
