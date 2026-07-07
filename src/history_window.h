@@ -41,7 +41,6 @@ private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK EditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK CopyButtonWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-    static LRESULT CALLBACK PromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK ComboSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
     void create_child_controls();
@@ -94,6 +93,7 @@ private:
     std::wstring get_edit_text(HWND edit) const;
 
     void show_profile_prompt(const std::string& profile);
+    void show_history_view();
     void layout_prompt_window();
     void save_prompt_edits();
     std::wstring get_edit_text_w(HWND edit) const;
@@ -133,6 +133,7 @@ private:
     PanelLinks panel_links_;
     int highlighted_entry_ = -1;
     bool updating_highlight_ = false;
+    bool profile_mode_ = false;
     HWND hover_button_ = nullptr;
     HWND hover_profile_edit_ = nullptr;
     int hover_profile_start_ = -1;
@@ -155,7 +156,6 @@ private:
 
     void subclass_combo_box(HWND combo);
 
-    HWND prompt_hwnd_ = nullptr;
     HWND prompt_pre_label_ = nullptr;
     HWND prompt_pre_edit_ = nullptr;
     HWND prompt_profile_label_ = nullptr;
@@ -165,6 +165,7 @@ private:
     HWND prompt_profile_rename_button_ = nullptr;
     HWND prompt_transform_label_ = nullptr;
     HWND prompt_transform_edit_ = nullptr;
+    HWND prompt_back_button_ = nullptr;
     HWND prompt_save_button_ = nullptr;
     HWND prompt_status_ = nullptr;
     std::string active_prompt_profile_;

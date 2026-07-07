@@ -19,6 +19,7 @@ static constexpr int IDC_PROMPT_SAVE  = 1010;
 static constexpr int IDC_PROFILE_COMBO = 1011;
 static constexpr int IDC_PROFILE_NEW = 1012;
 static constexpr int IDC_PROFILE_RENAME = 1013;
+static constexpr int IDC_PROMPT_BACK = 1014;
 static constexpr int CLEAR_BUTTON_WIDTH = 90;
 static constexpr int CLEAR_BUTTON_GAP = 8;
 static constexpr int COPY_BUTTON_WIDTH = 34;
@@ -35,7 +36,6 @@ static constexpr int PROMPT_TEXT_RIGHT_MARGIN = 12;
 static constexpr int PANEL_RADIUS = 14;
 
 static constexpr const wchar_t* HISTORY_CLASS_NAME = L"VTTHistoryWindow";
-static constexpr const wchar_t* PROMPT_CLASS_NAME = L"VTTProfilePromptWindow";
 static constexpr const wchar_t* EDIT_OWNER_PROP = L"VTTHistoryWindowOwner";
 static constexpr const wchar_t* COPY_BUTTON_OWNER_PROP = L"VTTCopyButtonOwner";
 static constexpr const wchar_t* ENTRY_BEGIN = L"[[VTT_ENTRY_BEGIN:";
@@ -207,21 +207,27 @@ bool HistoryWindow::initialize(HINSTANCE hInstance, TranscriptHistory* history,
 }
 
 void HistoryWindow::shutdown() {
-    if (prompt_hwnd_) {
-        DestroyWindow(prompt_hwnd_);
-        prompt_hwnd_ = nullptr;
-        prompt_pre_label_ = nullptr;
-        prompt_pre_edit_ = nullptr;
-        prompt_profile_label_ = nullptr;
-        prompt_profile_edit_ = nullptr;
-        prompt_profile_combo_ = nullptr;
-        prompt_profile_new_button_ = nullptr;
-        prompt_profile_rename_button_ = nullptr;
-        prompt_transform_label_ = nullptr;
-        prompt_transform_edit_ = nullptr;
-        prompt_save_button_ = nullptr;
-        prompt_status_ = nullptr;
+    for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
+                    prompt_profile_label_, prompt_profile_edit_,
+                    prompt_profile_combo_, prompt_profile_new_button_,
+                    prompt_profile_rename_button_,
+                    prompt_transform_label_, prompt_transform_edit_,
+                    prompt_back_button_, prompt_save_button_,
+                    prompt_status_ }) {
+        if (h) DestroyWindow(h);
     }
+    prompt_pre_label_ = nullptr;
+    prompt_pre_edit_ = nullptr;
+    prompt_profile_label_ = nullptr;
+    prompt_profile_edit_ = nullptr;
+    prompt_profile_combo_ = nullptr;
+    prompt_profile_new_button_ = nullptr;
+    prompt_profile_rename_button_ = nullptr;
+    prompt_transform_label_ = nullptr;
+    prompt_transform_edit_ = nullptr;
+    prompt_back_button_ = nullptr;
+    prompt_save_button_ = nullptr;
+    prompt_status_ = nullptr;
     destroy_copy_buttons();
     if (hwnd_) {
         DestroyWindow(hwnd_);
@@ -246,7 +252,6 @@ void HistoryWindow::shutdown() {
     app_icon_large_ = nullptr;
     app_icon_small_ = nullptr;
     if (hInstance_) {
-        UnregisterClassW(PROMPT_CLASS_NAME, hInstance_);
         UnregisterClassW(HISTORY_CLASS_NAME, hInstance_);
         hInstance_ = nullptr;
     }
@@ -404,6 +409,11 @@ void HistoryWindow::create_child_controls() {
 
 void HistoryWindow::layout() {
     if (!hwnd_) return;
+
+    if (profile_mode_) {
+        layout_prompt_window();
+        return;
+    }
 
     RECT rc;
     GetClientRect(hwnd_, &rc);
@@ -663,20 +673,20 @@ void HistoryWindow::paint_background(HWND hwnd, HDC hdc) {
     GetClientRect(hwnd, &rc);
     FillRect(hdc, &rc, background_brush_);
 
-    if (hwnd == hwnd_) {
+    if (hwnd == hwnd_ && profile_mode_) {
+        paint_section(hdc, prompt_pre_panel_rc_, L"Cleanup role",
+                      L"Repairs raw dictation before profile transform");
+        paint_section(hdc, prompt_profile_panel_rc_, L"Profile",
+                      L"Choose or edit the active transformation profile");
+        paint_section(hdc, prompt_transform_panel_rc_, L"Transform role",
+                      L"Profile-specific rewrite rules");
+    } else if (hwnd == hwnd_) {
         paint_section(hdc, recorded_panel_rc_, L"Recorded voice",
                       L"Raw capture before cleanup");
         paint_section(hdc, transcribed_panel_rc_, L"Clean transcript",
                       L"Readable transcript output");
         paint_section(hdc, ai_language_panel_rc_, L"AI language",
                       L"Compact instruction view");
-    } else if (hwnd == prompt_hwnd_) {
-        paint_section(hdc, prompt_pre_panel_rc_, L"Cleanup role",
-                      L"Repairs raw dictation before profile transform");
-        paint_section(hdc, prompt_profile_panel_rc_, L"Detected profile",
-                      L"Chosen automatically for this history entry");
-        paint_section(hdc, prompt_transform_panel_rc_, L"Transform role",
-                      L"Profile-specific rewrite rules");
     }
 }
 
@@ -1807,32 +1817,7 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
     //   Step 1 (editable) — cleanup role applied to raw dictation
     //   Step 2 (read-only) — runtime profile selection (informational)
     //   Step 3 (editable) — per-profile transform role applied to cleaned text
-    if (!prompt_hwnd_) {
-        WNDCLASSEXW wc = {};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = PromptWndProc;
-        wc.hInstance = hInstance_;
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = nullptr;
-        wc.hIcon = app_icon_large_;
-        wc.hIconSm = app_icon_small_;
-        wc.lpszClassName = PROMPT_CLASS_NAME;
-        if (!RegisterClassExW(&wc)) {
-            if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return;
-        }
-
-        prompt_hwnd_ = CreateWindowExW(
-            0, PROMPT_CLASS_NAME, L"Profile prompt",
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT, 900, 720,
-            hwnd_, nullptr, hInstance_, this);
-        if (!prompt_hwnd_) return;
-        apply_dark_caption(prompt_hwnd_);
-        SendMessageW(prompt_hwnd_, WM_SETICON, ICON_BIG,
-                     reinterpret_cast<LPARAM>(app_icon_large_));
-        SendMessageW(prompt_hwnd_, WM_SETICON, ICON_SMALL,
-                     reinterpret_cast<LPARAM>(app_icon_small_));
-
+    if (!prompt_pre_edit_) {
         DWORD edit_common = WS_CHILD | WS_VISIBLE | WS_VSCROLL |
                             ES_MULTILINE | ES_AUTOVSCROLL | ES_LEFT |
                             ES_NOHIDESEL | ES_WANTRETURN;
@@ -1846,19 +1831,19 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
             L"Fixes transcription errors, punctuation, casing, grammar, and "
             L"structure on the raw dictation before profile transform.",
             label_style, 0, 0, 0, 0,
-            prompt_hwnd_, nullptr, hInstance_, nullptr);
+            hwnd_, nullptr, hInstance_, nullptr);
         prompt_pre_edit_ = CreateWindowExW(
             0, L"EDIT", L"", edit_editable,
-            0, 0, 0, 0, prompt_hwnd_, nullptr, hInstance_, nullptr);
+            0, 0, 0, 0, hwnd_, nullptr, hInstance_, nullptr);
 
         prompt_profile_label_ = CreateWindowExW(
             0, L"STATIC",
             L"Step 2 — Selected profile (read-only, runtime classifier output)",
             label_style, 0, 0, 0, 0,
-            prompt_hwnd_, nullptr, hInstance_, nullptr);
+            hwnd_, nullptr, hInstance_, nullptr);
         prompt_profile_edit_ = CreateWindowExW(
             0, L"EDIT", L"", edit_readonly,
-            0, 0, 0, 0, prompt_hwnd_, nullptr, hInstance_, nullptr);
+            0, 0, 0, 0, hwnd_, nullptr, hInstance_, nullptr);
         ShowWindow(prompt_profile_edit_, SW_HIDE);
 
         prompt_profile_combo_ = CreateWindowExW(
@@ -1866,7 +1851,7 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER |
                 CBS_DROPDOWN | CBS_AUTOHSCROLL |
                 CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
-            0, 0, 0, 0, prompt_hwnd_,
+            0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_COMBO)),
             hInstance_, nullptr);
         subclass_combo_box(prompt_profile_combo_);
@@ -1874,14 +1859,14 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
         prompt_profile_new_button_ = CreateWindowExW(
             0, L"BUTTON", L"New",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
-            0, 0, 0, 0, prompt_hwnd_,
+            0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_NEW)),
             hInstance_, nullptr);
 
         prompt_profile_rename_button_ = CreateWindowExW(
             0, L"BUTTON", L"Rename",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
-            0, 0, 0, 0, prompt_hwnd_,
+            0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_RENAME)),
             hInstance_, nullptr);
 
@@ -1890,22 +1875,29 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
             L"Step 3 — Transform role (editable). "
             L"Per-profile rewrite rules applied to the cleaned text from Step 1.",
             label_style, 0, 0, 0, 0,
-            prompt_hwnd_, nullptr, hInstance_, nullptr);
+            hwnd_, nullptr, hInstance_, nullptr);
         prompt_transform_edit_ = CreateWindowExW(
             0, L"EDIT", L"", edit_editable,
-            0, 0, 0, 0, prompt_hwnd_, nullptr, hInstance_, nullptr);
+            0, 0, 0, 0, hwnd_, nullptr, hInstance_, nullptr);
+
+        prompt_back_button_ = CreateWindowExW(
+            0, L"BUTTON", L"Back",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
+            0, 0, 0, 0, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROMPT_BACK)),
+            hInstance_, nullptr);
 
         prompt_save_button_ = CreateWindowExW(
             0, L"BUTTON", L"Save roles",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
-            0, 0, 0, 0, prompt_hwnd_,
+            0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROMPT_SAVE)),
             hInstance_, nullptr);
 
         prompt_status_ = CreateWindowExW(
             0, L"STATIC", L"",
             label_style, 0, 0, 0, 0,
-            prompt_hwnd_, nullptr, hInstance_, nullptr);
+            hwnd_, nullptr, hInstance_, nullptr);
 
         SetWindowTextW(prompt_pre_label_,
                        L"Step 1 - Cleanup role (editable). "
@@ -1923,10 +1915,12 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
                         prompt_profile_combo_, prompt_profile_new_button_,
                         prompt_profile_rename_button_,
                         prompt_transform_label_, prompt_transform_edit_,
-                        prompt_save_button_, prompt_status_ }) {
+                        prompt_back_button_, prompt_save_button_,
+                        prompt_status_ }) {
             SendMessage(h, WM_SETFONT,
                         reinterpret_cast<WPARAM>(
                             (h == prompt_save_button_ ||
+                             h == prompt_back_button_ ||
                              h == prompt_profile_new_button_ ||
                              h == prompt_profile_rename_button_)
                                 ? button_font_
@@ -1944,10 +1938,6 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
         apply_dark_control_theme(prompt_profile_combo_);
     }
 
-    std::wstring title = L"Profile prompt: ";
-    title.append(utf8_to_wide(profile));
-    SetWindowTextW(prompt_hwnd_, title.c_str());
-
     if (config_) {
         const auto& cfg = config_->config();
         SetWindowTextW(prompt_pre_edit_, utf8_to_wide(cfg.llm_pre_prompt).c_str());
@@ -1956,22 +1946,54 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
     }
     SetWindowTextW(prompt_status_, L"");
 
-    layout_prompt_window();
-
-    if (IsIconic(prompt_hwnd_)) {
-        ShowWindow(prompt_hwnd_, SW_RESTORE);
-    } else {
-        ShowWindow(prompt_hwnd_, SW_SHOWMAXIMIZED);
+    profile_mode_ = true;
+    for (HWND h : { recorded_edit_, transcribed_edit_, ai_language_edit_,
+                    clear_button_ }) {
+        if (h) ShowWindow(h, SW_HIDE);
     }
-    SetForegroundWindow(prompt_hwnd_);
+    for (const auto& entry_view : history_entry_views_) {
+        if (entry_view.copy_button) ShowWindow(entry_view.copy_button, SW_HIDE);
+        if (entry_view.profile_button) ShowWindow(entry_view.profile_button, SW_HIDE);
+    }
+    for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
+                    prompt_profile_label_, prompt_profile_combo_,
+                    prompt_profile_new_button_, prompt_profile_rename_button_,
+                    prompt_transform_label_, prompt_transform_edit_,
+                    prompt_back_button_, prompt_save_button_,
+                    prompt_status_ }) {
+        if (h) ShowWindow(h, SW_SHOW);
+    }
+    layout();
     SetFocus(prompt_pre_edit_);
+    InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
+void HistoryWindow::show_history_view() {
+    profile_mode_ = false;
+    for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
+                    prompt_profile_label_, prompt_profile_edit_,
+                    prompt_profile_combo_, prompt_profile_new_button_,
+                    prompt_profile_rename_button_,
+                    prompt_transform_label_, prompt_transform_edit_,
+                    prompt_back_button_, prompt_save_button_,
+                    prompt_status_ }) {
+        if (h) ShowWindow(h, SW_HIDE);
+    }
+    for (HWND h : { recorded_edit_, transcribed_edit_, ai_language_edit_,
+                    clear_button_ }) {
+        if (h) ShowWindow(h, SW_SHOW);
+    }
+    layout();
+    update_copy_button_positions();
+    SetFocus(hwnd_);
+    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 void HistoryWindow::layout_prompt_window() {
-    if (!prompt_hwnd_) return;
+    if (!hwnd_ || !profile_mode_) return;
 
     RECT rc;
-    GetClientRect(prompt_hwnd_, &rc);
+    GetClientRect(hwnd_, &rc);
     int width  = rc.right - rc.left;
     int height = rc.bottom - rc.top;
 
@@ -2033,11 +2055,15 @@ void HistoryWindow::layout_prompt_window() {
 
     int button_x = width - padding - button_width;
     int button_y = footer_top;
+    MoveWindow(prompt_back_button_, padding, button_y,
+               button_width, button_height, TRUE);
     MoveWindow(prompt_save_button_, button_x, button_y,
                button_width, button_height, TRUE);
-    MoveWindow(prompt_status_, padding, button_y + 8,
-               (std::max)(0, button_x - padding * 2), button_height, TRUE);
-    InvalidateRect(prompt_hwnd_, nullptr, TRUE);
+    MoveWindow(prompt_status_, padding + button_width + control_gap,
+               button_y + 8,
+               (std::max)(0, button_x - padding * 3 - button_width),
+               button_height, TRUE);
+    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 void HistoryWindow::save_prompt_edits() {
@@ -2130,11 +2156,50 @@ LRESULT CALLBACK HistoryWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
             break;
 
+        case WM_CTLCOLOREDIT:
+            if (self) {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                SetBkColor(hdc, COLOR_CONTROL);
+                SetTextColor(hdc, COLOR_TEXT);
+                return reinterpret_cast<LRESULT>(self->control_brush_);
+            }
+            break;
+
+        case WM_CTLCOLORLISTBOX:
+            if (self) {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                SetBkColor(hdc, COLOR_CONTROL);
+                SetTextColor(hdc, COLOR_TEXT);
+                return reinterpret_cast<LRESULT>(self->control_brush_);
+            }
+            break;
+
+        case WM_MEASUREITEM:
+            if (self && wParam == IDC_PROFILE_COMBO) {
+                MEASUREITEMSTRUCT* mis =
+                    reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+                mis->itemHeight = 26;
+                return TRUE;
+            }
+            break;
+
         case WM_DRAWITEM:
             if (self) {
                 const auto* item =
                     reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+                if (item->CtlType == ODT_COMBOBOX &&
+                    item->CtlID == IDC_PROFILE_COMBO) {
+                    self->draw_combo_item(item);
+                    return TRUE;
+                }
                 if (wParam == IDC_CLEAR_BUTTON) {
+                    self->draw_steel_button(item);
+                    return TRUE;
+                }
+                if (item->CtlID == IDC_PROMPT_SAVE ||
+                    item->CtlID == IDC_PROMPT_BACK ||
+                    item->CtlID == IDC_PROFILE_NEW ||
+                    item->CtlID == IDC_PROFILE_RENAME) {
                     self->draw_steel_button(item);
                     return TRUE;
                 }
@@ -2168,6 +2233,39 @@ LRESULT CALLBACK HistoryWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 if (answer == IDYES && self->history_) {
                     self->history_->clear();
                     self->refresh();
+                }
+                return 0;
+            }
+            if (self && LOWORD(wParam) == IDC_PROMPT_BACK &&
+                HIWORD(wParam) == BN_CLICKED) {
+                self->show_history_view();
+                return 0;
+            }
+            if (self && LOWORD(wParam) == IDC_PROMPT_SAVE &&
+                HIWORD(wParam) == BN_CLICKED) {
+                self->save_prompt_edits();
+                return 0;
+            }
+            if (self && LOWORD(wParam) == IDC_PROFILE_NEW &&
+                HIWORD(wParam) == BN_CLICKED) {
+                self->create_new_profile();
+                return 0;
+            }
+            if (self && LOWORD(wParam) == IDC_PROFILE_RENAME &&
+                HIWORD(wParam) == BN_CLICKED) {
+                self->rename_current_profile();
+                return 0;
+            }
+            if (self && LOWORD(wParam) == IDC_PROFILE_COMBO &&
+                HIWORD(wParam) == CBN_SELCHANGE) {
+                int index = static_cast<int>(
+                    SendMessageW(self->prompt_profile_combo_, CB_GETCURSEL, 0, 0));
+                if (index >= 0) {
+                    wchar_t buffer[256] = {};
+                    SendMessageW(self->prompt_profile_combo_, CB_GETLBTEXT,
+                                 static_cast<WPARAM>(index),
+                                 reinterpret_cast<LPARAM>(buffer));
+                    self->select_profile_for_editing(wide_to_utf8(buffer));
                 }
                 return 0;
             }
@@ -2359,154 +2457,6 @@ LRESULT CALLBACK HistoryWindow::CopyButtonWndProc(HWND hwnd, UINT msg,
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
     return CallWindowProcW(original, hwnd, msg, wParam, lParam);
-}
-
-LRESULT CALLBACK HistoryWindow::PromptWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    HistoryWindow* self = nullptr;
-
-    if (msg == WM_NCCREATE) {
-        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        self = static_cast<HistoryWindow*>(cs->lpCreateParams);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-    } else {
-        self = reinterpret_cast<HistoryWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    }
-
-    switch (msg) {
-        case WM_SIZE:
-            if (self) self->layout_prompt_window();
-            return 0;
-
-        case WM_ERASEBKGND:
-            return 1;
-
-        case WM_PAINT:
-            if (self) {
-                PAINTSTRUCT ps;
-                HDC hdc = BeginPaint(hwnd, &ps);
-                self->paint_background(hwnd, hdc);
-                EndPaint(hwnd, &ps);
-                return 0;
-            }
-            break;
-
-        case WM_CTLCOLORSTATIC:
-            if (self) {
-                HDC hdc = reinterpret_cast<HDC>(wParam);
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, COLOR_MUTED);
-                return reinterpret_cast<LRESULT>(self->background_brush_);
-            }
-            break;
-
-        case WM_CTLCOLOREDIT:
-            if (self) {
-                HDC hdc = reinterpret_cast<HDC>(wParam);
-                SetBkColor(hdc, COLOR_CONTROL);
-                SetTextColor(hdc, COLOR_TEXT);
-                return reinterpret_cast<LRESULT>(self->control_brush_);
-            }
-            break;
-
-        case WM_CTLCOLORLISTBOX:
-            if (self) {
-                HDC hdc = reinterpret_cast<HDC>(wParam);
-                SetBkColor(hdc, COLOR_CONTROL);
-                SetTextColor(hdc, COLOR_TEXT);
-                return reinterpret_cast<LRESULT>(self->control_brush_);
-            }
-            break;
-
-        case WM_CTLCOLORBTN:
-            if (self) {
-                HDC hdc = reinterpret_cast<HDC>(wParam);
-                SetBkColor(hdc, COLOR_BUTTON);
-                SetTextColor(hdc, RGB(255, 255, 255));
-                return reinterpret_cast<LRESULT>(self->button_brush_);
-            }
-            break;
-
-        case WM_MEASUREITEM:
-            if (self && wParam == IDC_PROFILE_COMBO) {
-                MEASUREITEMSTRUCT* mis =
-                    reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-                mis->itemHeight = 26;
-                return TRUE;
-            }
-            break;
-
-        case WM_DRAWITEM:
-            if (self) {
-                const DRAWITEMSTRUCT* item =
-                    reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-                if (item->CtlType == ODT_COMBOBOX &&
-                    item->CtlID == IDC_PROFILE_COMBO) {
-                    self->draw_combo_item(item);
-                    return TRUE;
-                }
-                if (item->CtlID == IDC_PROMPT_SAVE ||
-                    item->CtlID == IDC_PROFILE_NEW ||
-                    item->CtlID == IDC_PROFILE_RENAME) {
-                    self->draw_steel_button(item);
-                    return TRUE;
-                }
-            }
-            break;
-
-        case WM_COMMAND:
-            if (self && LOWORD(wParam) == IDC_PROMPT_SAVE &&
-                HIWORD(wParam) == BN_CLICKED) {
-                self->save_prompt_edits();
-                return 0;
-            }
-            if (self && LOWORD(wParam) == IDC_PROFILE_NEW &&
-                HIWORD(wParam) == BN_CLICKED) {
-                self->create_new_profile();
-                return 0;
-            }
-            if (self && LOWORD(wParam) == IDC_PROFILE_RENAME &&
-                HIWORD(wParam) == BN_CLICKED) {
-                self->rename_current_profile();
-                return 0;
-            }
-            if (self && LOWORD(wParam) == IDC_PROFILE_COMBO &&
-                HIWORD(wParam) == CBN_SELCHANGE) {
-                int index = static_cast<int>(
-                    SendMessageW(self->prompt_profile_combo_, CB_GETCURSEL, 0, 0));
-                if (index >= 0) {
-                    wchar_t buffer[256] = {};
-                    SendMessageW(self->prompt_profile_combo_, CB_GETLBTEXT,
-                                 static_cast<WPARAM>(index),
-                                 reinterpret_cast<LPARAM>(buffer));
-                    self->select_profile_for_editing(wide_to_utf8(buffer));
-                }
-                return 0;
-            }
-            break;
-
-        case WM_CLOSE:
-            ShowWindow(hwnd, SW_HIDE);
-            return 0;
-
-        case WM_DESTROY:
-            if (self && self->prompt_hwnd_ == hwnd) {
-                self->prompt_hwnd_ = nullptr;
-                self->prompt_pre_label_ = nullptr;
-                self->prompt_pre_edit_ = nullptr;
-                self->prompt_profile_label_ = nullptr;
-                self->prompt_profile_edit_ = nullptr;
-                self->prompt_profile_combo_ = nullptr;
-                self->prompt_profile_new_button_ = nullptr;
-                self->prompt_profile_rename_button_ = nullptr;
-                self->prompt_transform_label_ = nullptr;
-                self->prompt_transform_edit_ = nullptr;
-                self->prompt_save_button_ = nullptr;
-                self->prompt_status_ = nullptr;
-            }
-            return 0;
-    }
-
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 } // namespace vtt
