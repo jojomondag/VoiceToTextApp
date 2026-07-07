@@ -1,241 +1,226 @@
 # VoiceToText
 
-A fast, local voice-to-text application for Windows built in C++ with GPU acceleration. Uses **KB-Whisper** models fine-tuned for Swedish by the National Library of Sweden (KBLab), running on **whisper.cpp** with CUDA support.
+VoiceToText is a local Windows dictation app built in C++. It records from your
+microphone, transcribes speech with whisper.cpp, optionally cleans the result
+through a local OpenAI-compatible LLM server, and inserts the final text into
+the app you are already using.
 
-Inspired by [Wispr Flow](https://wisprflow.ai) - designed for dictating thoughts directly into any application at high speed.
+The app is built for fast everyday dictation: start it once, leave it in the
+system tray, press a hotkey, speak, and get text back in the focused window.
 
-## Features
+## Highlights
 
-- **Local & Private** - All processing happens on your GPU. No data leaves your machine.
-- **GPU Accelerated** - CUDA support via whisper.cpp for fast transcription
-- **KB-Whisper Swedish** - State-of-the-art Swedish speech recognition (47% lower error rate than OpenAI Whisper)
-- **Multi-language** - Swedish, English, and auto-detect. Switch with Ctrl+Shift+L
-- **Works Everywhere** - Transcribed text is injected into any focused application via clipboard/keystrokes
-- **Optional LM Studio cleanup** - Send the finished transcription through a local OpenAI-compatible LM Studio model before insertion
-- **Press-to-Talk** - Hold Ctrl+Shift+Space to record, release to transcribe
-- **Voice Activity Detection** - Energy-based VAD with configurable thresholds
-- **System Tray** - Runs quietly in the background with status notifications
-- **Status Overlay** - Small floating indicator showing recording/processing state
-- **Configurable** - JSON config file for all settings
+- Swedish-first KB-Whisper model support.
+- Optional CUDA acceleration with automatic CPU/GPU selection.
+- Microphone capture with voice activity detection and silence trimming.
+- Optional local LLM cleanup and profile-based rewriting.
+- Transcript history with raw, cleaned, and AI Language views.
+- System tray controls and a floating status overlay.
 
 ## Requirements
 
-- **Windows 10/11** (64-bit)
-- **NVIDIA GPU** with CUDA support (for GPU acceleration)
-- **CUDA Toolkit 12.x** installed
-- **CMake 3.20+**
-- **Visual Studio 2022** (or Build Tools with C++ workload)
-- **A microphone**
+- Windows 10/11, 64-bit.
+- Visual Studio 2022 or Build Tools with the C++ workload.
+- CMake 3.20 or newer.
+- A microphone.
+- Optional: NVIDIA GPU and CUDA runtime/backend files for GPU acceleration.
+
+CPU builds are supported. CUDA is recommended for larger models.
 
 ## Quick Start
 
-### 1. Clone the repository
+Clone the repository:
 
-```bash
-git clone https://github.com/YOUR_USERNAME/VoiceToTextApp.git
+```powershell
+git clone https://github.com/jojomondag/VoiceToTextApp.git
 cd VoiceToTextApp
 ```
 
-### 2. Download a KB-Whisper model
+Download the default KB-Whisper model:
 
 ```powershell
-# Download large model (default, best quality, ~1.01 GB)
 .\scripts\download_model.ps1
-
-# Or choose a specific size:
-.\scripts\download_model.ps1 -Size small    # 167 MB, fast, good quality
-.\scripts\download_model.ps1 -Size medium   # 514 MB, high quality
-.\scripts\download_model.ps1 -Size tiny     # 29 MB, fastest, lower quality
 ```
 
-Available models from [KBLab on Hugging Face](https://huggingface.co/KBLab):
+Available model sizes are listed in [Models](#models).
 
-| Model | Size | Quality | Speed |
-|-------|------|---------|-------|
-| `tiny` | ~29 MB | Basic | Fastest |
-| `base` | ~53 MB | Decent | Fast |
-| `small` | ~167 MB | Good | Good balance |
-| `medium` | ~514 MB | High | Moderate |
-| `large` | ~1.01 GB | Best | Slower |
+Build and run:
 
-### 3. Build
+```powershell
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release
+.\build\bin\Release\VoiceToText.exe
+```
 
-```bash
+The app starts in the system tray by default.
+
+## Usage
+
+Default hotkeys:
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+Shift+Space` | Start or stop recording |
+| `Escape` | Cancel the current recording while recording |
+| `Ctrl+Shift+L` | Cycle language: Swedish, English, Auto |
+
+Typical flow:
+
+1. Put the cursor in any app where you want text.
+2. Press `Ctrl+Shift+Space`.
+3. Speak naturally.
+4. Press `Ctrl+Shift+Space` again.
+5. The final text appears in the focused app.
+
+You can also use the tray menu to start recording, switch language, change
+model size, change compute mode, open History, or exit.
+
+## History And Profiles
+
+The History window keeps recent dictations and shows:
+
+- Recorded voice: raw Whisper output.
+- Clean transcript: text after cleanup/profile transformation.
+- AI Language: compact AI-readable version for prompt-heavy workflows.
+
+Each history row includes copy buttons and profile controls. Clicking the
+profile text or profile icon opens the profile prompt editor. From there you can
+edit how each profile transforms cleaned text, create new profiles, and rename
+profiles.
+
+History is stored in `transcript_history.json` next to the executable unless
+configured otherwise.
+
+## Configuration
+
+On first run, the app creates `config.json` next to the executable. The full
+example lives in [config.example.json](config.example.json).
+
+Common settings are:
+
+| Setting | Meaning |
+| --- | --- |
+| `model_path` | GGML model file used by whisper.cpp. |
+| `language` | `sv`, `en`, or `auto`. |
+| `use_gpu` | Enables GPU use when available. |
+| `compute_mode` | `auto`, `cpu`, or `gpu`. |
+| `n_threads` | CPU inference threads. `0` means auto. |
+| `whisper_fast_mode` | Faster dictation-oriented Whisper settings. |
+| `warm_up_model_on_load` | Runs a small warmup after loading the model. |
+| `audio_device` | Optional microphone device name. Empty means default. |
+| `vad_threshold` | Voice activity sensitivity. Lower is more sensitive. |
+| `silence_duration_ms` | Silence duration used to detect speech end. |
+| `speech_min_duration_ms` | Minimum speech duration before accepting input. |
+| `trim_silence_before_transcription` | Trims leading/trailing silence. |
+| `toggle_key` | Virtual-key code for the recording hotkey key. |
+| `cancel_key` | Virtual-key code for cancel while recording. |
+| `injection_method` | `auto`, `clipboard`, or `keystrokes`. |
+| `llm_cleanup_enabled` | Enables local LLM processing. |
+| `llm_endpoint` | OpenAI-compatible chat completions endpoint. |
+| `llm_model` | Model name sent to the LLM endpoint. |
+| `llm_profiles` | Editable intent profiles and their instructions. |
+| `show_overlay` | Shows the floating status overlay. |
+| `start_minimized` | Starts in the tray instead of showing a window. |
+| `transcript_history_path` | History JSON path. |
+| `transcript_history_max_entries` | Number of history entries to keep. |
+
+## Local LLM Cleanup
+
+VoiceToText can send transcribed text to a local OpenAI-compatible chat
+completions server before insertion. LM Studio works well for this.
+
+Basic setup:
+
+1. Start LM Studio.
+2. Load a local chat model.
+3. Start the local server, usually on `http://127.0.0.1:1234`.
+4. In `config.json`, set:
+
+```json
+{
+  "llm_cleanup_enabled": true,
+  "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
+  "llm_model": "local-model"
+}
+```
+
+If the LLM request fails, the app falls back to the transcription instead of
+blocking dictation.
+
+## Models
+
+The download script fetches KB-Whisper GGML models from KBLab. To choose a
+specific size, pass `-Size`:
+
+```powershell
+.\scripts\download_model.ps1 -Size small
+```
+
+| Size | Approx. file size | Use case |
+| --- | ---: | --- |
+| `tiny` | 29 MB | Fast tests and very low latency. |
+| `base` | 53 MB | Lightweight dictation. |
+| `small` | 167 MB | Good everyday balance. |
+| `medium` | 514 MB | Better quality, slower. |
+| `large` | 1.01 GB | Best quality, highest resource use. |
+
+Model project:
+
+- [KB-Whisper](https://kb-labb.github.io/posts/2025-03-07-welcome-KB-Whisper/)
+- [KBLab on Hugging Face](https://huggingface.co/KBLab)
+
+## Building
+
+CUDA build:
+
+```powershell
 cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release
 ```
 
-The executable will be at `build/bin/Release/VoiceToText.exe`.
+CPU-only build:
 
-### 4. Run
-
-```bash
-.\build\bin\Release\VoiceToText.exe
-```
-
-The app starts minimized in the system tray.
-
-## Hotkeys
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+Shift+Space` | Toggle recording (press to start, press again to stop & transcribe) |
-| `Escape` | Cancel current recording |
-| `Ctrl+Shift+L` | Cycle language (Swedish → English → Auto-detect) |
-
-## Configuration
-
-Edit `config.json` (created automatically next to the executable):
-
-```json
-{
-    "model_path": "models/ggml-model-large-q5_0.bin",
-    "language": "sv",
-    "use_gpu": true,
-    "n_threads": 0,
-    "whisper_fast_mode": true,
-    "warm_up_model_on_load": true,
-    "audio_device": "",
-    "vad_threshold": 0.01,
-    "silence_duration_ms": 1500,
-    "speech_min_duration_ms": 200,
-    "trim_silence_before_transcription": true,
-    "trim_silence_padding_ms": 250,
-    "injection_method": "auto",
-    "keystroke_delay_ms": 5,
-    "pre_injection_delay_ms": 25,
-    "llm_cleanup_enabled": false,
-    "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
-    "llm_model": "local-model",
-    "llm_pre_prompt": "Du städar upp dikterade instruktioner innan de skickas till en AI-kodmodell. Rätta transkriberingsfel, fel ord som tydligt inte passar i sammanhanget, skiljetecken, versaler, grammatik och struktur. Gör texten tydlig, konkret och lätt för en kodmodell att agera på. Använd kodkontext när det är uppenbart, till exempel LM Studio, app.cpp, C++, CMake, PowerShell, JSON, API, endpoint och config. Bevara användarens avsikt, språk, ton, namn, sökvägar, kommandon, kodidentifierare, siffror och tekniska termer. Lägg inte till nya krav, antaganden eller förklaringar. Svara endast med den städade instruktionen.",
-    "llm_timeout_ms": 30000,
-    "llm_max_tokens": 4096,
-    "llm_corrections_enabled": true,
-    "llm_corrections_path": "transcription_corrections.json",
-    "llm_corrections_max_entries": 200,
-    "llm_corrections_prompt_limit": 20,
-    "llm_corrections_min_count": 1,
-    "llm_ai_language_enabled": true,
-    "llm_ai_language_prompt": "Skapa en ultrakompakt AI-läsbar instruktionsdialekt från användarens städade instruktion. Komprimera aggressivt men bevara avsikt, krav, begränsningar, entiteter, kodnamn, sökvägar, siffror och åtgärdsordning. Identifiera och ta bort upprepningar, utfyllnad och otydlighet. Strukturera tätt med etiketter som Goal, Context, Tasks, Constraints och Output när det hjälper. Använd förkortningar bara när en kodmodell entydigt förstår dem. Lägg inte till nya krav eller antaganden. Svara endast med AI-språkversionen.",
-    "llm_intent_profiles_enabled": true,
-    "llm_intent_detection_prompt": "Identifiera användarens avsikt från texten och välj exakt en profil: coding, email, discussion, translation eller general. Svara endast med strikt JSON: {\"profile\":\"coding|email|discussion|translation|general\"}.",
-    "llm_profile_transform_prompt": "Transformera texten enligt vald profil. coding: gör texten konkret, åtgärdsbar och tydlig för en kodmodell. email: gör den till ett tydligt mailutkast med passande ton. Lägg inte till placeholders, signatur eller ämnesrad om användaren inte bad om det. discussion: bevara samtalston och gör resonemanget klart. translation: översätt eller förbered översättning enligt användarens begäran och bevara betydelsen. general: städa texten utan särskild formatering. Lägg inte till nya krav. Svara endast med den transformerade texten.",
-    "show_overlay": true,
-    "start_minimized": true,
-    "auto_start": false,
-    "transcript_history_path": "transcript_history.json",
-    "transcript_history_max_entries": 100
-}
-```
-
-### Key settings
-
-- **`model_path`** - Path to the GGML model file
-- **`language`** - `"sv"` (Swedish), `"en"` (English), or `"auto"` (auto-detect)
-- **`use_gpu`** - `true` for CUDA GPU acceleration, `false` for CPU only
-- **`n_threads`** - CPU threads for inference (when using CPU); `0` auto-detects available hardware threads
-- **`whisper_fast_mode`** - `true` skips timestamp decoding and suppresses non-speech tokens for faster dictation output
-- **`warm_up_model_on_load`** - `true` runs a tiny background warmup after model load so the first real transcription feels faster
-- **`vad_threshold`** - Voice activity detection sensitivity (lower = more sensitive)
-- **`trim_silence_before_transcription`** - `true` trims leading/trailing silence before Whisper runs
-- **`trim_silence_padding_ms`** - Padding kept around detected speech after silence trimming
-- **`injection_method`** - `"auto"`, `"clipboard"`, or `"keystrokes"`
-- **`pre_injection_delay_ms`** - Short pause before injecting text after transcription; lower values feel snappier
-- **`llm_cleanup_enabled`** - `true` to clean transcription text through LM Studio before insertion
-- **`llm_endpoint`** - LM Studio OpenAI-compatible chat completions URL, usually `http://127.0.0.1:1234/v1/chat/completions`
-- **`llm_model`** - Model identifier shown by LM Studio for your loaded Gemma model
-- **`llm_pre_prompt`** - Instruction that tells the local LLM how to clean dictated text before insertion
-- **`llm_timeout_ms`** - How long to wait for cleanup before falling back to raw transcription
-- **`llm_corrections_enabled`** - `true` to learn recurring raw-to-cleaned transcription corrections
-- **`llm_corrections_path`** - JSON file where learned corrections are stored next to the executable
-- **`llm_corrections_prompt_limit`** - Maximum learned corrections included in each LM Studio prompt
-- **`llm_ai_language_enabled`** - `true` to generate a third compact AI-readable history version
-- **`llm_ai_language_prompt`** - Prompt used to compress cleaned text into AI Language
-- **`llm_intent_profiles_enabled`** - `true` to auto-detect intent and apply a profile during cleanup
-- **`llm_intent_detection_prompt`** - Prompt used for the second pass that classifies the user's intent
-- **`llm_profile_transform_prompt`** - Prompt used for the third pass that transforms text according to the detected profile
-- **`transcript_history_path`** - JSON file where raw and cleaned transcription history is stored
-- **`transcript_history_max_entries`** - Maximum number of history entries kept for the History window
-
-### LM Studio cleanup
-
-1. Start LM Studio and load your Gemma model.
-2. Open the Local Server tab and start the OpenAI-compatible server on port `1234`.
-3. In `config.json` next to `VoiceToText.exe`, set:
-
-```json
-{
-    "llm_cleanup_enabled": true,
-    "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
-    "llm_model": "local-model",
-    "llm_pre_prompt": "Du städar upp dikterade instruktioner innan de skickas till en AI-kodmodell. Rätta transkriberingsfel, fel ord som tydligt inte passar i sammanhanget, skiljetecken, versaler, grammatik och struktur. Gör texten tydlig, konkret och lätt för en kodmodell att agera på. Använd kodkontext när det är uppenbart, till exempel LM Studio, app.cpp, C++, CMake, PowerShell, JSON, API, endpoint och config. Bevara användarens avsikt, språk, ton, namn, sökvägar, kommandon, kodidentifierare, siffror och tekniska termer. Lägg inte till nya krav, antaganden eller förklaringar. Svara endast med den städade instruktionen.",
-    "llm_corrections_enabled": true,
-    "llm_corrections_path": "transcription_corrections.json",
-    "llm_ai_language_enabled": true
-}
-```
-
-If LM Studio is not running or the request fails, VoiceToText writes the raw Whisper transcription instead.
-
-## How It Works
-
-1. **Press Ctrl+Shift+Space** → Recording starts, overlay shows blue "Listening..." indicator
-2. **Speak naturally** → Audio is captured at 16kHz from your microphone
-3. **Press Ctrl+Shift+Space again** → Recording stops, overlay shows yellow "Processing..."
-4. **Whisper processes audio** → KB-Whisper model runs inference on your GPU
-5. **Optional LM Studio cleanup** → Text is polished locally through your loaded model
-6. **Optional AI Language pass** → A compact model-readable version is stored in history
-7. **Text is injected** → Transcribed text appears in whatever application has focus
-
-## Architecture
-
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Hotkey Mgr  │────▶│     App      │◀────│  System Tray │
-└──────────────┘     └──────┬───────┘     └──────────────┘
-                            │
-                 ┌──────────┼──────────┐
-                 ▼          ▼          ▼
-          ┌───────────┐ ┌────────┐ ┌───────────┐
-          │  Audio    │ │Whisper │ │   Text    │
-          │ Capture   │ │ Engine │ │ Injector  │
-          │(miniaudio)│ │(.cpp)  │ │(SendInput)│
-          └─────┬─────┘ └────────┘ └───────────┘
-                │
-          ┌─────▼─────┐
-          │   VAD     │
-          │(energy)   │
-          └───────────┘
-```
-
-## Building Without GPU
-
-To build CPU-only (no CUDA required):
-
-```bash
+```powershell
 cmake -B build -DGGML_CUDA=OFF
 cmake --build build --config Release
 ```
 
+Debug build:
+
+```powershell
+cmake --build build --config Debug
+```
+
+The executable is written to:
+
+```text
+build\bin\Release\VoiceToText.exe
+```
+
+## Packaging
+
+There is a helper script for creating a standalone folder:
+
+```powershell
+.\scripts\package_standalone.ps1
+```
+
+The package script copies the executable, runtime DLLs, model/config files where
+available, and standalone notes into `dist\VoiceToText`.
+
 ## Dependencies
 
-All dependencies are automatically fetched via CMake FetchContent:
+CMake fetches or wires the required dependencies:
 
-- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) - C/C++ Whisper inference
-- [miniaudio](https://github.com/mackron/miniaudio) - Audio capture (single header)
-- [nlohmann/json](https://github.com/nlohmann/json) - JSON configuration
+- [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+- [miniaudio](https://github.com/mackron/miniaudio)
+- [nlohmann/json](https://github.com/nlohmann/json)
 
-## KB-Whisper Models
+## Repository Notes
 
-This application uses [KB-Whisper](https://kb-labb.github.io/posts/2025-03-07-welcome-KB-Whisper/) models from the National Library of Sweden. These models achieve an average **47% reduction in Word Error Rate** compared to OpenAI's Whisper-large-v3 for Swedish speech.
-
-Model repositories on Hugging Face:
-- [kb-whisper-tiny](https://huggingface.co/KBLab/kb-whisper-tiny)
-- [kb-whisper-base](https://huggingface.co/KBLab/kb-whisper-base)
-- [kb-whisper-small](https://huggingface.co/KBLab/kb-whisper-small)
-- [kb-whisper-medium](https://huggingface.co/KBLab/kb-whisper-medium)
-- [kb-whisper-large](https://huggingface.co/KBLab/kb-whisper-large)
+Generated build folders such as `build` and `build-cuda` are local build
+artifacts. They are not required to understand or modify the source code.
 
 ## License
 
-MIT License
+MIT License. See [LICENSE](LICENSE).
