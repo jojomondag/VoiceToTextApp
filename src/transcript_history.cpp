@@ -55,9 +55,9 @@ void append_entry_text(std::ostringstream& oss,
                        int display_index,
                        int token_count) {
     oss << "[[VTT_ENTRY_BEGIN:" << display_index << "]]";
-    oss << "[" << entry.timestamp << "]    Profile: " << entry.intent_profile
+    oss << "[" << entry.timestamp << "]            Profile: " << entry.intent_profile
         << "    Tokens: " << token_count << "\r\n";
-    oss << text << "[[VTT_ENTRY_END:" << display_index << "]]\r\n\r\n";
+    oss << text << "[[VTT_ENTRY_END:" << display_index << "]]\r\n";
 }
 
 } // namespace
