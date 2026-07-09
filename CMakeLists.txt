@@ -10,6 +10,11 @@ include(FetchContent)
 # whisper.cpp  (with optional CUDA / GPU support)
 # ---------------------------------------------------------------------------
 option(VTT_CUDA "Enable CUDA GPU acceleration" OFF)
+
+# Release binaries must run on the user's CPU, not on the CPU of the build
+# runner. Native instruction selection can emit AVX/AVX512 instructions that
+# make the app terminate with STATUS_ILLEGAL_INSTRUCTION on older machines.
+set(GGML_NATIVE OFF CACHE BOOL "Disable host-specific CPU instructions" FORCE)
 if(VTT_CUDA)
     set(GGML_CUDA ON CACHE BOOL "Enable CUDA support for whisper.cpp" FORCE)
 else()
