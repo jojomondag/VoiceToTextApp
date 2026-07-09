@@ -47,6 +47,10 @@ The repository also contains the macOS DMG packaging path in
 Win32 APIs and therefore needs a macOS platform port before a functional macOS
 installer can be published.
 
+VoiceToText runs in the Windows notification area rather than as a normal
+taskbar window. If Windows has collapsed notification icons, open the hidden
+icons menu near the clock and enable VoiceToText under taskbar settings.
+
 ![VoiceToText MarketGraphic](assets/MarketGraphic.png)
 
 ## Usage

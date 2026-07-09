@@ -32,6 +32,13 @@
 namespace vtt {
 
 namespace {
+// A stable GUID lets Windows remember this notification-area icon instead of
+// treating every launch as a new, unrecognised tray application.
+const GUID VOICETOTEXT_TRAY_GUID = {
+    0x6e8d2f15, 0x4f41, 0x4c40,
+    {0x9a, 0x2c, 0x56, 0x9d, 0x0b, 0x4d, 0x2e, 0x71}
+};
+
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) return L"";
 
@@ -171,9 +178,10 @@ bool TrayIcon::initialize(HWND hwnd, HINSTANCE hInstance) {
     nid_.cbSize = sizeof(NOTIFYICONDATAW);
     nid_.hWnd = hwnd_;
     nid_.uID = 1;
-    nid_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_GUID;
     nid_.uCallbackMessage = WM_TRAYICON;
     nid_.hIcon = icon_idle_;
+    nid_.guidItem = VOICETOTEXT_TRAY_GUID;
     wcscpy_s(nid_.szTip, L"VoiceToText - Ready");
 
     if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
