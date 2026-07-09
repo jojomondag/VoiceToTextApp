@@ -53,10 +53,14 @@ void append_entry_text(std::ostringstream& oss,
                        const TranscriptHistoryEntry& entry,
                        const std::string& text,
                        int display_index,
-                       int token_count) {
+                       int token_count,
+                       bool include_profile) {
     oss << "[[VTT_ENTRY_BEGIN:" << display_index << "]]";
-    oss << "[" << entry.timestamp << "]            Profile: " << entry.intent_profile
-        << "    Tokens: " << token_count << "\r\n";
+    oss << "[" << entry.timestamp << "]            ";
+    if (include_profile) {
+        oss << "Profile: " << entry.intent_profile << "    ";
+    }
+    oss << "Tokens: " << token_count << "\r\n";
     oss << text << "[[VTT_ENTRY_END:" << display_index << "]]\r\n";
 }
 
@@ -106,7 +110,7 @@ std::string TranscriptHistory::format_recorded() const {
     int display_index = 0;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
         append_entry_text(oss, *it, it->recorded, display_index++,
-                          it->recorded_tokens);
+                          it->recorded_tokens, false);
     }
     return oss.str();
 }
@@ -117,7 +121,7 @@ std::string TranscriptHistory::format_transcribed() const {
     int display_index = 0;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
         append_entry_text(oss, *it, it->transcribed, display_index++,
-                          it->transcribed_tokens);
+                          it->transcribed_tokens, true);
     }
     return oss.str();
 }
@@ -128,7 +132,7 @@ std::string TranscriptHistory::format_ai_language() const {
     int display_index = 0;
     for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
         append_entry_text(oss, *it, it->ai_language, display_index++,
-                          it->ai_language_tokens);
+                          it->ai_language_tokens, true);
     }
     return oss.str();
 }

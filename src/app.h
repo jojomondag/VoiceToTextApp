@@ -15,6 +15,7 @@
 #include "tray_icon.h"
 #include "config_manager.h"
 #include "llm_cleaner.h"
+#include "gemma_runtime.h"
 #include "correction_store.h"
 #include "transcript_history.h"
 #include "history_window.h"
@@ -51,11 +52,26 @@ private:
     // Model selection
     void select_model(const std::string& model_size);
     void select_compute_mode(const std::string& compute_mode);
+    void select_whisper_compute_mode(const std::string& mode);
+    void select_gemma_compute_mode(const std::string& mode);
     void download_and_select_model(const std::string& model_size,
                                    const std::string& model_path);
+    void select_gemma_model(const std::string& model_id);
+    void download_and_select_gemma_model(const std::string& model_id,
+                                         const std::string& model_path);
+    void configure_llm_cleaner();
+    bool ensure_internal_llm_runtime();
+    bool ensure_llama_server_available(std::string& server_path);
+    std::string current_gemma_model_id() const;
+    std::string gemma_model_path_for_id_config(const std::string& model_id) const;
+    std::string find_existing_gemma_model_path(const std::string& model_id) const;
+    std::string gemma_model_download_path(const std::string& model_id) const;
+    std::vector<std::string> installed_gemma_model_ids() const;
+    std::string resolve_llama_server_path(const std::string& server_path) const;
     bool ensure_startup_model_available();
     std::string current_model_size() const;
     std::string current_compute_mode() const;
+    std::string current_gemma_compute_mode() const;
     std::string resolve_model_path(const std::string& model_path) const;
     std::string model_path_for_size(const std::string& model_size) const;
     std::string model_url_for_size(const std::string& model_size) const;
@@ -79,6 +95,7 @@ private:
     std::unique_ptr<OverlayWindow> overlay_;
     std::unique_ptr<TrayIcon> tray_;
     std::unique_ptr<LlmCleaner> llm_cleaner_;
+    std::unique_ptr<GemmaRuntime> gemma_runtime_;
     std::unique_ptr<CorrectionStore> correction_store_;
     std::unique_ptr<TranscriptHistory> transcript_history_;
     std::unique_ptr<HistoryWindow> history_window_;

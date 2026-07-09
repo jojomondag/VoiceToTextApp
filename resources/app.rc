@@ -1,4 +1,8 @@
 #include <windows.h>
+#include "resource.h"
+
+IDI_APP_ICON ICON "voice_app_logo.ico"
+IDI_RECORDING_ICON ICON "voice_app_logo_recording.ico"
 
 // Version info
 VS_VERSION_INFO VERSIONINFO

@@ -42,11 +42,19 @@ struct AppConfig {
     std::string injection_method = "auto"; // "auto", "clipboard", "keystrokes"
     int keystroke_delay_ms = 5;
     int pre_injection_delay_ms = 25;
+    std::string paste_output_mode = "clean"; // "ai", "recorded", "clean"
 
-    // Local LLM cleanup (LM Studio OpenAI-compatible server)
+    // Local LLM cleanup
     bool llm_cleanup_enabled = false;
+    std::string llm_provider = "lmstudio"; // "lmstudio", "internal"
     std::string llm_endpoint = "http://127.0.0.1:1234/v1/chat/completions";
     std::string llm_model = "local-model";
+    std::string llm_internal_model = "auto";
+    std::string llm_internal_model_path = "models/llm/gemma-4-E2B-it-Q8_0.gguf";
+    std::string llm_internal_compute_mode = "auto";
+    std::string llm_internal_server_path = "llama-server.exe";
+    int llm_internal_port = 8088;
+    bool llm_internal_auto_start = true;
     std::string llm_pre_prompt =
         "You clean up dictated instructions before they are sent to an AI "
         "coding model. Fix transcription mistakes, wrong words that clearly "
@@ -58,7 +66,7 @@ struct AppConfig {
         "code identifiers, numbers, and technical terms. Do not add new "
         "requirements or explanations. Return only the cleaned instruction.";
     int llm_timeout_ms = 30000;
-    int llm_max_tokens = 4096;
+    int llm_max_tokens = 4096;          // Dynamic per-request ceiling
     bool llm_corrections_enabled = true;
     std::string llm_corrections_path = "transcription_corrections.json";
     int llm_corrections_max_entries = 200;
@@ -124,7 +132,11 @@ struct AppConfig {
         trim_silence_before_transcription, trim_silence_padding_ms,
         toggle_key, cancel_key,
         injection_method, keystroke_delay_ms, pre_injection_delay_ms,
-        llm_cleanup_enabled, llm_endpoint, llm_model, llm_pre_prompt,
+        paste_output_mode,
+        llm_cleanup_enabled, llm_provider, llm_endpoint, llm_model,
+        llm_internal_model, llm_internal_model_path,
+        llm_internal_compute_mode, llm_internal_server_path,
+        llm_internal_port, llm_internal_auto_start, llm_pre_prompt,
         llm_timeout_ms, llm_max_tokens, llm_corrections_enabled,
         llm_corrections_path, llm_corrections_max_entries,
         llm_corrections_prompt_limit, llm_corrections_min_count,

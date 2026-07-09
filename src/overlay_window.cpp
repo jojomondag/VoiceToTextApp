@@ -1,18 +1,25 @@
 #include "overlay_window.h"
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <gdiplus.h>
+#include <string>
+#include <utility>
+#include <windowsx.h>
 
 using namespace Gdiplus;
 
 namespace vtt {
 
-static constexpr int OVERLAY_WIDTH = 360;
-static constexpr int OVERLAY_HEIGHT = 102;
+static constexpr int OVERLAY_WIDTH = 500;
+static constexpr int OVERLAY_HEIGHT = 140;
+static constexpr int OVERLAY_COMPACT_HEIGHT = 60;
 static constexpr int DOT_RADIUS = 10;
 static constexpr int CORNER_RADIUS = 20;
 static constexpr int PADDING = 18;
-static constexpr int WAVEFORM_HEIGHT = 30;
+static constexpr int WAVEFORM_HEIGHT = 28;
 static constexpr int WAVEFORM_BARS = 28;
+static constexpr int PASTE_BUTTON_COUNT = 3;
 static constexpr const wchar_t* OVERLAY_CLASS_NAME = L"VTTOverlayWindow";
 
 static constexpr COLORREF COLOR_LISTENING  = RGB(66, 133, 244);
@@ -50,6 +57,50 @@ static Color gdip_color(COLORREF color, BYTE alpha = 255) {
     return Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color));
 }
 
+static bool file_exists(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static std::wstring exe_directory() {
+    wchar_t path[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return L".";
+
+    std::wstring dir(path, len);
+    size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return L".";
+    return dir.substr(0, slash);
+}
+
+static Bitmap* load_resource_bitmap(const wchar_t* filename) {
+    const std::wstring name(filename);
+    const std::wstring exe_dir = exe_directory();
+    const std::wstring candidates[] = {
+        exe_dir + L"\\resources\\" + name,
+        L"resources\\" + name,
+        L"..\\..\\resources\\" + name,
+    };
+
+    for (const auto& path : candidates) {
+        if (!file_exists(path)) continue;
+        Bitmap* bitmap = Bitmap::FromFile(path.c_str(), FALSE);
+        if (bitmap && bitmap->GetLastStatus() == Ok) return bitmap;
+        delete bitmap;
+    }
+
+    return nullptr;
+}
+
+static std::string normalize_paste_mode(std::string mode) {
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "ai" || mode == "ai_language" || mode == "ai-language") return "ai";
+    if (mode == "recorded" || mode == "recorded_voice" || mode == "voice") return "recorded";
+    return "clean";
+}
+
 static void add_rounded_rect(GraphicsPath& path, REAL x, REAL y,
                              REAL width, REAL height, REAL radius) {
     REAL diameter = radius * 2.0f;
@@ -75,6 +126,7 @@ bool OverlayWindow::initialize(HINSTANCE hInstance) {
         gdiplus_token_ = 0;
         return false;
     }
+    load_paste_button_icons();
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -111,6 +163,7 @@ void OverlayWindow::shutdown() {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
+    release_paste_button_icons();
     if (hInstance_) {
         UnregisterClassW(OVERLAY_CLASS_NAME, hInstance_);
         hInstance_ = nullptr;
@@ -120,6 +173,20 @@ void OverlayWindow::shutdown() {
         gdiplus_token_ = 0;
     }
     initialized_ = false;
+}
+
+void OverlayWindow::load_paste_button_icons() {
+    release_paste_button_icons();
+    paste_button_icons_[0] = load_resource_bitmap(L"overlay_voice_mode.png");
+    paste_button_icons_[1] = load_resource_bitmap(L"overlay_ai_language_mode.png");
+    paste_button_icons_[2] = load_resource_bitmap(L"overlay_cleanup_mode.png");
+}
+
+void OverlayWindow::release_paste_button_icons() {
+    for (auto*& icon : paste_button_icons_) {
+        delete icon;
+        icon = nullptr;
+    }
 }
 
 void OverlayWindow::show(OverlayState state, const std::string& text) {
@@ -173,6 +240,16 @@ void OverlayWindow::set_progress(float progress, const std::string& text) {
     if (hwnd_ && IsWindowVisible(hwnd_)) paint();
 }
 
+void OverlayWindow::set_paste_output_mode(const std::string& mode) {
+    paste_output_mode_ = normalize_paste_mode(mode);
+    if (hwnd_ && IsWindowVisible(hwnd_)) paint();
+}
+
+void OverlayWindow::set_paste_mode_callback(
+    std::function<void(const std::string&)> callback) {
+    paste_mode_callback_ = std::move(callback);
+}
+
 LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     OverlayWindow* self = nullptr;
 
@@ -193,8 +270,39 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             return 0;
         }
 
-        case WM_NCHITTEST:
+        case WM_NCHITTEST: {
+            if (self && self->state_ == OverlayState::Listening) {
+                POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ScreenToClient(hwnd, &pt);
+                if (self->hit_test_paste_button(pt.x, pt.y) >= 0) return HTCLIENT;
+            }
             return HTCAPTION;
+        }
+
+        case WM_MOUSEMOVE:
+            if (self && self->state_ == OverlayState::Listening) {
+                self->update_hover(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                TRACKMOUSEEVENT tme = {};
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&tme);
+            }
+            return 0;
+
+        case WM_MOUSELEAVE:
+            if (self && self->hover_button_ != -1) {
+                self->hover_button_ = -1;
+                self->paint();
+            }
+            return 0;
+
+        case WM_LBUTTONDOWN:
+            if (self && self->state_ == OverlayState::Listening &&
+                self->handle_button_click(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {
+                return 0;
+            }
+            break;
 
         case WM_ERASEBKGND:
             return 1;
@@ -206,8 +314,88 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+int OverlayWindow::hit_test_paste_button(int x, int y) const {
+    for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
+        const RECT& rc = paste_button_rects_[i];
+        if (x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void OverlayWindow::update_hover(int x, int y) {
+    int hit = hit_test_paste_button(x, y);
+    if (hit != hover_button_) {
+        hover_button_ = hit;
+        paint();
+    }
+}
+
+bool OverlayWindow::handle_button_click(int x, int y) {
+    int hit = hit_test_paste_button(x, y);
+    if (hit < 0) return false;
+
+    const char* modes[] = {"recorded", "ai", "clean"};
+    paste_output_mode_ = modes[hit];
+    if (paste_mode_callback_) {
+        paste_mode_callback_(paste_output_mode_);
+    }
+    paint();
+    return true;
+}
+
+static void draw_robot_icon(Graphics& g, const RectF& rc, Color color) {
+    Pen pen(color, 1.7f);
+    SolidBrush brush(color);
+    REAL headX = rc.X + 4.0f;
+    REAL headY = rc.Y + 6.0f;
+    REAL headW = rc.Width - 8.0f;
+    REAL headH = rc.Height - 9.0f;
+    GraphicsPath head;
+    add_rounded_rect(head, headX, headY, headW, headH, 4.0f);
+    g.DrawPath(&pen, &head);
+    g.FillEllipse(&brush, headX + 4.0f, headY + 6.0f, 3.0f, 3.0f);
+    g.FillEllipse(&brush, headX + headW - 7.0f, headY + 6.0f, 3.0f, 3.0f);
+    g.DrawLine(&pen, headX + 6.0f, headY + headH - 6.0f,
+               headX + headW - 6.0f, headY + headH - 6.0f);
+    g.DrawLine(&pen, rc.X + rc.Width / 2.0f, rc.Y + 6.0f,
+               rc.X + rc.Width / 2.0f, rc.Y + 2.0f);
+    g.FillEllipse(&brush, rc.X + rc.Width / 2.0f - 1.7f, rc.Y, 3.4f, 3.4f);
+}
+
+static void draw_mic_icon(Graphics& g, const RectF& rc, Color color) {
+    Pen pen(color, 1.8f);
+    GraphicsPath mic;
+    add_rounded_rect(mic, rc.X + 7.0f, rc.Y + 1.5f,
+                     rc.Width - 14.0f, rc.Height - 8.0f, 6.0f);
+    g.DrawPath(&pen, &mic);
+    g.DrawArc(&pen, rc.X + 3.0f, rc.Y + 8.0f, rc.Width - 6.0f,
+              rc.Height - 8.0f, 0.0f, 180.0f);
+    g.DrawLine(&pen, rc.X + rc.Width / 2.0f, rc.Y + rc.Height - 4.0f,
+               rc.X + rc.Width / 2.0f, rc.Y + rc.Height);
+    g.DrawLine(&pen, rc.X + 7.0f, rc.Y + rc.Height,
+               rc.X + rc.Width - 7.0f, rc.Y + rc.Height);
+}
+
+static void draw_clean_icon(Graphics& g, const RectF& rc, Color color) {
+    Pen pen(color, 1.7f);
+    REAL x = rc.X + 5.0f;
+    REAL y = rc.Y + 1.5f;
+    REAL w = rc.Width - 10.0f;
+    REAL h = rc.Height - 3.0f;
+    g.DrawRectangle(&pen, x, y, w, h);
+    g.DrawLine(&pen, x + 4.0f, y + 6.0f, x + w - 4.0f, y + 6.0f);
+    g.DrawLine(&pen, x + 4.0f, y + 11.0f, x + w - 7.0f, y + 11.0f);
+    g.DrawLine(&pen, x + 4.0f, y + 16.0f, x + w - 10.0f, y + 16.0f);
+}
+
 void OverlayWindow::paint() {
     if (!hwnd_ || !gdiplus_token_) return;
+
+    const int overlayHeight = state_ == OverlayState::Processing
+                                  ? OVERLAY_COMPACT_HEIGHT
+                                  : OVERLAY_HEIGHT;
 
     // State color and default text
     COLORREF dotColor = COLOR_LISTENING;
@@ -240,7 +428,7 @@ void OverlayWindow::paint() {
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = OVERLAY_WIDTH;
-    bmi.bmiHeader.biHeight = -OVERLAY_HEIGHT;
+    bmi.bmiHeader.biHeight = -overlayHeight;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -260,13 +448,14 @@ void OverlayWindow::paint() {
     Graphics g(memDC);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     g.Clear(Color(0, 0, 0, 0));
 
     GraphicsPath bgPath;
     add_rounded_rect(bgPath, 0.5f, 0.5f,
                      static_cast<REAL>(OVERLAY_WIDTH - 1),
-                     static_cast<REAL>(OVERLAY_HEIGHT - 1),
+                     static_cast<REAL>(overlayHeight - 1),
                      static_cast<REAL>(CORNER_RADIUS));
     SolidBrush bgBrush(Color(235, 32, 33, 36));
     g.FillPath(&bgBrush, &bgPath);
@@ -277,7 +466,45 @@ void OverlayWindow::paint() {
     float seconds = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
     float pulse = (std::sin(seconds * 4.2f) + 1.0f) * 0.5f;
 
+    const REAL modeIconSize = 42.0f;
+    const REAL modeIconGap = 8.0f;
+    const REAL modeIconTotalW =
+        PASTE_BUTTON_COUNT * modeIconSize + (PASTE_BUTTON_COUNT - 1) * modeIconGap;
+
     REAL dotX = static_cast<REAL>(PADDING + DOT_RADIUS);
+    REAL textLeft = 0;
+    REAL textWidthAllowed = 0;
+
+    std::wstring wText = utf8_to_wide(displayText);
+    FontFamily fontFamily(L"Segoe UI");
+    Font font(&fontFamily, 20.0f, FontStyleBold, UnitPixel);
+    PointF measureOrigin(0, 0);
+    RectF measureRect;
+    g.MeasureString(wText.c_str(), -1, &font, measureOrigin, &measureRect);
+    REAL textWidth = measureRect.Width;
+
+    if (state_ == OverlayState::Listening) {
+        dotX = static_cast<REAL>(PADDING + DOT_RADIUS);
+        REAL iconAreaX = static_cast<REAL>(OVERLAY_WIDTH - PADDING - modeIconTotalW);
+        REAL leftBound = dotX + DOT_RADIUS + 12.0f;
+        REAL rightBound = iconAreaX - 8.0f;
+        if (rightBound <= leftBound) rightBound = leftBound + 1.0f;
+        REAL availableW = rightBound - leftBound;
+        REAL useW = (std::min)(textWidth, availableW);
+        textLeft = leftBound + (availableW - useW) / 2.0f;
+        textWidthAllowed = useW;
+    } else {
+        dotX = static_cast<REAL>(PADDING + DOT_RADIUS);
+        REAL leftBound = dotX + DOT_RADIUS + 12.0f;
+        REAL rightBound = static_cast<REAL>(OVERLAY_WIDTH) - PADDING;
+        if (rightBound <= leftBound) rightBound = leftBound + 1.0f;
+        REAL availableW = rightBound - leftBound;
+        REAL useW = (std::min)(textWidth, availableW);
+        textLeft = (state_ == OverlayState::Processing)
+                       ? leftBound + (availableW - useW) / 2.0f
+                       : leftBound;
+        textWidthAllowed = useW;
+    }
     REAL dotY = static_cast<REAL>(PADDING + DOT_RADIUS + 1);
     if (state_ == OverlayState::Listening) {
         REAL haloRadius = DOT_RADIUS + 3.5f + pulse * 4.5f;
@@ -291,12 +518,9 @@ void OverlayWindow::paint() {
     g.FillEllipse(&dotBrush, dotX - DOT_RADIUS, dotY - DOT_RADIUS,
                   DOT_RADIUS * 2.0f, DOT_RADIUS * 2.0f);
 
-    std::wstring wText = utf8_to_wide(displayText);
-    FontFamily fontFamily(L"Segoe UI");
-    Font font(&fontFamily, 18.0f, FontStyleBold, UnitPixel);
     SolidBrush textBrush(gdip_color(COLOR_TEXT));
-    RectF textRect(dotX + DOT_RADIUS + 12.0f, PADDING - 1.0f,
-                   OVERLAY_WIDTH - (dotX + DOT_RADIUS + 30.0f), 28.0f);
+    RectF textRect(textLeft, PADDING - 1.0f,
+                   textWidthAllowed, 28.0f);
     StringFormat textFormat;
     textFormat.SetLineAlignment(StringAlignmentCenter);
     textFormat.SetTrimming(StringTrimmingEllipsisCharacter);
@@ -332,6 +556,64 @@ void OverlayWindow::paint() {
         g.DrawString(percentText.c_str(), -1, &percentFont,
                      percentRect, &percentFormat, &percentBrush);
     } else if (state_ == OverlayState::Listening) {
+        const char* modes[] = {"recorded", "ai", "clean"};
+        REAL modeIconY = static_cast<REAL>(PADDING - 4);
+        REAL iconStartX = static_cast<REAL>(OVERLAY_WIDTH - PADDING - modeIconTotalW);
+
+        for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
+            REAL x = iconStartX + i * (modeIconSize + modeIconGap);
+            REAL y = modeIconY;
+            paste_button_rects_[i] = {
+                static_cast<LONG>(std::floor(x - 4.0f)),
+                static_cast<LONG>(std::floor(y - 4.0f)),
+                static_cast<LONG>(std::ceil(x + modeIconSize + 4.0f)),
+                static_cast<LONG>(std::ceil(y + modeIconSize + 4.0f))
+            };
+
+            bool selected = paste_output_mode_ == modes[i];
+            bool hovered = hover_button_ == i;
+            if (selected || hovered) {
+                BYTE alpha = selected ? 85 : 45;
+                SolidBrush haloBrush(gdip_color(COLOR_LISTENING, alpha));
+                g.FillEllipse(&haloBrush, x - 3.0f, y - 3.0f,
+                              modeIconSize + 6.0f, modeIconSize + 6.0f);
+            }
+
+            Color iconColor;
+            if (selected) {
+                iconColor = Color(255, 255, 255, 255);
+            } else {
+                iconColor = Color(55, 255, 255, 255);
+            }
+            RectF iconRect(x, y, modeIconSize, modeIconSize);
+            if (paste_button_icons_[i]) {
+                if (selected) {
+                    g.DrawImage(paste_button_icons_[i], iconRect);
+                } else {
+                    ColorMatrix fadeMatrix = {
+                        0.299f, 0.299f, 0.299f, 0, 0,
+                        0.587f, 0.587f, 0.587f, 0, 0,
+                        0.114f, 0.114f, 0.114f, 0, 0,
+                        0,      0,      0,      0.22f, 0,
+                        0,      0,      0,      0,     1
+                    };
+                    ImageAttributes attr;
+                    attr.SetColorMatrix(&fadeMatrix);
+                    g.DrawImage(paste_button_icons_[i], iconRect,
+                                0, 0,
+                                paste_button_icons_[i]->GetWidth(),
+                                paste_button_icons_[i]->GetHeight(),
+                                UnitPixel, &attr);
+                }
+            } else if (i == 0) {
+                draw_mic_icon(g, iconRect, iconColor);
+            } else if (i == 1) {
+                draw_robot_icon(g, iconRect, iconColor);
+            } else {
+                draw_clean_icon(g, iconRect, iconColor);
+            }
+        }
+
         REAL graphX = static_cast<REAL>(PADDING);
         REAL graphY = static_cast<REAL>(OVERLAY_HEIGHT - PADDING - WAVEFORM_HEIGHT);
         REAL graphW = static_cast<REAL>(OVERLAY_WIDTH - PADDING * 2);
@@ -342,8 +624,8 @@ void OverlayWindow::paint() {
         SolidBrush graphBg(Color(150, 48, 49, 54));
         g.FillPath(&graphBg, &graphPath);
 
-        REAL gap = 4.0f;
-        REAL barWidth = (graphW - (WAVEFORM_BARS - 1) * gap) / WAVEFORM_BARS;
+        REAL barGap = 4.0f;
+        REAL barWidth = (graphW - (WAVEFORM_BARS - 1) * barGap) / WAVEFORM_BARS;
         if (barWidth < 4.0f) barWidth = 4.0f;
         REAL centerY = graphY + graphH / 2.0f;
 
@@ -357,7 +639,7 @@ void OverlayWindow::paint() {
             value = clampf(value, 0.03f, 1.0f);
 
             REAL barHeight = static_cast<REAL>(imax(5, static_cast<int>(value * graphH)));
-            REAL x = graphX + i * (barWidth + gap);
+            REAL x = graphX + i * (barWidth + barGap);
             GraphicsPath barPath;
             add_rounded_rect(barPath, x, centerY - barHeight / 2.0f,
                              barWidth, barHeight, barWidth / 2.0f);
@@ -369,7 +651,7 @@ void OverlayWindow::paint() {
     GetWindowRect(hwnd_, &windowRect);
     POINT dst = {windowRect.left, windowRect.top};
     POINT src = {0, 0};
-    SIZE size = {OVERLAY_WIDTH, OVERLAY_HEIGHT};
+    SIZE size = {OVERLAY_WIDTH, overlayHeight};
     BLENDFUNCTION blend = {};
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = 255;
@@ -387,12 +669,16 @@ void OverlayWindow::paint() {
 void OverlayWindow::update_position() {
     if (!hwnd_) return;
 
+    int overlayHeight = state_ == OverlayState::Processing
+                            ? OVERLAY_COMPACT_HEIGHT
+                            : OVERLAY_HEIGHT;
+
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int x = (screenWidth - OVERLAY_WIDTH) / 2;
     int y = 20;
 
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, OVERLAY_WIDTH, OVERLAY_HEIGHT,
-                 SWP_NOACTIVATE | SWP_NOSIZE);
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, OVERLAY_WIDTH, overlayHeight,
+                 SWP_NOACTIVATE);
 }
 
 } // namespace vtt

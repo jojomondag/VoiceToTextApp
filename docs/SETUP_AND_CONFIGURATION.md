@@ -44,6 +44,46 @@ Model project:
 - [KB-Whisper](https://kb-labb.github.io/posts/2025-03-07-welcome-KB-Whisper/)
 - [KBLab on Hugging Face](https://huggingface.co/KBLab)
 
+## Internal Gemma Models
+
+VoiceToText can run Gemma internally for cleanup, profile transforms, and AI
+Language output. This uses a local `llama-server.exe` process and an
+OpenAI-compatible endpoint inside the app.
+
+Download the recommended Gemma model:
+
+```powershell
+.\scripts\download_gemma_model.ps1 -Model e2b
+```
+
+Let the script choose based on hardware:
+
+```powershell
+.\scripts\download_gemma_model.ps1 -Model auto
+```
+
+| Model | Use case |
+| --- | --- |
+| `e2b` | Recommended default for this app. |
+| `e4b` | Higher quality when the machine has enough RAM/GPU headroom. |
+| `12b` | Large; usually unnecessary for dictation cleanup. |
+| `26b-a4b` | Very large workstation option. |
+| `31b` | Experimental/overkill for normal use. |
+
+The tray menu also has a Gemma Model submenu. If a selected model is missing,
+VoiceToText downloads it into `models/llm` and switches to it when ready.
+
+VoiceToText looks for `llama-server.exe` at the configured path, next to the
+executable, or under `tools\llama.cpp`. If it is missing, the app can run
+`scripts\install_llama_server.ps1` automatically and install the CPU runtime
+under `tools\llama.cpp`.
+
+Install the runtime manually:
+
+```powershell
+.\scripts\install_llama_server.ps1
+```
+
 ## Build
 
 CUDA build:
@@ -116,8 +156,14 @@ Common settings:
 | `cancel_key` | Virtual-key code for cancel while recording. |
 | `injection_method` | `auto`, `clipboard`, or `keystrokes`. |
 | `llm_cleanup_enabled` | Enables local LLM processing. |
+| `llm_provider` | `internal` for Gemma, or `lmstudio` for an external server. |
 | `llm_endpoint` | OpenAI-compatible chat completions endpoint. |
 | `llm_model` | Model name sent to the LLM endpoint. |
+| `llm_internal_model` | `auto`, `e2b`, `e4b`, `12b`, `26b-a4b`, or `31b`. |
+| `llm_internal_model_path` | Gemma GGUF path used by internal mode. |
+| `llm_internal_server_path` | Path to `llama-server.exe`. |
+| `llm_internal_port` | Local port for the internal OpenAI-compatible server. |
+| `llm_max_tokens` | Dynamic output-token ceiling; short dictation uses less, while long dictation can scale up to this value. Default `4096`. |
 | `llm_profiles` | Editable intent profiles and their instructions. |
 | `show_overlay` | Shows the floating status overlay. |
 | `start_minimized` | Starts in the tray instead of showing a window. |
@@ -126,19 +172,29 @@ Common settings:
 
 ## Local LLM Cleanup
 
-VoiceToText can send transcribed text to a local OpenAI-compatible chat
-completions server before insertion. LM Studio works well for this.
+VoiceToText can clean transcribed text before insertion.
 
-Basic setup:
-
-1. Start LM Studio.
-2. Load a local chat model.
-3. Start the local server, usually on `http://127.0.0.1:1234`.
-4. In `config.json`, set:
+Internal Gemma setup:
 
 ```json
 {
   "llm_cleanup_enabled": true,
+  "llm_provider": "internal",
+  "llm_internal_model": "auto",
+  "llm_internal_server_path": "llama-server.exe"
+}
+```
+
+External LM Studio setup:
+
+1. Start LM Studio and load a local chat model.
+2. Start the local server, usually on `http://127.0.0.1:1234`.
+3. In `config.json`, set:
+
+```json
+{
+  "llm_cleanup_enabled": true,
+  "llm_provider": "lmstudio",
   "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
   "llm_model": "local-model"
 }

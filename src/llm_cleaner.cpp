@@ -80,10 +80,23 @@ bool parse_url(const std::string& url, ParsedUrl& parsed) {
 std::string build_request_body(const LlmCleanerConfig& config,
                                const std::string& system_prompt,
                                const std::string& input) {
+    // Use a small generation budget for short dictation, but leave enough
+    // room for long dictation to be rewritten without being truncated.
+    // UTF-8 bytes are a conservative approximation of input token count here.
+    const size_t estimated_input_tokens = (input.size() + 3) / 4;
+    int dynamic_max_tokens = 512;
+    if (estimated_input_tokens > 150) dynamic_max_tokens = 768;
+    if (estimated_input_tokens > 350) dynamic_max_tokens = 1024;
+    if (estimated_input_tokens > 700) dynamic_max_tokens = 1536;
+    if (estimated_input_tokens > 1200) dynamic_max_tokens = 2048;
+    if (estimated_input_tokens > 2200) dynamic_max_tokens = 3072;
+    if (estimated_input_tokens > 3200) dynamic_max_tokens = 4096;
+
+    const int token_ceiling = (std::max)(256, config.max_tokens);
     nlohmann::json body;
     body["model"] = config.model;
     body["temperature"] = 0.1;
-    body["max_tokens"] = config.max_tokens;
+    body["max_tokens"] = (std::min)(dynamic_max_tokens, token_ceiling);
     body["stream"] = false;
     body["messages"] = nlohmann::json::array({
         {
@@ -366,6 +379,11 @@ bool LlmCleaner::transform_text(const std::string& input,
                                 const std::string& system_prompt,
                                 std::string& output) const {
     return request_completion(input, system_prompt, output);
+}
+
+bool LlmCleaner::warm_up() const {
+    std::string output;
+    return request_completion("Reply with only: OK", "Reply with only: OK", output);
 }
 
 bool LlmCleaner::request_completion(const std::string& input,

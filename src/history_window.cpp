@@ -358,7 +358,7 @@ void HistoryWindow::create_child_controls() {
     ShowWindow(transcribed_label_, SW_HIDE);
     ShowWindow(ai_language_label_, SW_HIDE);
 
-    DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS |
+    DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
                        WS_VSCROLL | ES_MULTILINE |
                        ES_AUTOVSCROLL | ES_READONLY | ES_LEFT | ES_NOHIDESEL;
 
@@ -512,6 +512,15 @@ void HistoryWindow::draw_steel_button(const DRAWITEMSTRUCT* item) {
     if (!item) return;
 
     RECT rc = item->rcItem;
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+
+    HDC memDC = CreateCompatibleDC(item->hDC);
+    HBITMAP memBmp = CreateCompatibleBitmap(item->hDC, w, h);
+    HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+    RECT memRect = {0, 0, w, h};
+
     bool pressed = (item->itemState & ODS_SELECTED) != 0;
     bool focused = (item->itemState & ODS_FOCUS) != 0;
     bool hot = item->hwndItem == hover_button_;
@@ -533,53 +542,66 @@ void HistoryWindow::draw_steel_button(const DRAWITEMSTRUCT* item) {
 
     HBRUSH brush = CreateSolidBrush(fill);
     HPEN pen = CreatePen(PS_SOLID, 1, border);
-    HGDIOBJ old_brush = SelectObject(item->hDC, brush);
-    HGDIOBJ old_pen = SelectObject(item->hDC, pen);
-    RoundRect(item->hDC, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
-    SelectObject(item->hDC, old_pen);
-    SelectObject(item->hDC, old_brush);
+    HGDIOBJ old_brush = SelectObject(memDC, brush);
+    HGDIOBJ old_pen = SelectObject(memDC, pen);
+    RoundRect(memDC, 0, 0, w, h, 10, 10);
+    SelectObject(memDC, old_pen);
+    SelectObject(memDC, old_brush);
     DeleteObject(pen);
     DeleteObject(brush);
 
-    SetBkMode(item->hDC, TRANSPARENT);
-    SetTextColor(item->hDC, RGB(255, 255, 255));
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(255, 255, 255));
+    RECT textRect = memRect;
     if (pressed) {
-        OffsetRect(&rc, 0, 1);
+        OffsetRect(&textRect, 0, 1);
     }
 
     wchar_t text[128] = {};
     GetWindowTextW(item->hwndItem, text, 128);
     if (text[0] == L'\0') {
         HPEN icon_pen = CreatePen(PS_SOLID, 1, RGB(245, 250, 255));
-        HGDIOBJ old_icon_pen = SelectObject(item->hDC, icon_pen);
+        HGDIOBJ old_icon_pen = SelectObject(memDC, icon_pen);
         HGDIOBJ old_icon_brush =
-            SelectObject(item->hDC, GetStockObject(NULL_BRUSH));
+            SelectObject(memDC, GetStockObject(NULL_BRUSH));
 
-        int center_x = (rc.left + rc.right) / 2;
-        int center_y = (rc.top + rc.bottom) / 2;
+        int center_x = w / 2;
+        int center_y = h / 2;
         RECT back = {center_x - 6, center_y - 6,
                      center_x + 3, center_y + 3};
         RECT front = {center_x - 3, center_y - 3,
                       center_x + 6, center_y + 6};
-        Rectangle(item->hDC, back.left, back.top, back.right, back.bottom);
-        Rectangle(item->hDC, front.left, front.top, front.right, front.bottom);
+        Rectangle(memDC, back.left, back.top, back.right, back.bottom);
+        Rectangle(memDC, front.left, front.top, front.right, front.bottom);
 
-        SelectObject(item->hDC, old_icon_brush);
-        SelectObject(item->hDC, old_icon_pen);
+        SelectObject(memDC, old_icon_brush);
+        SelectObject(memDC, old_icon_pen);
         DeleteObject(icon_pen);
-        return;
+    } else {
+        HGDIOBJ old_font = SelectObject(memDC, button_font_);
+        DrawTextW(memDC, text, -1, &textRect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(memDC, old_font);
     }
 
-    HGDIOBJ old_font = SelectObject(item->hDC, button_font_);
-    DrawTextW(item->hDC, text, -1, &rc,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    SelectObject(item->hDC, old_font);
+    BitBlt(item->hDC, rc.left, rc.top, w, h, memDC, 0, 0, SRCCOPY);
+
+    SelectObject(memDC, oldBmp);
+    DeleteObject(memBmp);
+    DeleteDC(memDC);
 }
 
 void HistoryWindow::draw_profile_button(const DRAWITEMSTRUCT* item) {
     if (!item) return;
 
     RECT rc = item->rcItem;
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+
+    HDC memDC = CreateCompatibleDC(item->hDC);
+    HBITMAP memBmp = CreateCompatibleBitmap(item->hDC, w, h);
+    HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
     bool pressed = (item->itemState & ODS_SELECTED) != 0;
     bool focused = (item->itemState & ODS_FOCUS) != 0;
     bool hot = item->hwndItem == hover_button_;
@@ -601,30 +623,37 @@ void HistoryWindow::draw_profile_button(const DRAWITEMSTRUCT* item) {
 
     HBRUSH brush = CreateSolidBrush(fill);
     HPEN border_pen = CreatePen(PS_SOLID, 1, border);
-    HGDIOBJ old_brush = SelectObject(item->hDC, brush);
-    HGDIOBJ old_pen = SelectObject(item->hDC, border_pen);
-    RoundRect(item->hDC, rc.left, rc.top, rc.right, rc.bottom, 9, 9);
-    SelectObject(item->hDC, old_pen);
-    SelectObject(item->hDC, old_brush);
+    HGDIOBJ old_brush = SelectObject(memDC, brush);
+    HGDIOBJ old_pen = SelectObject(memDC, border_pen);
+    RoundRect(memDC, 0, 0, w, h, 9, 9);
+    SelectObject(memDC, old_pen);
+    SelectObject(memDC, old_brush);
     DeleteObject(border_pen);
     DeleteObject(brush);
 
-    if (pressed) OffsetRect(&rc, 0, 1);
+    RECT iconRect = {0, 0, w, h};
+    if (pressed) OffsetRect(&iconRect, 0, 1);
 
     HPEN icon_pen = CreatePen(PS_SOLID, 1, RGB(245, 255, 252));
     HBRUSH icon_brush = CreateSolidBrush(RGB(235, 255, 248));
-    HGDIOBJ old_icon_pen = SelectObject(item->hDC, icon_pen);
-    HGDIOBJ old_icon_brush = SelectObject(item->hDC, icon_brush);
+    HGDIOBJ old_icon_pen = SelectObject(memDC, icon_pen);
+    HGDIOBJ old_icon_brush = SelectObject(memDC, icon_brush);
 
-    int cx = (rc.left + rc.right) / 2;
-    int cy = (rc.top + rc.bottom) / 2;
-    Ellipse(item->hDC, cx - 3, cy - 7, cx + 4, cy);
-    RoundRect(item->hDC, cx - 7, cy + 2, cx + 8, cy + 8, 6, 6);
+    int cx = w / 2;
+    int cy = h / 2;
+    Ellipse(memDC, cx - 3, cy - 7, cx + 4, cy);
+    RoundRect(memDC, cx - 7, cy + 2, cx + 8, cy + 8, 6, 6);
 
-    SelectObject(item->hDC, old_icon_brush);
-    SelectObject(item->hDC, old_icon_pen);
+    SelectObject(memDC, old_icon_brush);
+    SelectObject(memDC, old_icon_pen);
     DeleteObject(icon_brush);
     DeleteObject(icon_pen);
+
+    BitBlt(item->hDC, rc.left, rc.top, w, h, memDC, 0, 0, SRCCOPY);
+
+    SelectObject(memDC, oldBmp);
+    DeleteObject(memBmp);
+    DeleteDC(memDC);
 }
 
 void HistoryWindow::draw_combo_item(const DRAWITEMSTRUCT* item) {
@@ -832,10 +861,6 @@ std::wstring HistoryWindow::get_edit_text(HWND edit) const {
 }
 
 std::vector<std::pair<int, int>> HistoryWindow::entry_display_ranges(HWND edit) const {
-    if (edit == recorded_edit_) return panel_ranges_.recorded;
-    if (edit == transcribed_edit_) return panel_ranges_.transcribed;
-    if (edit == ai_language_edit_) return panel_ranges_.ai_language;
-
     std::wstring text = get_edit_text(edit);
     std::vector<int> starts;
 
@@ -849,7 +874,6 @@ std::vector<std::pair<int, int>> HistoryWindow::entry_display_ranges(HWND edit) 
 
         std::wstring line = text.substr(pos, line_end - pos);
         if (line.find(L"]") != std::wstring::npos &&
-            line.find(L"Profile:") != std::wstring::npos &&
             line.find(L"Tokens:") != std::wstring::npos) {
             starts.push_back(static_cast<int>(pos));
         }
@@ -1216,8 +1240,13 @@ void HistoryWindow::update_copy_button_positions() {
             continue;
         }
 
-        int x = (std::max)(4, (static_cast<int>(start_pos.x) -
-                               ENTRY_COPY_WIDTH) / 2);
+        int left_column = (std::max)(4, HISTORY_TEXT_LEFT_MARGIN -
+                                        ENTRY_COPY_WIDTH - 14);
+        if (entry_view.edit == ai_language_edit_) {
+            left_column = (std::max)(4, HISTORY_TEXT_LEFT_MARGIN -
+                                        ENTRY_COPY_WIDTH - 18);
+        }
+        int x = left_column;
 
         MoveWindow(entry_view.copy_button, x, y,
                    ENTRY_COPY_WIDTH, ENTRY_COPY_HEIGHT, TRUE);
@@ -1896,7 +1925,7 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
 
         prompt_status_ = CreateWindowExW(
             0, L"STATIC", L"",
-            label_style, 0, 0, 0, 0,
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 0, 0,
             hwnd_, nullptr, hInstance_, nullptr);
 
         SetWindowTextW(prompt_pre_label_,
@@ -1999,7 +2028,8 @@ void HistoryWindow::layout_prompt_window() {
 
     int padding       = 24;
     int section_gap   = 14;
-    int footer_gap    = 18;
+    int toolbar_gap   = 18;
+    int toolbar_height = 38;
     int button_height = 34;
     int button_width  = 132;
     int short_height  = 32;       // step 2 profile controls row
@@ -2007,18 +2037,29 @@ void HistoryWindow::layout_prompt_window() {
     int control_gap = 10;
 
     int content_width = (std::max)(100, width - padding * 2);
-    int footer_top = height - padding - button_height;
-    int content_bottom = footer_top - footer_gap;
+    int toolbar_y = padding;
+    int toolbar_status_x = padding + button_width + control_gap;
+    int toolbar_status_width = (std::max)(
+        0, width - padding * 2 - button_width * 2 - control_gap * 2);
+    MoveWindow(prompt_back_button_, padding, toolbar_y,
+               button_width, button_height, TRUE);
+    MoveWindow(prompt_save_button_, width - padding - button_width,
+               toolbar_y, button_width, button_height, TRUE);
+    MoveWindow(prompt_status_, toolbar_status_x, toolbar_y + 8,
+               toolbar_status_width, button_height, TRUE);
+
+    int content_top = padding + toolbar_height + toolbar_gap;
+    int content_bottom = height - padding;
     int panel_header = 76;
     int panel_inner = SECTION_TITLE_INSET;
     int profile_panel_height = panel_header + panel_inner + short_height
                                + panel_inner;
-    int flex_total = content_bottom - padding - section_gap * 2
+    int flex_total = content_bottom - content_top - section_gap * 2
                      - profile_panel_height
                      - (panel_header + panel_inner * 2) * 2;
     int flex_height = (std::max)(48, flex_total / 2);
 
-    int y = padding;
+    int y = content_top;
     int pre_panel_height = panel_header + panel_inner + flex_height + panel_inner;
     prompt_pre_panel_rc_ = {padding, y, padding + content_width, y + pre_panel_height};
     MoveWindow(prompt_pre_label_, 0, 0, 0, 0, TRUE);
@@ -2052,17 +2093,6 @@ void HistoryWindow::layout_prompt_window() {
     MoveWindow(prompt_transform_edit_, padding + panel_inner, y + panel_header,
                content_width - panel_inner * 2, flex_height, TRUE);
     y += transform_panel_height;
-
-    int button_x = width - padding - button_width;
-    int button_y = footer_top;
-    MoveWindow(prompt_back_button_, padding, button_y,
-               button_width, button_height, TRUE);
-    MoveWindow(prompt_save_button_, button_x, button_y,
-               button_width, button_height, TRUE);
-    MoveWindow(prompt_status_, padding + button_width + control_gap,
-               button_y + 8,
-               (std::max)(0, button_x - padding * 3 - button_width),
-               button_height, TRUE);
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 

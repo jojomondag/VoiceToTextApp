@@ -9,6 +9,7 @@
 #include <mutex>
 #include <filesystem>
 #include <urlmon.h>
+#include <winhttp.h>
 #include <vector>
 #include <algorithm>
 
@@ -57,6 +58,14 @@ void vtlog(const char* fmt, ...) {
     va_end(ap);
     fputc('\n', f);
     fflush(f);
+}
+
+std::string normalize_paste_output_mode(std::string mode) {
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "ai" || mode == "ai_language" || mode == "ai-language") return "ai";
+    if (mode == "recorded" || mode == "recorded_voice" || mode == "voice") return "recorded";
+    return "clean";
 }
 
 void sync_auto_start(bool enabled) {
@@ -234,6 +243,199 @@ bool should_auto_use_gpu_for_model(const std::string& model_size) {
 long long elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
+}
+
+std::string quote_arg(const std::string& arg) {
+    std::string quoted = "\"";
+    for (char c : arg) {
+        if (c == '"') quoted += '\\';
+        quoted += c;
+    }
+    quoted += "\"";
+    return quoted;
+}
+
+std::string powershell_quote(const std::string& arg) {
+    std::string quoted = "'";
+    for (char c : arg) {
+        if (c == '\'') quoted += "''";
+        else quoted += c;
+    }
+    quoted += "'";
+    return quoted;
+}
+
+bool run_hidden_process_and_wait(const std::string& command,
+                                 const std::filesystem::path& working_dir,
+                                 DWORD timeout_ms,
+                                 DWORD& exit_code) {
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+
+    STARTUPINFOA startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION process = {};
+    std::string cwd = working_dir.string();
+    BOOL ok = CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                             FALSE, CREATE_NO_WINDOW, nullptr,
+                             cwd.empty() ? nullptr : cwd.c_str(),
+                             &startup, &process);
+    if (!ok) {
+        exit_code = GetLastError();
+        return false;
+    }
+
+    DWORD wait = WaitForSingleObject(process.hProcess, timeout_ms);
+    if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, 3000);
+        exit_code = WAIT_TIMEOUT;
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return false;
+    }
+
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+        exit_code = GetLastError();
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return false;
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return exit_code == 0;
+}
+
+bool download_file_with_powershell(const std::string& url,
+                                   const std::filesystem::path& output_path,
+                                   unsigned long long expected_size,
+                                   const std::function<void(float)>& on_progress,
+                                   DWORD& exit_code) {
+    std::string command =
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"$ProgressPreference='SilentlyContinue'; "
+        "Invoke-WebRequest -Uri " + powershell_quote(url) +
+        " -OutFile " + powershell_quote(output_path.string()) + "\"";
+
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+
+    STARTUPINFOA startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION process = {};
+    std::string cwd = output_path.parent_path().string();
+    BOOL ok = CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                             FALSE, CREATE_NO_WINDOW, nullptr,
+                             cwd.empty() ? nullptr : cwd.c_str(),
+                             &startup, &process);
+    if (!ok) {
+        exit_code = GetLastError();
+        return false;
+    }
+
+    for (;;) {
+        DWORD wait = WaitForSingleObject(process.hProcess, 500);
+        if (expected_size > 0) {
+            std::error_code ec;
+            if (std::filesystem::exists(output_path, ec)) {
+                auto current_size = std::filesystem::file_size(output_path, ec);
+                if (!ec) {
+                    float progress = static_cast<float>(
+                        static_cast<double>(current_size) /
+                        static_cast<double>(expected_size));
+                    on_progress((std::min)(progress, 0.98f));
+                }
+            }
+        }
+
+        if (wait == WAIT_TIMEOUT) continue;
+        if (wait != WAIT_OBJECT_0) {
+            exit_code = wait;
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            return false;
+        }
+        break;
+    }
+
+    if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+        exit_code = GetLastError();
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return false;
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return exit_code == 0;
+}
+
+bool http_get_ok(const std::wstring& host,
+                 INTERNET_PORT port,
+                 const std::wstring& path,
+                 DWORD timeout_ms) {
+    HINTERNET session = WinHttpOpen(L"VoiceToText/1.0",
+                                    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME,
+                                    WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+
+    HINTERNET connect = WinHttpConnect(session, host.c_str(), port, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(connect, L"GET", path.c_str(),
+                                           nullptr, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr);
+
+    DWORD status_code = 0;
+    DWORD status_size = sizeof(status_code);
+    if (ok) {
+        ok = WinHttpQueryHeaders(request,
+                                 WINHTTP_QUERY_STATUS_CODE |
+                                     WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX,
+                                 &status_code, &status_size,
+                                 WINHTTP_NO_HEADER_INDEX);
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return ok && status_code >= 200 && status_code < 300;
+}
+
+bool wait_for_llm_server_ready(int port, DWORD timeout_ms) {
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start).count() <
+           timeout_ms) {
+        if (http_get_ok(L"127.0.0.1", static_cast<INTERNET_PORT>(port),
+                        L"/health", 1500)) {
+            return true;
+        }
+        Sleep(1000);
+    }
+    return false;
 }
 
 struct AudioTrimResult {
@@ -589,22 +791,10 @@ bool App::initialize(HINSTANCE hInstance) {
 
     // --- 8. Initialize local LLM cleanup ---
     llm_cleaner_ = std::make_unique<LlmCleaner>();
-    LlmCleanerConfig cleaner_config{
-        cfg.llm_cleanup_enabled,
-        cfg.llm_endpoint,
-        cfg.llm_model,
-        cfg.llm_pre_prompt,
-        cfg.llm_timeout_ms,
-        cfg.llm_max_tokens,
-        cfg.llm_intent_profiles_enabled,
-        cfg.llm_intent_detection_prompt,
-        cfg.llm_profile_transform_prompt,
-    };
-    cleaner_config.profiles.clear();
-    for (const auto& profile : cfg.llm_profiles) {
-        cleaner_config.profiles.push_back({profile.name, profile.instructions});
+    if (cfg.llm_cleanup_enabled && cfg.llm_provider == "internal") {
+        ensure_internal_llm_runtime();
     }
-    llm_cleaner_->configure(cleaner_config);
+    configure_llm_cleaner();
 
     correction_store_ = std::make_unique<CorrectionStore>();
     std::filesystem::path correction_path(cfg.llm_corrections_path);
@@ -626,6 +816,16 @@ bool App::initialize(HINSTANCE hInstance) {
 
     // --- 9. Initialize overlay ---
     overlay_ = std::make_unique<OverlayWindow>();
+    overlay_->set_paste_output_mode(cfg.paste_output_mode);
+    overlay_->set_paste_mode_callback([this](const std::string& mode) {
+        if (!config_) return;
+        config_->config().paste_output_mode = normalize_paste_output_mode(mode);
+        if (overlay_) {
+            overlay_->set_paste_output_mode(config_->config().paste_output_mode);
+        }
+        vtlog("paste output mode changed: %s",
+              config_->config().paste_output_mode.c_str());
+    });
     if (cfg.show_overlay) {
         overlay_->initialize(hInstance_);
     }
@@ -691,6 +891,7 @@ void App::shutdown() {
     if (injector_) injector_->shutdown();
     if (audio_) audio_->shutdown();
     if (engine_) engine_->shutdown();
+    if (gemma_runtime_) gemma_runtime_->stop();
 
     if (hwnd_) {
         DestroyWindow(hwnd_);
@@ -712,7 +913,11 @@ void App::initialize_tray() {
     }
 
     tray_->set_current_model(current_model_size());
-    tray_->set_current_compute_mode(current_compute_mode());
+    tray_->set_current_compute_mode(current_compute_mode(),
+                                    current_gemma_compute_mode());
+    tray_->set_current_gemma_model(current_gemma_model_id(),
+                                   recommend_gemma_model_for_hardware());
+    tray_->set_installed_gemma_models(installed_gemma_model_ids());
     update_tray_compute_info();
     tray_->set_callback([this](TrayAction action, const std::string& value) {
         on_tray_action(action, value);
@@ -852,6 +1057,18 @@ void App::on_tray_action(TrayAction action, const std::string& value) {
             select_compute_mode(value);
             break;
 
+        case TrayAction::SelectWhisperComputeMode:
+            select_whisper_compute_mode(value);
+            break;
+
+        case TrayAction::SelectGemmaComputeMode:
+            select_gemma_compute_mode(value);
+            break;
+
+        case TrayAction::SelectGemmaModel:
+            select_gemma_model(value);
+            break;
+
         case TrayAction::Quit:
             if (recording_.load()) {
                 cancel_recording();
@@ -887,6 +1104,15 @@ std::string App::current_compute_mode() const {
     return "auto";
 }
 
+std::string App::current_gemma_compute_mode() const {
+    if (!config_) return "auto";
+    const std::string& mode = config_->config().llm_internal_compute_mode;
+    if (mode == "gpu" || mode == "cpu" || mode == "auto") {
+        return mode;
+    }
+    return "auto";
+}
+
 std::string App::resolve_model_path(const std::string& model_path) const {
     std::filesystem::path path(model_path);
     if (path.is_absolute()) {
@@ -902,6 +1128,347 @@ std::string App::resolve_model_path(const std::string& model_path) const {
     }
 
     return (config_dir / path).string();
+}
+
+std::string App::resolve_llama_server_path(const std::string& server_path) const {
+    if (server_path.empty()) return {};
+
+    std::filesystem::path path(server_path);
+    if (path.is_absolute() && std::filesystem::exists(path)) {
+        return path.string();
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    std::filesystem::path config_dir = exe_directory();
+    if (config_) {
+        std::filesystem::path config_path(config_->get_config_path());
+        if (config_path.has_parent_path()) {
+            config_dir = config_path.parent_path();
+        }
+    }
+
+    candidates.push_back(config_dir / path);
+    candidates.push_back(exe_directory() / path);
+    candidates.push_back(exe_directory() / "tools" / "llama.cpp" / path.filename());
+    candidates.push_back(config_dir / "tools" / "llama.cpp" / path.filename());
+    candidates.push_back(std::filesystem::current_path() / path);
+
+    for (const auto& candidate : candidates) {
+        if (std::filesystem::exists(candidate)) {
+            return candidate.string();
+        }
+    }
+
+    const std::filesystem::path search_roots[] = {
+        config_dir / "tools" / "llama.cpp",
+        exe_directory() / "tools" / "llama.cpp",
+    };
+    for (const auto& root : search_roots) {
+        std::error_code ec;
+        if (!std::filesystem::exists(root, ec)) continue;
+        for (const auto& entry :
+             std::filesystem::recursive_directory_iterator(root, ec)) {
+            if (ec) break;
+            if (entry.is_regular_file(ec) &&
+                entry.path().filename() == path.filename()) {
+                return entry.path().string();
+            }
+        }
+    }
+
+    return server_path;
+}
+
+std::string App::current_gemma_model_id() const {
+    if (!config_) return "auto";
+    const std::string& configured = config_->config().llm_internal_model;
+    if (configured == "auto") return "auto";
+    return normalize_gemma_model_id(configured);
+}
+
+std::string App::gemma_model_path_for_id_config(const std::string& model_id) const {
+    std::string normalized = normalize_gemma_model_id(model_id);
+    std::string existing = find_existing_gemma_model_path(normalized);
+    if (!existing.empty()) {
+        return existing;
+    }
+
+    std::string configured_path = config_ ? config_->config().llm_internal_model_path : "";
+    if (!configured_path.empty() && current_gemma_model_id() == normalized) {
+        return resolve_model_path(configured_path);
+    }
+    return gemma_model_download_path(normalized);
+}
+
+std::string App::find_existing_gemma_model_path(const std::string& model_id) const {
+    std::string normalized = normalize_gemma_model_id(model_id);
+    const GemmaModelInfo* model = find_gemma_model(normalized);
+    if (!model) model = &recommended_gemma_model();
+
+    std::vector<std::filesystem::path> roots;
+    std::filesystem::path config_dir = exe_directory();
+    if (config_) {
+        std::filesystem::path config_path(config_->get_config_path());
+        if (config_path.has_parent_path()) {
+            config_dir = config_path.parent_path();
+        }
+    }
+
+    roots.push_back(config_dir);
+    roots.push_back(exe_directory());
+    roots.push_back(std::filesystem::current_path());
+
+    auto add_ancestors = [&roots](std::filesystem::path path) {
+        for (int i = 0; i < 5 && !path.empty(); ++i) {
+            roots.push_back(path);
+            std::filesystem::path parent = path.parent_path();
+            if (parent == path) break;
+            path = parent;
+        }
+    };
+    add_ancestors(config_dir);
+    add_ancestors(exe_directory());
+    add_ancestors(std::filesystem::current_path());
+
+    std::vector<std::filesystem::path> candidates;
+    std::string configured_path = config_ ? config_->config().llm_internal_model_path : "";
+    if (!configured_path.empty()) {
+        std::filesystem::path configured(configured_path);
+        if (configured.filename() == model->filename ||
+            current_gemma_model_id() == normalized) {
+            candidates.push_back(configured);
+        }
+    }
+    candidates.push_back(model->local_path);
+    candidates.push_back(std::filesystem::path("models") / "llm" / model->filename);
+
+    std::error_code ec;
+    for (const auto& candidate : candidates) {
+        if (candidate.is_absolute() &&
+            std::filesystem::is_regular_file(candidate, ec) &&
+            std::filesystem::file_size(candidate, ec) > 0) {
+            return candidate.string();
+        }
+
+        for (const auto& root : roots) {
+            std::filesystem::path full_path = root / candidate;
+            if (std::filesystem::is_regular_file(full_path, ec) &&
+                std::filesystem::file_size(full_path, ec) > 0) {
+                return full_path.string();
+            }
+        }
+    }
+
+    return {};
+}
+
+std::string App::gemma_model_download_path(const std::string& model_id) const {
+    std::string normalized = normalize_gemma_model_id(model_id);
+    std::filesystem::path config_dir = exe_directory();
+    if (config_) {
+        std::filesystem::path config_path(config_->get_config_path());
+        if (config_path.has_parent_path()) {
+            config_dir = config_path.parent_path();
+        }
+    }
+
+    const GemmaModelInfo* model = find_gemma_model(normalized);
+    if (!model) model = &recommended_gemma_model();
+    return (config_dir / "models" / "llm" / model->filename).string();
+}
+
+std::vector<std::string> App::installed_gemma_model_ids() const {
+    std::vector<std::string> installed;
+    for (const auto& model : gemma_models()) {
+        if (!find_existing_gemma_model_path(model.id).empty()) {
+            installed.push_back(model.id);
+        }
+    }
+    return installed;
+}
+
+bool App::ensure_internal_llm_runtime() {
+    if (!config_) return false;
+
+    auto& cfg = config_->config();
+    if (!cfg.llm_cleanup_enabled || cfg.llm_provider != "internal" ||
+        !cfg.llm_internal_auto_start) {
+        return false;
+    }
+
+    std::string model_id = normalize_gemma_model_id(cfg.llm_internal_model);
+    std::string model_path = gemma_model_path_for_id_config(model_id);
+    if (!std::filesystem::exists(model_path)) {
+        vtlog("gemma runtime: model missing: %s", model_path.c_str());
+        return false;
+    }
+
+    std::string server_path = resolve_llama_server_path(cfg.llm_internal_server_path);
+    if (!ensure_llama_server_available(server_path)) {
+        vtlog("gemma runtime: llama-server.exe missing or unsuitable and auto-install failed");
+    }
+    const bool gpu_requested = cfg.llm_internal_compute_mode == "gpu" ||
+                               cfg.llm_internal_compute_mode == "auto";
+    const bool gpu_driver = has_nvidia_driver();
+    const bool gpu_runtime = std::filesystem::exists(
+        std::filesystem::path(server_path).parent_path() / "ggml-cuda.dll");
+    vtlog("gemma runtime: compute=%s, NVIDIA driver=%d, CUDA runtime=%d, GPU expected=%d",
+          cfg.llm_internal_compute_mode.c_str(), gpu_driver ? 1 : 0,
+          gpu_runtime ? 1 : 0,
+          (gpu_requested && gpu_driver && gpu_runtime) ? 1 : 0);
+    gemma_runtime_ = std::make_unique<GemmaRuntime>();
+    std::string error;
+    if (!gemma_runtime_->start(server_path, model_path,
+                               cfg.llm_internal_compute_mode,
+                               cfg.llm_internal_port, error)) {
+        vtlog("gemma runtime: start failed: %s", error.c_str());
+        if (tray_) {
+            tray_->show_notification("Gemma start failed", error);
+        }
+        return false;
+    }
+
+    vtlog("gemma runtime: process started %s on port %d, waiting for readiness",
+          model_path.c_str(), cfg.llm_internal_port);
+    if (!wait_for_llm_server_ready(cfg.llm_internal_port, 180000)) {
+        vtlog("gemma runtime: readiness timed out on port %d",
+              cfg.llm_internal_port);
+        if (tray_) {
+            tray_->show_notification("Gemma start timed out",
+                                     "llama-server started but did not become ready.");
+        }
+        gemma_runtime_->stop();
+        return false;
+    }
+
+    vtlog("gemma runtime: ready %s on port %d",
+          model_path.c_str(), cfg.llm_internal_port);
+    // Trigger model loading and the first-token path before the first dictation.
+    // The request is intentionally tiny to remove the cold-start cost.
+    configure_llm_cleaner();
+    if (llm_cleaner_) {
+        auto warmup_start = std::chrono::steady_clock::now();
+        bool warmup_ok = llm_cleaner_->warm_up();
+        vtlog("gemma runtime: warmup finished in %lld ms (ok=%d)",
+              elapsed_ms(warmup_start), warmup_ok ? 1 : 0);
+    }
+    return true;
+}
+
+bool App::ensure_llama_server_available(std::string& server_path) {
+    bool wants_cuda = false;
+    if (config_) {
+        const auto& cfg = config_->config();
+        wants_cuda = has_nvidia_driver() &&
+                     (cfg.llm_internal_compute_mode == "auto" ||
+                      cfg.llm_internal_compute_mode == "gpu");
+    }
+
+    auto has_llama_cuda = [](const std::string& path) {
+        if (path.empty()) return false;
+        std::filesystem::path dir = std::filesystem::path(path).parent_path();
+        return std::filesystem::exists(dir / "ggml-cuda.dll");
+    };
+
+    if (std::filesystem::exists(server_path) &&
+        (!wants_cuda || has_llama_cuda(server_path))) {
+        return true;
+    }
+
+    std::filesystem::path config_dir = exe_directory();
+    if (config_) {
+        std::filesystem::path config_path(config_->get_config_path());
+        if (config_path.has_parent_path()) {
+            config_dir = config_path.parent_path();
+        }
+    }
+
+    const std::filesystem::path scripts[] = {
+        config_dir / "scripts" / "install_llama_server.ps1",
+        exe_directory() / "scripts" / "install_llama_server.ps1",
+        std::filesystem::current_path() / "scripts" / "install_llama_server.ps1",
+    };
+
+    std::filesystem::path script_path;
+    for (const auto& candidate : scripts) {
+        if (std::filesystem::exists(candidate)) {
+            script_path = candidate;
+            break;
+        }
+    }
+    if (script_path.empty()) {
+        return false;
+    }
+
+    std::filesystem::path install_dir = config_dir / "tools" / "llama.cpp";
+    std::filesystem::create_directories(install_dir);
+
+    if (tray_) {
+        tray_->show_notification("Installing Gemma runtime",
+                                 wants_cuda
+                                     ? "Downloading CUDA llama-server for internal Gemma."
+                                     : "Downloading llama-server.exe for internal Gemma.");
+    }
+    vtlog("gemma runtime: installing llama-server via %s",
+          script_path.string().c_str());
+
+    std::string command =
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File " +
+        quote_arg(script_path.string()) +
+        " -Variant " + std::string(wants_cuda ? "cuda" : "cpu") +
+        " -InstallDir " + quote_arg(install_dir.string());
+    if (wants_cuda) {
+        command += " -Force";
+    }
+
+    DWORD exit_code = 0;
+    bool ok = run_hidden_process_and_wait(command, config_dir,
+                                          10 * 60 * 1000, exit_code);
+    if (!ok) {
+        vtlog("gemma runtime: llama-server install failed, exit=%lu",
+              static_cast<unsigned long>(exit_code));
+        if (tray_) {
+            tray_->show_notification("Gemma runtime install failed",
+                                     "Could not install llama-server.exe.");
+        }
+        return false;
+    }
+
+    server_path = resolve_llama_server_path(config_->config().llm_internal_server_path);
+    return std::filesystem::exists(server_path);
+}
+
+void App::configure_llm_cleaner() {
+    if (!config_ || !llm_cleaner_) return;
+
+    const auto& cfg = config_->config();
+    std::string endpoint = cfg.llm_endpoint;
+    std::string model = cfg.llm_model;
+    if (cfg.llm_provider == "internal") {
+        endpoint = "http://127.0.0.1:" +
+                   std::to_string(cfg.llm_internal_port) +
+                   "/v1/chat/completions";
+        const GemmaModelInfo* info =
+            find_gemma_model(normalize_gemma_model_id(cfg.llm_internal_model));
+        model = info ? info->repo : recommended_gemma_model().repo;
+    }
+
+    LlmCleanerConfig cleaner_config{
+        cfg.llm_cleanup_enabled,
+        endpoint,
+        model,
+        cfg.llm_pre_prompt,
+        cfg.llm_timeout_ms,
+        cfg.llm_max_tokens,
+        cfg.llm_intent_profiles_enabled,
+        cfg.llm_intent_detection_prompt,
+        cfg.llm_profile_transform_prompt,
+    };
+    cleaner_config.profiles.clear();
+    for (const auto& profile : cfg.llm_profiles) {
+        cleaner_config.profiles.push_back({profile.name, profile.instructions});
+    }
+    llm_cleaner_->configure(cleaner_config);
 }
 
 std::string App::model_path_for_size(const std::string& model_size) const {
@@ -1004,7 +1571,8 @@ void App::select_model(const std::string& model_size) {
 
     if (tray_) {
         tray_->set_current_model(model_size);
-        tray_->set_current_compute_mode(current_compute_mode());
+        tray_->set_current_compute_mode(current_compute_mode(),
+                                        current_gemma_compute_mode());
         update_tray_compute_info();
         tray_->set_tooltip("VoiceToText - Model: " + model_size +
                            (use_gpu ? " GPU" : " CPU"));
@@ -1082,7 +1650,8 @@ void App::download_and_select_model(const std::string& model_size,
 
             if (tray_) {
                 tray_->set_current_model(model_size);
-                tray_->set_current_compute_mode(current_compute_mode());
+                tray_->set_current_compute_mode(current_compute_mode(),
+                                                current_gemma_compute_mode());
                 update_tray_compute_info();
                 tray_->set_tooltip("VoiceToText - Model: " + model_size +
                                    (use_gpu ? " GPU" : " CPU"));
@@ -1097,6 +1666,187 @@ void App::download_and_select_model(const std::string& model_size,
                                          "Downloaded but failed to load " + model_size + ".");
             }
             if (overlay_) overlay_->show(OverlayState::Error, "Load failed");
+        }
+
+        downloading_model_ = false;
+        Sleep(1200);
+        if (overlay_) overlay_->hide();
+    });
+}
+
+void App::select_gemma_model(const std::string& model_id) {
+    if (model_id.empty() || !config_) return;
+
+    if (recording_.load() || processing_.load()) {
+        if (tray_) {
+            tray_->show_notification("VoiceToText",
+                                     "Cannot switch Gemma model while recording or processing.");
+        }
+        return;
+    }
+    if (downloading_model_.load()) {
+        if (tray_) {
+            tray_->show_notification("VoiceToText",
+                                     "A model download is already running.");
+        }
+        return;
+    }
+
+    std::string normalized = normalize_gemma_model_id(model_id);
+    std::string new_path = find_existing_gemma_model_path(normalized);
+    if (new_path.empty()) {
+        new_path = gemma_model_download_path(normalized);
+    }
+    vtlog("select_gemma_model: requested=%s normalized=%s path=%s exists=%d",
+          model_id.c_str(), normalized.c_str(), new_path.c_str(),
+          std::filesystem::exists(new_path) ? 1 : 0);
+    if (!std::filesystem::exists(new_path)) {
+        download_and_select_gemma_model(model_id, new_path);
+        return;
+    }
+
+    config_->config().llm_provider = "internal";
+    config_->config().llm_internal_model = model_id;
+    config_->config().llm_internal_model_path = new_path;
+    config_->config().llm_cleanup_enabled = true;
+    config_->save();
+
+    if (gemma_runtime_) gemma_runtime_->stop();
+    ensure_internal_llm_runtime();
+    configure_llm_cleaner();
+
+    if (tray_) {
+        tray_->set_current_gemma_model(model_id, recommend_gemma_model_for_hardware());
+        tray_->set_installed_gemma_models(installed_gemma_model_ids());
+        tray_->show_notification("Gemma model changed",
+                                 "Now using: " + normalized + " internally.");
+    }
+}
+
+void App::download_and_select_gemma_model(const std::string& model_id,
+                                          const std::string& model_path) {
+    if (model_download_thread_.joinable()) {
+        model_download_thread_.join();
+    }
+
+    downloading_model_ = true;
+    std::string normalized = normalize_gemma_model_id(model_id);
+    std::string url = gemma_download_url_for_id(normalized);
+    std::filesystem::path final_path(model_path);
+    std::filesystem::path temp_path = final_path;
+    temp_path += ".download";
+    const GemmaModelInfo* model_info = find_gemma_model(normalized);
+    unsigned long long expected_size =
+        model_info ? model_info->expected_size_bytes : 0;
+    vtlog("download_gemma_model: model=%s url=%s final=%s expected_size=%llu",
+          normalized.c_str(), url.c_str(), final_path.string().c_str(),
+          expected_size);
+
+    if (overlay_) {
+        overlay_->show(OverlayState::Downloading, "Downloading Gemma " + normalized + "...");
+        overlay_->set_progress(0.0f, "Downloading Gemma " + normalized + "...");
+    }
+    if (tray_) {
+        tray_->show_notification("Downloading Gemma model",
+                                 normalized + " will be selected when ready.");
+    }
+
+    model_download_thread_ = std::thread([this, model_id, normalized, url,
+                                          final_path, temp_path,
+                                          expected_size]() {
+        std::error_code ec;
+        std::filesystem::create_directories(final_path.parent_path(), ec);
+        std::filesystem::remove(temp_path, ec);
+
+        DWORD download_exit = 0;
+        bool download_ok = download_file_with_powershell(
+            url, temp_path, expected_size,
+            [this, normalized](float progress) {
+                if (overlay_) {
+                    overlay_->set_progress(progress,
+                                           "Downloading Gemma " + normalized + "...");
+                }
+            },
+            download_exit);
+        auto temp_size = [&]() -> unsigned long long {
+            std::error_code size_ec;
+            if (!std::filesystem::exists(temp_path, size_ec)) return 0;
+            return static_cast<unsigned long long>(
+                std::filesystem::file_size(temp_path, size_ec));
+        };
+        vtlog("download_gemma_model: powershell download finished ok=%d exit=%lu temp=%s size=%llu",
+              download_ok ? 1 : 0, static_cast<unsigned long>(download_exit),
+              temp_path.string().c_str(),
+              temp_size());
+
+        if (download_ok) {
+            if (overlay_) {
+                overlay_->set_progress(0.99f, "Finalizing Gemma " + normalized + "...");
+            }
+            vtlog("download_gemma_model: removing old final path: %s",
+                  final_path.string().c_str());
+            std::filesystem::remove(final_path, ec);
+            if (ec) {
+                vtlog("download_gemma_model: remove final failed ec=%d message=%s",
+                      ec.value(), ec.message().c_str());
+            }
+            ec.clear();
+            vtlog("download_gemma_model: renaming %s -> %s",
+                  temp_path.string().c_str(), final_path.string().c_str());
+            std::filesystem::rename(temp_path, final_path, ec);
+            if (ec) {
+                vtlog("download_gemma_model: rename failed ec=%d message=%s",
+                      ec.value(), ec.message().c_str());
+            } else {
+                std::error_code size_ec;
+                auto final_size = std::filesystem::file_size(final_path, size_ec);
+                vtlog("download_gemma_model: finalized size=%llu",
+                      static_cast<unsigned long long>(size_ec ? 0 : final_size));
+            }
+        }
+
+        if (!download_ok || ec) {
+            vtlog("download_gemma_model: failed ok=%d exit=%lu ec=%d message=%s",
+                  download_ok ? 1 : 0, static_cast<unsigned long>(download_exit),
+                  ec.value(), ec.message().c_str());
+            std::filesystem::remove(temp_path, ec);
+            downloading_model_ = false;
+            if (overlay_) overlay_->show(OverlayState::Error, "Gemma download failed");
+            if (tray_) {
+                tray_->show_notification("Gemma download failed",
+                                         "Could not download " + normalized + ".");
+            }
+            Sleep(1800);
+            if (overlay_) overlay_->hide();
+            return;
+        }
+
+        if (overlay_) {
+            overlay_->set_progress(1.0f, "Starting Gemma " + normalized + "...");
+        }
+
+        config_->config().llm_provider = "internal";
+        config_->config().llm_internal_model = model_id;
+        config_->config().llm_internal_model_path = final_path.string();
+        config_->config().llm_cleanup_enabled = true;
+        config_->save();
+
+        if (gemma_runtime_) gemma_runtime_->stop();
+        bool started = ensure_internal_llm_runtime();
+        vtlog("download_gemma_model: ensure_internal_llm_runtime started=%d",
+              started ? 1 : 0);
+        configure_llm_cleaner();
+
+        if (tray_) {
+            tray_->set_current_gemma_model(model_id, recommend_gemma_model_for_hardware());
+            tray_->set_installed_gemma_models(installed_gemma_model_ids());
+            tray_->show_notification(started ? "Gemma model ready" : "Gemma model downloaded",
+                                     started ? "Now using: " + normalized + " internally."
+                                             : "Install llama-server.exe to start it internally.");
+        }
+        if (overlay_) {
+            overlay_->show(started ? OverlayState::Processing : OverlayState::Error,
+                           started ? "Gemma ready" : "llama-server.exe missing");
         }
 
         downloading_model_ = false;
@@ -1136,7 +1886,8 @@ void App::select_compute_mode(const std::string& compute_mode) {
     config_->save();
 
     if (tray_) {
-        tray_->set_current_compute_mode(compute_mode);
+        tray_->set_current_compute_mode(compute_mode,
+                                        current_gemma_compute_mode());
         update_tray_compute_info();
         tray_->set_tooltip("VoiceToText - " + compute_mode +
                            (use_gpu ? " GPU" : " CPU"));
@@ -1147,6 +1898,70 @@ void App::select_compute_mode(const std::string& compute_mode) {
             tray_->show_notification("Compute mode changed",
                                      compute_mode + (use_gpu ? " (GPU active)" : " (CPU active)"));
         }
+    }
+}
+
+void App::select_whisper_compute_mode(const std::string& mode) {
+    if (mode != "gpu" && mode != "cpu") return;
+
+    if (recording_.load() || processing_.load()) {
+        if (tray_) {
+            tray_->show_notification("VoiceToText",
+                                     "Cannot switch compute mode while recording or processing.");
+        }
+        return;
+    }
+
+    std::string model_size = current_model_size();
+    std::string model_path = resolve_model_path(config_->config().model_path);
+    bool use_gpu = effective_use_gpu(model_size, mode);
+    bool requested_gpu = mode == "gpu";
+
+    if (!reload_engine(model_path, use_gpu)) {
+        if (tray_) {
+            tray_->show_notification("VoiceToText",
+                                     "Failed to switch compute mode.");
+        }
+        return;
+    }
+
+    config_->config().compute_mode = mode;
+    config_->config().use_gpu = use_gpu;
+    config_->save();
+
+    if (tray_) {
+        tray_->set_current_compute_mode(mode, current_gemma_compute_mode());
+        update_tray_compute_info();
+        tray_->set_tooltip("VoiceToText - KB Whisper: " + mode +
+                           (use_gpu ? " GPU" : " CPU"));
+        if (requested_gpu && !use_gpu) {
+            tray_->show_notification("GPU backend unavailable",
+                                     "Using CPU. Build with CUDA to enable GPU.");
+        } else {
+            tray_->show_notification("KB Whisper compute mode changed",
+                                     mode + (use_gpu ? " (GPU active)" : " (CPU active)"));
+        }
+    }
+}
+
+void App::select_gemma_compute_mode(const std::string& mode) {
+    if (mode != "gpu" && mode != "cpu") return;
+
+    if (recording_.load() || processing_.load()) {
+        if (tray_) {
+            tray_->show_notification("VoiceToText",
+                                     "Cannot switch compute mode while recording or processing.");
+        }
+        return;
+    }
+
+    config_->config().llm_internal_compute_mode = mode;
+    config_->save();
+
+    if (tray_) {
+        tray_->set_current_compute_mode(current_compute_mode(), mode);
+        tray_->set_tooltip("VoiceToText - Gemma: " + mode);
+        tray_->show_notification("Gemma compute mode changed", mode);
     }
 }
 
@@ -1285,7 +2100,10 @@ void App::start_recording() {
     hotkeys_->register_hotkey(HotkeyAction::CancelRecording,
                               cfg.cancel_modifiers, cfg.cancel_key);
 
-    if (overlay_) overlay_->show(OverlayState::Listening);
+    if (overlay_) {
+        overlay_->set_paste_output_mode(config_->config().paste_output_mode);
+        overlay_->show(OverlayState::Listening);
+    }
     if (tray_) tray_->set_recording(true);
 
     // Start a thread that monitors audio level for the overlay
@@ -1415,6 +2233,7 @@ void App::process_audio() {
 
     // Run transcription
     vtlog("process_audio: calling whisper transcribe...");
+    if (overlay_) overlay_->show(OverlayState::Processing, "Transcribing...");
     auto whisper_start = std::chrono::steady_clock::now();
     TranscriptionResult result = engine_->transcribe(audio_data);
     vtlog("process_audio: transcribe returned in %lld ms, text length = %zu",
@@ -1449,32 +2268,17 @@ void App::process_audio() {
         std::string intent_profile = "general";
 
         bool cleanup_succeeded = false;
-        const bool llm_configured = cfg.llm_cleanup_enabled && llm_cleaner_ &&
-                                    !cfg.llm_endpoint.empty() &&
-                                    !cfg.llm_model.empty();
+        const bool llm_configured = cfg.llm_cleanup_enabled && llm_cleaner_;
 
         if (llm_configured) {
-            vtlog("process_audio: calling LM Studio cleanup/profile transform...");
+            vtlog("process_audio: calling LLM cleanup/profile transform...");
+            if (overlay_) overlay_->show(OverlayState::Processing, "Enhancing...");
             auto cleanup_start = std::chrono::steady_clock::now();
-            LlmCleanerConfig cleaner_config{
-                cfg.llm_cleanup_enabled,
-                cfg.llm_endpoint,
-                cfg.llm_model,
-                cfg.llm_pre_prompt,
-                cfg.llm_timeout_ms,
-                cfg.llm_max_tokens,
-                cfg.llm_intent_profiles_enabled,
-                cfg.llm_intent_detection_prompt,
-                cfg.llm_profile_transform_prompt,
-            };
-            cleaner_config.profiles.clear();
-            for (const auto& profile : cfg.llm_profiles) {
-                cleaner_config.profiles.push_back({
-                    profile.name,
-                    profile.instructions,
-                });
+            if (cfg.llm_provider == "internal" &&
+                (!gemma_runtime_ || !gemma_runtime_->running())) {
+                ensure_internal_llm_runtime();
             }
-            llm_cleaner_->configure(cleaner_config);
+            configure_llm_cleaner();
 
             std::string learned_corrections;
             if (config_->config().llm_corrections_enabled && correction_store_) {
@@ -1509,6 +2313,7 @@ void App::process_audio() {
         if (cleanup_succeeded &&
             config_->config().llm_ai_language_enabled && llm_cleaner_) {
             vtlog("process_audio: calling AI language transform...");
+            if (overlay_) overlay_->show(OverlayState::Processing, "AI Language...");
             auto ai_language_start = std::chrono::steady_clock::now();
             if (llm_cleaner_->transform_text(result.text,
                                             config_->config().llm_ai_language_prompt,
@@ -1524,14 +2329,32 @@ void App::process_audio() {
             vtlog("process_audio: skipping AI language because cleanup did not run successfully");
         }
 
+        std::string paste_mode = normalize_paste_output_mode(
+            config_->config().paste_output_mode);
+        std::string paste_text = result.text;
+        const char* paste_source = "clean";
+        if (paste_mode == "recorded") {
+            paste_text = recorded_text;
+            paste_source = "recorded";
+        } else if (paste_mode == "ai") {
+            if (!ai_language_text.empty()) {
+                paste_text = ai_language_text;
+                paste_source = "ai";
+            } else {
+                paste_source = "clean-fallback";
+                vtlog("process_audio: AI paste selected but AI language is empty; using clean transcript");
+            }
+        }
+
         if (overlay_) overlay_->hide();
-        vtlog("process_audio: injecting text: \"%s\"", result.text.c_str());
+        vtlog("process_audio: injecting %s text: \"%s\"",
+              paste_source, paste_text.c_str());
         // Small delay to let the user release the hotkey before injecting.
         Sleep(static_cast<DWORD>((std::max)(0, cfg.pre_injection_delay_ms)));
 
         // Inject the transcribed text into the focused application
         auto inject_start = std::chrono::steady_clock::now();
-        injector_->inject_text(result.text);
+        injector_->inject_text(paste_text);
         vtlog("process_audio: injection returned in %lld ms",
               elapsed_ms(inject_start));
 

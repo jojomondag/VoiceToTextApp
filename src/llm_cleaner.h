@@ -74,6 +74,7 @@ public:
     bool transform_text(const std::string& input,
                         const std::string& system_prompt,
                         std::string& output) const;
+    bool warm_up() const;
 
 private:
     bool request_completion(const std::string& input,

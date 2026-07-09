@@ -90,6 +90,7 @@ set(SOURCES
     src/hotkey_manager.cpp
     src/text_injector.cpp
     src/llm_cleaner.cpp
+    src/gemma_runtime.cpp
     src/correction_store.cpp
     src/transcript_history.cpp
     src/history_window.cpp
@@ -124,6 +125,12 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 set_target_properties(${PROJECT_NAME} PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     RUNTIME_OUTPUT_DIRECTORY      "${CMAKE_BINARY_DIR}/bin"
+)
+
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/resources"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/resources"
 )
 
 if(VTT_CUDA)
