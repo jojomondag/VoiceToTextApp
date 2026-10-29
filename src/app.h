@@ -4,11 +4,18 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <deque>
+#include <mutex>
 #include <windows.h>
 
-#include "whisper_engine.h"
+#include "pianissimo_engine.h"
+#include "speech_model_catalog.h"
+#include "dictation_window.h"
+#include "external_dictation_target.h"
+#include "live_mode_processor.h"
+#include "mode_switch_policy.h"
+#include "dictation_diagnostics.h"
 #include "audio_capture.h"
-#include "vad.h"
 #include "hotkey_manager.h"
 #include "text_injector.h"
 #include "overlay_window.h"
@@ -44,18 +51,24 @@ private:
     void cancel_recording();
 
     // Transcription
-    void process_audio();
+    void transcribe_live(unsigned long long session);
+    void process_text(std::string text, unsigned long long session);
+    void change_live_mode(const std::string& mode);
+    void refresh_live_mode_settings();
+    LiveModeProcessor::Result transform_live_mode(const LiveModeProcessor::Request& request);
+    void queue_live_mode(bool urgent = false, bool final = false);
+    void apply_live_mode_results();
+    void refresh_live_mode_status();
+    void complete_live_capture();
 
     // Language
     void switch_language();
 
     // Model selection
     void select_model(const std::string& model_size);
-    void select_compute_mode(const std::string& compute_mode);
     void select_whisper_compute_mode(const std::string& mode);
     void select_gemma_compute_mode(const std::string& mode);
-    void download_and_select_model(const std::string& model_size,
-                                   const std::string& model_path);
+    void download_and_select_model(const std::string& model_id);
     void select_gemma_model(const std::string& model_id);
     void download_and_select_gemma_model(const std::string& model_id,
                                          const std::string& model_path);
@@ -68,17 +81,13 @@ private:
     std::string gemma_model_download_path(const std::string& model_id) const;
     std::vector<std::string> installed_gemma_model_ids() const;
     std::string resolve_llama_server_path(const std::string& server_path) const;
-    bool ensure_startup_model_available();
     std::string current_model_size() const;
     std::string current_compute_mode() const;
     std::string current_gemma_compute_mode() const;
     std::string resolve_model_path(const std::string& model_path) const;
-    std::string model_path_for_size(const std::string& model_size) const;
-    std::string model_url_for_size(const std::string& model_size) const;
     bool effective_use_gpu(const std::string& model_size,
                            const std::string& compute_mode) const;
-    bool reload_engine(const std::string& model_path, bool use_gpu);
-    void update_tray_compute_info();
+    bool reload_engine(const std::string& model_id, bool use_gpu);
     void start_engine_warmup();
     void join_engine_warmup();
 
@@ -87,9 +96,12 @@ private:
 
     // Components
     std::unique_ptr<ConfigManager> config_;
-    std::unique_ptr<WhisperEngine> engine_;
+    std::unique_ptr<PianissimoEngine> engine_;
+    std::unique_ptr<DictationWindow> dictation_window_;
+    std::unique_ptr<ExternalDictationTarget> external_dictation_;
+    std::unique_ptr<LiveModeProcessor> live_mode_processor_;
+    std::shared_ptr<DictationDiagnostics> dictation_diagnostics_;
     std::unique_ptr<AudioCapture> audio_;
-    std::unique_ptr<VoiceActivityDetector> vad_;
     std::unique_ptr<HotkeyManager> hotkeys_;
     std::unique_ptr<TextInjector> injector_;
     std::unique_ptr<OverlayWindow> overlay_;
@@ -107,14 +119,36 @@ private:
     std::atomic<bool> recording_{false};
     std::atomic<bool> processing_{false};
     std::atomic<bool> downloading_model_{false};
+    std::atomic<bool> shutting_down_{false};
+    std::atomic<unsigned long long> dictation_session_{0};
+    HWND output_target_ = nullptr;
+    DWORD output_target_pid_ = 0;
+    bool manual_output_requested_ = false;
+    std::uint64_t live_mode_generation_ = 0;
+    std::uint64_t live_click_id_ = 0;
+    std::uint64_t last_live_token_ = 0;
+    std::string last_live_raw_;
+    std::uint64_t applied_live_token_ = 0;
+    std::string applied_live_raw_;
+    std::string live_status_key_;
+    ULONGLONG live_result_wait_started_ = 0;
+    ULONGLONG last_live_mode_poll_ = 0;
+    bool live_session_active_ = false;
+    bool live_capture_finished_ = false;
+    bool live_mode_flush_requested_ = false;
+    bool live_error_reported_ = false;
+    ModeSwitchPolicy mode_switch_policy_;
+    std::deque<ModeSwitchPolicy::Replacement> live_results_;
+    std::mutex live_settings_mutex_;
+    AppConfig live_settings_;
+    std::string live_corrections_;
+    std::mutex llm_work_mutex_;
+    std::atomic<bool> live_llm_busy_{false};
     std::thread process_thread_;
     std::thread model_download_thread_;
     std::thread warmup_thread_;
     std::thread history_append_thread_;
 
-    // Language cycling
-    std::vector<std::string> languages_ = {"sv", "en", "auto"};
-    int language_index_ = 0;
 };
 
 } // namespace vtt

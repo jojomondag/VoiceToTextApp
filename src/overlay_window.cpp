@@ -1,7 +1,9 @@
 #include "overlay_window.h"
+#include "../resources/version.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <commctrl.h>
 #include <gdiplus.h>
 #include <string>
 #include <utility>
@@ -19,13 +21,36 @@ static constexpr int CORNER_RADIUS = 20;
 static constexpr int PADDING = 18;
 static constexpr int WAVEFORM_HEIGHT = 28;
 static constexpr int WAVEFORM_BARS = 28;
+static constexpr int VERSION_TEXT_HEIGHT = 18;
+static constexpr int VERSION_TEXT_GAP = 4;
 static constexpr int PASTE_BUTTON_COUNT = 3;
+static constexpr int MODE_ICON_SIZE = 42;
+static constexpr int MODE_ICON_GAP = 8;
+static constexpr int MODE_HIT_PADDING = 4;
+static constexpr int MODE_ICON_TOTAL_WIDTH =
+    PASTE_BUTTON_COUNT * MODE_ICON_SIZE + (PASTE_BUTTON_COUNT - 1) * MODE_ICON_GAP;
 static constexpr const wchar_t* OVERLAY_CLASS_NAME = L"VTTOverlayWindow";
+static constexpr const wchar_t* PASTE_MODE_TOOLTIPS[] = {
+    L"Rösttext\n"
+    L"Klicka för att återställa originalet i det aktuella orörda textstycket.\n\n"
+    L"Fortsatt tal skrivs som originaltext. Text du själv redigerar bevaras.",
+    L"AI-språk\n"
+    L"Klicka för att göra det aktuella orörda textstycket till en tydlig AI-prompt "
+    L"med mål, uppgifter och krav. Fortsatt tal bygger vidare på prompten.\n\n"
+    L"Oklara delar markeras utan att fyllas i med gissningar. "
+    L"Nya ord kan synas som originaltext en kort stund medan Gemma bearbetar dem. "
+    L"Vänta på AI klar innan du markerar eller kopierar. Stopp slutför bearbetningen. "
+    L"Text du själv redigerar bevaras.",
+    L"Städa text\n"
+    L"Klicka för att rätta stavning, skiljetecken och grammatik i det aktuella "
+    L"orörda textstycket och fortsätta städa texten när du pratar.\n\n"
+    L"Nya ord kan synas som originaltext en kort stund medan Gemma bearbetar dem. "
+    L"Text du själv redigerar bevaras.",
+};
 
 static constexpr COLORREF COLOR_LISTENING  = RGB(66, 133, 244);
 static constexpr COLORREF COLOR_PROCESSING = RGB(251, 188, 4);
 static constexpr COLORREF COLOR_ERROR      = RGB(234, 67, 53);
-static constexpr COLORREF COLOR_BG         = RGB(32, 33, 36);
 static constexpr COLORREF COLOR_TEXT       = RGB(255, 255, 255);
 
 static int imax(int a, int b) {
@@ -112,7 +137,18 @@ static void add_rounded_rect(GraphicsPath& path, REAL x, REAL y,
     path.CloseFigure();
 }
 
-OverlayWindow::OverlayWindow() = default;
+OverlayWindow::OverlayWindow() {
+    // Button layout must not depend on whether the native tooltip initializes.
+    for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
+        const int x = OVERLAY_WIDTH - PADDING - MODE_ICON_TOTAL_WIDTH +
+                      i * (MODE_ICON_SIZE + MODE_ICON_GAP);
+        const int y = PADDING - 4;
+        paste_button_rects_[i] = {
+            x - MODE_HIT_PADDING, y - MODE_HIT_PADDING,
+            x + MODE_ICON_SIZE + MODE_HIT_PADDING,
+            y + MODE_ICON_SIZE + MODE_HIT_PADDING};
+    }
+}
 
 OverlayWindow::~OverlayWindow() {
     shutdown();
@@ -152,13 +188,17 @@ bool OverlayWindow::initialize(HINSTANCE hInstance) {
     );
 
     if (!hwnd_) return false;
+    if (!initialize_paste_tooltips()) return false;
 
     update_position();
-    initialized_ = true;
     return true;
 }
 
 void OverlayWindow::shutdown() {
+    if (tooltip_) {
+        DestroyWindow(tooltip_);
+        tooltip_ = nullptr;
+    }
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
@@ -172,7 +212,49 @@ void OverlayWindow::shutdown() {
         GdiplusShutdown(gdiplus_token_);
         gdiplus_token_ = 0;
     }
-    initialized_ = false;
+}
+
+bool OverlayWindow::initialize_paste_tooltips() {
+    INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES};
+    if (!InitCommonControlsEx(&controls)) return false;
+
+    // The overlay never takes focus away from the text field being dictated into.
+    tooltip_ = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        hwnd_, nullptr, hInstance_, nullptr);
+    if (!tooltip_) return false;
+
+    SetWindowPos(tooltip_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SendMessageW(tooltip_, TTM_SETMAXTIPWIDTH, 0, 360);
+    SendMessageW(tooltip_, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+    SendMessageW(tooltip_, TTM_SETDELAYTIME, TTDT_RESHOW, 150);
+    SendMessageW(tooltip_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+
+    for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
+        TOOLINFOW tool = {};
+        // No v6 manifest is required: v5 controls reject the larger V3 structure.
+        tool.cbSize = TTTOOLINFOW_V2_SIZE;
+        tool.uFlags = TTF_SUBCLASS;
+        tool.hwnd = hwnd_;
+        tool.uId = static_cast<UINT_PTR>(i + 1);
+        tool.rect = paste_button_rects_[i];
+        tool.lpszText = const_cast<wchar_t*>(PASTE_MODE_TOOLTIPS[i]);
+        if (!SendMessageW(tooltip_, TTM_ADDTOOLW, 0,
+                          reinterpret_cast<LPARAM>(&tool))) return false;
+    }
+    SendMessageW(tooltip_, TTM_ACTIVATE, FALSE, 0);
+    return true;
+}
+
+void OverlayWindow::dismiss_paste_tooltip() {
+    if (tooltip_) SendMessageW(tooltip_, TTM_POP, 0, 0);
+    if (hover_button_ != -1) {
+        hover_button_ = -1;
+        if (hwnd_ && IsWindowVisible(hwnd_)) paint();
+    }
 }
 
 void OverlayWindow::load_paste_button_icons() {
@@ -190,6 +272,7 @@ void OverlayWindow::release_paste_button_icons() {
 }
 
 void OverlayWindow::show(OverlayState state, const std::string& text) {
+    dismiss_paste_tooltip();
     state_ = state;
     text_ = text;
     progress_ = 0.0f;
@@ -203,6 +286,9 @@ void OverlayWindow::show(OverlayState state, const std::string& text) {
     }
 
     if (hwnd_) {
+        if (tooltip_) {
+            SendMessageW(tooltip_, TTM_ACTIVATE, state == OverlayState::Listening, 0);
+        }
         update_position();
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
         paint();
@@ -210,6 +296,8 @@ void OverlayWindow::show(OverlayState state, const std::string& text) {
 }
 
 void OverlayWindow::hide() {
+    dismiss_paste_tooltip();
+    if (tooltip_) SendMessageW(tooltip_, TTM_ACTIVATE, FALSE, 0);
     state_ = OverlayState::Hidden;
     if (hwnd_) {
         ShowWindow(hwnd_, SW_HIDE);
@@ -242,6 +330,12 @@ void OverlayWindow::set_progress(float progress, const std::string& text) {
 
 void OverlayWindow::set_paste_output_mode(const std::string& mode) {
     paste_output_mode_ = normalize_paste_mode(mode);
+    if (hwnd_ && IsWindowVisible(hwnd_)) paint();
+}
+
+void OverlayWindow::set_status_text(const std::string& text) {
+    if (text_ == text) return;
+    text_ = text;
     if (hwnd_ && IsWindowVisible(hwnd_)) paint();
 }
 
@@ -291,13 +385,20 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             return 0;
 
         case WM_MOUSELEAVE:
-            if (self && self->hover_button_ != -1) {
-                self->hover_button_ = -1;
-                self->paint();
-            }
+        case WM_NCMOUSEMOVE:
+            if (self) self->dismiss_paste_tooltip();
             return 0;
 
+        case WM_ENTERSIZEMOVE:
+        case WM_CANCELMODE:
+            if (self) self->dismiss_paste_tooltip();
+            break;
+
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+
         case WM_LBUTTONDOWN:
+            if (self && self->tooltip_) SendMessageW(self->tooltip_, TTM_POP, 0, 0);
             if (self && self->state_ == OverlayState::Listening &&
                 self->handle_button_click(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) {
                 return 0;
@@ -317,7 +418,7 @@ LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 int OverlayWindow::hit_test_paste_button(int x, int y) const {
     for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
         const RECT& rc = paste_button_rects_[i];
-        if (x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom) {
+        if (PtInRect(&rc, POINT{x, y})) {
             return i;
         }
     }
@@ -466,10 +567,8 @@ void OverlayWindow::paint() {
     float seconds = static_cast<float>(GetTickCount64() % 100000) / 1000.0f;
     float pulse = (std::sin(seconds * 4.2f) + 1.0f) * 0.5f;
 
-    const REAL modeIconSize = 42.0f;
-    const REAL modeIconGap = 8.0f;
-    const REAL modeIconTotalW =
-        PASTE_BUTTON_COUNT * modeIconSize + (PASTE_BUTTON_COUNT - 1) * modeIconGap;
+    const REAL modeIconSize = static_cast<REAL>(MODE_ICON_SIZE);
+    const REAL modeIconTotalW = static_cast<REAL>(MODE_ICON_TOTAL_WIDTH);
 
     REAL dotX = static_cast<REAL>(PADDING + DOT_RADIUS);
     REAL textLeft = 0;
@@ -557,18 +656,9 @@ void OverlayWindow::paint() {
                      percentRect, &percentFormat, &percentBrush);
     } else if (state_ == OverlayState::Listening) {
         const char* modes[] = {"recorded", "ai", "clean"};
-        REAL modeIconY = static_cast<REAL>(PADDING - 4);
-        REAL iconStartX = static_cast<REAL>(OVERLAY_WIDTH - PADDING - modeIconTotalW);
-
         for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
-            REAL x = iconStartX + i * (modeIconSize + modeIconGap);
-            REAL y = modeIconY;
-            paste_button_rects_[i] = {
-                static_cast<LONG>(std::floor(x - 4.0f)),
-                static_cast<LONG>(std::floor(y - 4.0f)),
-                static_cast<LONG>(std::ceil(x + modeIconSize + 4.0f)),
-                static_cast<LONG>(std::ceil(y + modeIconSize + 4.0f))
-            };
+            REAL x = static_cast<REAL>(paste_button_rects_[i].left + MODE_HIT_PADDING);
+            REAL y = static_cast<REAL>(paste_button_rects_[i].top + MODE_HIT_PADDING);
 
             bool selected = paste_output_mode_ == modes[i];
             bool hovered = hover_button_ == i;
@@ -615,7 +705,8 @@ void OverlayWindow::paint() {
         }
 
         REAL graphX = static_cast<REAL>(PADDING);
-        REAL graphY = static_cast<REAL>(OVERLAY_HEIGHT - PADDING - WAVEFORM_HEIGHT);
+        REAL graphY = static_cast<REAL>(OVERLAY_HEIGHT - PADDING - VERSION_TEXT_HEIGHT -
+                                      VERSION_TEXT_GAP - WAVEFORM_HEIGHT);
         REAL graphW = static_cast<REAL>(OVERLAY_WIDTH - PADDING * 2);
         REAL graphH = static_cast<REAL>(WAVEFORM_HEIGHT);
 
@@ -645,6 +736,22 @@ void OverlayWindow::paint() {
                              barWidth, barHeight, barWidth / 2.0f);
             g.FillPath(value > 0.18f ? &barBrush : &quietBrush, &barPath);
         }
+
+        // Listening is shown when recording starts; keep the version in its footer.
+        const std::wstring versionText = utf8_to_wide("V" VTT_VERSION_STRING);
+        Font versionFont(&fontFamily, 12.0f, FontStyleRegular, UnitPixel);
+        SolidBrush versionBrush(gdip_color(COLOR_TEXT, 190));
+        RectF versionRect(static_cast<REAL>(PADDING),
+                          static_cast<REAL>(OVERLAY_HEIGHT - PADDING - VERSION_TEXT_HEIGHT),
+                          static_cast<REAL>(OVERLAY_WIDTH - PADDING * 2),
+                          static_cast<REAL>(VERSION_TEXT_HEIGHT));
+        StringFormat versionFormat;
+        versionFormat.SetAlignment(StringAlignmentNear);
+        versionFormat.SetLineAlignment(StringAlignmentFar);
+        versionFormat.SetFormatFlags(StringFormatFlagsNoWrap);
+        versionFormat.SetTrimming(StringTrimmingEllipsisCharacter);
+        g.DrawString(versionText.c_str(), -1, &versionFont,
+                     versionRect, &versionFormat, &versionBrush);
     }
 
     RECT windowRect;

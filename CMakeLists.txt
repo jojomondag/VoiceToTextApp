@@ -7,54 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 
 # ---------------------------------------------------------------------------
-# whisper.cpp  (with optional CUDA / GPU support)
+# Pianissimo speech providers (the same versions as TeachersLittleHelper)
 # ---------------------------------------------------------------------------
-option(VTT_CUDA "Enable CUDA GPU acceleration" OFF)
-
-# Release binaries must run on the user's CPU, not on the CPU of the build
-# runner. Native instruction selection can emit AVX/AVX512 instructions that
-# make the app terminate with STATUS_ILLEGAL_INSTRUCTION on older machines.
-set(GGML_NATIVE OFF CACHE BOOL "Disable host-specific CPU instructions" FORCE)
-if(VTT_CUDA)
-    set(GGML_CUDA ON CACHE BOOL "Enable CUDA support for whisper.cpp" FORCE)
-else()
-    set(GGML_CUDA OFF CACHE BOOL "Enable CUDA support for whisper.cpp" FORCE)
-endif()
-set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(WHISPER_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    whisper
-    GIT_REPOSITORY https://github.com/ggerganov/whisper.cpp.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(whisper)
-
-if(VTT_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-
-    find_file(VTT_CUBLAS_DLL
-        NAMES cublas64_13.dll cublas64_12.dll
-        HINTS
-            "${CUDAToolkit_BIN_DIR}"
-            "${CUDAToolkit_BIN_DIR}/x64"
-            "$ENV{CUDA_PATH}/bin"
-            "$ENV{CUDA_PATH}/bin/x64"
-        NO_DEFAULT_PATH
-    )
-    find_file(VTT_CUBLASLT_DLL
-        NAMES cublasLt64_13.dll cublasLt64_12.dll
-        HINTS
-            "${CUDAToolkit_BIN_DIR}"
-            "${CUDAToolkit_BIN_DIR}/x64"
-            "$ENV{CUDA_PATH}/bin"
-            "$ENV{CUDA_PATH}/bin/x64"
-        NO_DEFAULT_PATH
-    )
-
-endif()
+include(cmake/PianissimoDependencies.cmake)
 
 # ---------------------------------------------------------------------------
 # miniaudio  (single-header library -- only need the header, not its build)
@@ -89,7 +44,16 @@ FetchContent_MakeAvailable(nlohmann_json)
 set(SOURCES
     src/main.cpp
     src/app.cpp
-    src/whisper_engine.cpp
+    src/pianissimo_engine.cpp
+    src/speech_model_catalog.cpp
+    src/live_dictation_buffer.cpp
+    src/live_mode_processor.cpp
+    src/mode_switch_policy.cpp
+    src/dictation_stream.cpp
+    src/dictation_window.cpp
+    src/external_dictation_target.cpp
+    src/clipboard_text_transaction.cpp
+    src/dictation_diagnostics.cpp
     src/audio_capture.cpp
     src/app_icon.cpp
     src/hotkey_manager.cpp
@@ -102,29 +66,31 @@ set(SOURCES
     src/overlay_window.cpp
     src/config_manager.cpp
     src/tray_icon.cpp
-    src/vad.cpp
 )
 
 add_executable(${PROJECT_NAME} WIN32 ${SOURCES} resources/app.rc)
 
-target_include_directories(${PROJECT_NAME} PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${whisper_SOURCE_DIR}/include
-)
-
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    whisper
     miniaudio_header
     nlohmann_json::nlohmann_json
     user32
     winhttp
     shell32
-    ole32
-    winmm
     dwmapi
     gdiplus
+    comctl32
     urlmon
+    bcrypt
+    ole32
+    oleaut32
+    uiautomationcore
 )
+target_include_directories(${PROJECT_NAME} PRIVATE "${VTT_SPEECH_INCLUDE_DIR}")
+target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
+endif()
+vtt_copy_speech_runtime(${PROJECT_NAME})
 
 # Set working directory for debugging inside Visual Studio / IDE
 set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -132,28 +98,19 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY      "${CMAKE_BINARY_DIR}/bin"
 )
 
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_SOURCE_DIR}/resources"
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/resources"
+set(VTT_RUNTIME_RESOURCES
+    "${CMAKE_SOURCE_DIR}/resources/overlay_voice_mode.png"
+    "${CMAKE_SOURCE_DIR}/resources/overlay_ai_language_mode.png"
+    "${CMAKE_SOURCE_DIR}/resources/overlay_cleanup_mode.png"
 )
 
-if(VTT_CUDA)
-    if(VTT_CUBLAS_DLL)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${VTT_CUBLAS_DLL}"
-                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-        )
-    endif()
-    if(VTT_CUBLASLT_DLL)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${VTT_CUBLASLT_DLL}"
-                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-        )
-    endif()
-endif()
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/resources"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${VTT_RUNTIME_RESOURCES}
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/resources"
+)
 
 add_custom_target(package-standalone
     COMMAND powershell -ExecutionPolicy Bypass -File

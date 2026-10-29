@@ -10,22 +10,27 @@ $models = @{
     "e2b" = @{
         Repo = "ggml-org/gemma-4-E2B-it-GGUF"
         File = "gemma-4-E2B-it-Q8_0.gguf"
+        Size = 4967497152
     }
     "e4b" = @{
         Repo = "ggml-org/gemma-4-E4B-it-GGUF"
-        File = "gemma-4-E4B-it-Q4_K_M.gguf"
+        File = "gemma-4-E4B-it-Q4_0.gguf"
+        Size = 4590807392
     }
     "12b" = @{
         Repo = "ggml-org/gemma-4-12B-it-GGUF"
-        File = "gemma-4-12B-it-Q4_K_M.gguf"
+        File = "gemma-4-12B-it-Q4_0.gguf"
+        Size = 7219673216
     }
     "26b-a4b" = @{
         Repo = "ggml-org/gemma-4-26B-A4B-it-GGUF"
-        File = "gemma-4-26B-A4B-it-Q4_K_M.gguf"
+        File = "gemma-4-26B-A4B-it-Q4_0.gguf"
+        Size = 14618145824
     }
     "31b" = @{
         Repo = "ggml-org/gemma-4-31B-it-GGUF"
-        File = "gemma-4-31B-it-Q4_K_M.gguf"
+        File = "gemma-4-31B-it-Q4_0.gguf"
+        Size = 17992313088
     }
 }
 
@@ -51,6 +56,12 @@ New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 Write-Host "Downloading $($entry.File)"
 Write-Host $url
 Invoke-WebRequest -Uri $url -OutFile $temp
+
+$downloadedSize = (Get-Item -LiteralPath $temp).Length
+if ($downloadedSize -ne $entry.Size) {
+    Remove-Item -LiteralPath $temp -Force
+    throw "Downloaded file size was $downloadedSize bytes; expected $($entry.Size)."
+}
 
 if (Test-Path $target) {
     Remove-Item -LiteralPath $target -Force

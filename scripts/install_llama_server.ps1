@@ -21,8 +21,13 @@ function Select-LlamaAsset {
     if ($Variant -eq "cuda") {
         $cuda = @($assets | Where-Object {
             $_.name -match '(?i)^llama-.*win-cuda.*x64.*\.zip$'
-        } |
-            Sort-Object name |
+        } | Sort-Object {
+            if ($_.name -match '(?i)cuda-(\d+)\.(\d+)') {
+                [version]("{0}.{1}" -f $Matches[1], $Matches[2])
+            } else {
+                [version]"0.0"
+            }
+        } -Descending |
             Select-Object -First 1)
         if ($cuda.Count -gt 0) { return $cuda[0] }
     }

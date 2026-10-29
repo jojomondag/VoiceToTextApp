@@ -8,11 +8,11 @@ namespace vtt {
 
 enum class TrayAction {
     ToggleRecording,
+    OpenDictation,
     OpenSettings,
     OpenHistory,
     SwitchLanguage,
     SelectModel,
-    SelectComputeMode,
     SelectGemmaModel,
     SelectWhisperComputeMode,
     SelectGemmaComputeMode,
@@ -37,43 +37,32 @@ public:
     void set_current_gemma_model(const std::string& model_id,
                                  const std::string& recommended_model_id);
     void set_installed_gemma_models(const std::vector<std::string>& model_ids);
-    void set_compute_info(const std::string& active_backend,
-                          const std::string& cpu_label,
-                          const std::string& gpu_label,
-                          const std::string& reason);
     void set_tooltip(const std::string& tooltip);
     void show_notification(const std::string& title, const std::string& message);
 
     // Call from WndProc for WM_APP+1 (tray messages)
-    void handle_message(WPARAM wParam, LPARAM lParam);
+    void handle_message(LPARAM lParam);
 
 private:
     void show_context_menu();
-    HICON create_color_icon(COLORREF color);
     std::string model_size_from_command(UINT cmd) const;
-    std::string compute_mode_from_command(UINT cmd) const;
     std::string gemma_model_from_command(UINT cmd) const;
     std::string whisper_compute_from_command(UINT cmd) const;
     std::string gemma_compute_from_command(UINT cmd) const;
 
     HWND hwnd_ = nullptr;
     HWND menu_hwnd_ = nullptr;
-    HINSTANCE hInstance_ = nullptr;
     NOTIFYICONDATAW nid_ = {};
     TrayCallback callback_;
     bool recording_ = false;
     bool initialized_ = false;
     bool menu_open_ = false;
-    std::string current_model_size_ = "tiny";
+    std::string current_model_size_ = "onnx-int8";
     std::string current_whisper_compute_mode_ = "auto";
     std::string current_gemma_compute_mode_ = "auto";
     std::string current_gemma_model_ = "auto";
     std::string recommended_gemma_model_ = "e2b";
     std::vector<std::string> installed_gemma_models_;
-    std::string active_compute_backend_ = "CPU";
-    std::string cpu_label_ = "Unknown CPU";
-    std::string gpu_label_ = "No GPU detected";
-    std::string compute_reason_ = "Auto";
     HICON icon_idle_ = nullptr;
     HICON icon_recording_ = nullptr;
 };

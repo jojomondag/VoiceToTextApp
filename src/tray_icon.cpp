@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 #define WM_TRAYICON (WM_APP + 1)
 
@@ -13,6 +14,7 @@
 #define IDM_SETTINGS  40003
 #define IDM_QUIT      40004
 #define IDM_HISTORY   40005
+#define IDM_DICTATION 40006
 #define IDM_MODEL_TINY   40100
 #define IDM_MODEL_BASE   40101
 #define IDM_MODEL_SMALL  40102
@@ -75,92 +77,17 @@ TrayIcon::~TrayIcon() {
     shutdown();
 }
 
-HICON TrayIcon::create_color_icon(COLORREF color) {
-    // Create a clear, opaque 32x32 tray icon with a white "V".
-    // Some Windows tray configurations make tiny generic icons hard to spot.
-    int size = 32;
-
-    HDC screen_dc = GetDC(nullptr);
-    HDC mem_dc = CreateCompatibleDC(screen_dc);
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = size;
-    bmi.bmiHeader.biHeight = -size;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP color_bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!color_bmp || !bits) {
-        DeleteDC(mem_dc);
-        ReleaseDC(nullptr, screen_dc);
-        return nullptr;
-    }
-
-    // Fill the bitmap with an opaque color.
-    DWORD* pixels = static_cast<DWORD*>(bits);
-    BYTE r = GetRValue(color);
-    BYTE g = GetGValue(color);
-    BYTE b = GetBValue(color);
-    DWORD pixel = (0xFF << 24) | (r << 16) | (g << 8) | b;
-
-    for (int i = 0; i < size * size; ++i) {
-        pixels[i] = pixel;
-    }
-
-    HBITMAP old_color = static_cast<HBITMAP>(SelectObject(mem_dc, color_bmp));
-    SetBkMode(mem_dc, TRANSPARENT);
-    SetTextColor(mem_dc, RGB(255, 255, 255));
-
-    HFONT font = CreateFontW(
-        24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT old_font = static_cast<HFONT>(SelectObject(mem_dc, font));
-    RECT text_rect = {0, 1, size, size};
-    DrawTextW(mem_dc, L"V", -1, &text_rect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(mem_dc, old_font);
-    DeleteObject(font);
-    SelectObject(mem_dc, old_color);
-
-    // Create an all-opaque mask.
-    HBITMAP mask_bmp = CreateBitmap(size, size, 1, 1, nullptr);
-    HBITMAP old_mask = static_cast<HBITMAP>(SelectObject(mem_dc, mask_bmp));
-    RECT mask_rect = {0, 0, size, size};
-    HBRUSH opaque_brush = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(mem_dc, &mask_rect, opaque_brush);
-    DeleteObject(opaque_brush);
-    SelectObject(mem_dc, old_mask);
-
-    ICONINFO ii = {};
-    ii.fIcon = TRUE;
-    ii.hbmMask = mask_bmp;
-    ii.hbmColor = color_bmp;
-    HICON icon = CreateIconIndirect(&ii);
-
-    DeleteObject(color_bmp);
-    DeleteObject(mask_bmp);
-    DeleteDC(mem_dc);
-    ReleaseDC(nullptr, screen_dc);
-
-    return icon;
-}
-
 bool TrayIcon::initialize(HWND hwnd, HINSTANCE hInstance) {
     if (initialized_) return true;
 
     hwnd_ = hwnd;
-    hInstance_ = hInstance;
     menu_hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         L"STATIC",
         L"VoiceToTextMenuOwner",
         WS_POPUP,
         0, 0, 0, 0,
-        nullptr, nullptr, hInstance_, nullptr);
+        nullptr, nullptr, hInstance, nullptr);
 
     // Create icons: app logo for idle, red-centered logo for recording.
     icon_idle_ = create_app_icon(32, RGB(0, 120, 215));
@@ -185,8 +112,21 @@ bool TrayIcon::initialize(HWND hwnd, HINSTANCE hInstance) {
     wcscpy_s(nid_.szTip, L"VoiceToText - Ready");
 
     if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
-        tray_log("Shell_NotifyIconW(NIM_ADD) failed", GetLastError());
-        return false;
+        const DWORD first_error = GetLastError();
+        tray_log("Shell_NotifyIconW(NIM_ADD) failed", first_error);
+
+        // Some Explorer/taskbar hosts reject GUID/show-tip registrations
+        // (notably after Explorer restarts or in a newly created desktop
+        // session). Retry with the classic hWnd/uID registration so the app
+        // still has a usable tray entry instead of appearing to start and
+        // then becoming unreachable.
+        nid_.uFlags &= ~(NIF_GUID | NIF_SHOWTIP);
+        ZeroMemory(&nid_.guidItem, sizeof(nid_.guidItem));
+        if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
+            tray_log("Shell_NotifyIconW fallback failed", GetLastError());
+            return false;
+        }
+        tray_log("Shell_NotifyIconW fallback succeeded");
     }
     tray_log("Shell_NotifyIconW(NIM_ADD) succeeded");
 
@@ -273,16 +213,6 @@ void TrayIcon::set_installed_gemma_models(const std::vector<std::string>& model_
     installed_gemma_models_ = model_ids;
 }
 
-void TrayIcon::set_compute_info(const std::string& active_backend,
-                                const std::string& cpu_label,
-                                const std::string& gpu_label,
-                                const std::string& reason) {
-    if (!active_backend.empty()) active_compute_backend_ = active_backend;
-    if (!cpu_label.empty()) cpu_label_ = cpu_label;
-    if (!gpu_label.empty()) gpu_label_ = gpu_label;
-    if (!reason.empty()) compute_reason_ = reason;
-}
-
 void TrayIcon::set_tooltip(const std::string& tooltip) {
     if (!initialized_) return;
 
@@ -298,21 +228,11 @@ void TrayIcon::set_tooltip(const std::string& tooltip) {
 
 std::string TrayIcon::model_size_from_command(UINT cmd) const {
     switch (cmd) {
-        case IDM_MODEL_TINY: return "tiny";
-        case IDM_MODEL_BASE: return "base";
-        case IDM_MODEL_SMALL: return "small";
-        case IDM_MODEL_MEDIUM: return "medium";
-        case IDM_MODEL_LARGE: return "large";
-        default: return {};
-    }
-}
-
-std::string TrayIcon::compute_mode_from_command(UINT cmd) const {
-    switch (cmd) {
-        case IDM_COMPUTE_WHISPER_GPU: return "gpu";
-        case IDM_COMPUTE_WHISPER_CPU: return "cpu";
-        case IDM_COMPUTE_GEMMA_GPU: return "gpu";
-        case IDM_COMPUTE_GEMMA_CPU: return "cpu";
+        case IDM_MODEL_TINY: return "gguf-q8";
+        case IDM_MODEL_BASE: return "onnx-int4";
+        case IDM_MODEL_SMALL: return "onnx-int8";
+        case IDM_MODEL_MEDIUM: return "onnx-fp16";
+        case IDM_MODEL_LARGE: return "onnx-fp32";
         default: return {};
     }
 }
@@ -366,7 +286,7 @@ void TrayIcon::show_notification(const std::string& title, const std::string& me
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
 
-void TrayIcon::handle_message(WPARAM wParam, LPARAM lParam) {
+void TrayIcon::handle_message(LPARAM lParam) {
     UINT msg = LOWORD(lParam);
 
     switch (msg) {
@@ -402,21 +322,25 @@ void TrayIcon::show_context_menu() {
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_LANGUAGE, L"Switch Language");
+    AppendMenuW(menu, MF_STRING, IDM_DICTATION, L"Live dictation...");
+    AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                L"Speech language: Swedish (Pianissimo)");
 
     // Compute Mode at the top — per-component submenus
     HMENU computeMenu = CreatePopupMenu();
     if (computeMenu) {
         HMENU whisperCompute = CreatePopupMenu();
         if (whisperCompute) {
+            const bool onnx = current_model_size_.rfind("onnx-", 0) == 0;
             AppendMenuW(whisperCompute, MF_STRING |
+                (onnx ? MF_DISABLED | MF_GRAYED : 0) |
                 (current_whisper_compute_mode_ == "gpu" ? MF_CHECKED : 0),
-                IDM_COMPUTE_WHISPER_GPU, L"GPU");
+                IDM_COMPUTE_WHISPER_GPU, L"GPU (Vulkan, GGUF)");
             AppendMenuW(whisperCompute, MF_STRING |
                 (current_whisper_compute_mode_ == "cpu" ? MF_CHECKED : 0),
-                IDM_COMPUTE_WHISPER_CPU, L"CPU");
+                IDM_COMPUTE_WHISPER_CPU, L"CPU (GGUF / ONNX)");
             AppendMenuW(computeMenu, MF_POPUP,
-                reinterpret_cast<UINT_PTR>(whisperCompute), L"KB Whisper");
+                reinterpret_cast<UINT_PTR>(whisperCompute), L"Pianissimo");
         }
 
         HMENU gemmaCompute = CreatePopupMenu();
@@ -432,7 +356,7 @@ void TrayIcon::show_context_menu() {
         }
 
         AppendMenuW(computeMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring whisperStatus = L"KB Whisper: " + utf8_to_wide(current_whisper_compute_mode_);
+        std::wstring whisperStatus = L"Pianissimo: " + utf8_to_wide(current_whisper_compute_mode_);
         std::wstring gemmaStatus = L"Gemma: " + utf8_to_wide(current_gemma_compute_mode_);
         AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
                     whisperStatus.c_str());
@@ -451,11 +375,11 @@ void TrayIcon::show_context_menu() {
             const char* size;
         };
         const ModelItem models[] = {
-            {IDM_MODEL_TINY, L"Tiny - fastest", "tiny"},
-            {IDM_MODEL_BASE, L"Base", "base"},
-            {IDM_MODEL_SMALL, L"Small - balanced", "small"},
-            {IDM_MODEL_MEDIUM, L"Medium - recommended", "medium"},
-            {IDM_MODEL_LARGE, L"Large - best quality", "large"},
+            {IDM_MODEL_TINY, L"GGUF Q8 (~740 MB)", "gguf-q8"},
+            {IDM_MODEL_BASE, L"ONNX int4 - smallest (~515 MB)", "onnx-int4"},
+            {IDM_MODEL_SMALL, L"ONNX int8 - recommended (~660 MB)", "onnx-int8"},
+            {IDM_MODEL_MEDIUM, L"ONNX fp16 (~1.28 GB)", "onnx-fp16"},
+            {IDM_MODEL_LARGE, L"ONNX fp32 (~2.56 GB)", "onnx-fp32"},
         };
 
         for (const auto& model : models) {
@@ -467,7 +391,7 @@ void TrayIcon::show_context_menu() {
         }
 
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modelMenu),
-                    L"KB Whisper Model");
+                    L"Pianissimo Model");
     }
 
     HMENU gemmaMenu = CreatePopupMenu();
@@ -539,6 +463,9 @@ void TrayIcon::show_context_menu() {
             break;
         case IDM_HISTORY:
             callback_(TrayAction::OpenHistory, {});
+            break;
+        case IDM_DICTATION:
+            callback_(TrayAction::OpenDictation, {});
             break;
         case IDM_SETTINGS:
             callback_(TrayAction::OpenSettings, {});

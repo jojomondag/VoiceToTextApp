@@ -14,12 +14,6 @@ std::string lower_copy(std::string value) {
     return value;
 }
 
-std::filesystem::path exe_directory() {
-    char exe_path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
-    return std::filesystem::path(exe_path).parent_path();
-}
-
 int installed_ram_gb() {
     MEMORYSTATUSEX status = {};
     status.dwLength = sizeof(status);
@@ -53,63 +47,38 @@ const std::vector<GemmaModelInfo>& gemma_models() {
     static const std::vector<GemmaModelInfo> models = {
         {
             "e2b",
-            "Gemma 4 E2B - recommended",
             "ggml-org/gemma-4-E2B-it-GGUF",
-            "Q8_0",
             "gemma-4-E2B-it-Q8_0.gguf",
             "models/llm/gemma-4-E2B-it-Q8_0.gguf",
-            "Best default for dictation cleanup and profile transforms.",
-            4967494592ull,
-            8,
-            16,
+            4967497152ull,
         },
         {
             "e4b",
-            "Gemma 4 E4B - higher quality",
             "ggml-org/gemma-4-E4B-it-GGUF",
-            "Q4_K_M",
-            "gemma-4-E4B-it-Q4_K_M.gguf",
-            "models/llm/gemma-4-E4B-it-Q4_K_M.gguf",
-            "Better quality when you can afford a little more latency.",
-            5335289824ull,
-            12,
-            24,
+            "gemma-4-E4B-it-Q4_0.gguf",
+            "models/llm/gemma-4-E4B-it-Q4_0.gguf",
+            4590807392ull,
         },
         {
             "12b",
-            "Gemma 4 12B - advanced",
             "ggml-org/gemma-4-12B-it-GGUF",
-            "Q4_K_M",
-            "gemma-4-12B-it-Q4_K_M.gguf",
-            "models/llm/gemma-4-12B-it-Q4_K_M.gguf",
-            "Useful only for heavier local reasoning workflows.",
-            0,
-            24,
-            32,
+            "gemma-4-12B-it-Q4_0.gguf",
+            "models/llm/gemma-4-12B-it-Q4_0.gguf",
+            7219673216ull,
         },
         {
             "26b-a4b",
-            "Gemma 4 26B A4B - high end",
             "ggml-org/gemma-4-26B-A4B-it-GGUF",
-            "Q4_K_M",
-            "gemma-4-26B-A4B-it-Q4_K_M.gguf",
-            "models/llm/gemma-4-26B-A4B-it-Q4_K_M.gguf",
-            "High-end GPU/workstation option, not needed for normal dictation.",
-            0,
-            32,
-            48,
+            "gemma-4-26B-A4B-it-Q4_0.gguf",
+            "models/llm/gemma-4-26B-A4B-it-Q4_0.gguf",
+            14618145824ull,
         },
         {
             "31b",
-            "Gemma 4 31B - workstation",
             "ggml-org/gemma-4-31B-it-GGUF",
-            "Q4_K_M",
-            "gemma-4-31B-it-Q4_K_M.gguf",
-            "models/llm/gemma-4-31B-it-Q4_K_M.gguf",
-            "Overkill for cleanup; keep for experimentation only.",
-            0,
-            48,
-            64,
+            "gemma-4-31B-it-Q4_0.gguf",
+            "models/llm/gemma-4-31B-it-Q4_0.gguf",
+            17992313088ull,
         },
     };
     return models;
@@ -132,11 +101,6 @@ std::string recommend_gemma_model_for_hardware() {
     bool nvidia = has_nvidia_driver();
     if (nvidia && ram_gb >= 24) return "e4b";
     return "e2b";
-}
-
-std::string gemma_model_path_for_id(const std::string& id) {
-    const GemmaModelInfo* model = find_gemma_model(id);
-    return model ? model->local_path : recommended_gemma_model().local_path;
 }
 
 std::string gemma_download_url_for_id(const std::string& id) {
@@ -232,7 +196,6 @@ bool GemmaRuntime::start(const std::string& llama_server_path,
     }
 
     process_ = process;
-    port_ = port;
     return true;
 }
 
@@ -251,7 +214,6 @@ void GemmaRuntime::stop() {
         CloseHandle(process_.hThread);
         process_.hThread = nullptr;
     }
-    port_ = 0;
 }
 
 bool GemmaRuntime::running() const {
@@ -259,10 +221,6 @@ bool GemmaRuntime::running() const {
     DWORD exit_code = 0;
     return GetExitCodeProcess(process_.hProcess, &exit_code) &&
            exit_code == STILL_ACTIVE;
-}
-
-int GemmaRuntime::port() const {
-    return port_;
 }
 
 } // namespace vtt

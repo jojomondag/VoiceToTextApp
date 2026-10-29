@@ -2,13 +2,16 @@
 
 #include "app_icon.h"
 #include "config_manager.h"
+#include "transcript_history.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <dwmapi.h>
+#include <iterator>
 #include <richedit.h>
 #include <string>
+#include <string_view>
 #include <windowsx.h>
 
 namespace vtt {
@@ -20,37 +23,32 @@ static constexpr int IDC_PROFILE_COMBO = 1011;
 static constexpr int IDC_PROFILE_NEW = 1012;
 static constexpr int IDC_PROFILE_RENAME = 1013;
 static constexpr int IDC_PROMPT_BACK = 1014;
-static constexpr int CLEAR_BUTTON_WIDTH = 90;
-static constexpr int CLEAR_BUTTON_GAP = 8;
-static constexpr int COPY_BUTTON_WIDTH = 34;
-static constexpr int COPY_BUTTON_HEIGHT = 20;
 static constexpr int PROFILE_BUTTON_WIDTH = 24;
 static constexpr int PROFILE_BUTTON_HEIGHT = 20;
 static constexpr int PROFILE_BUTTON_GAP = 6;
 static constexpr int SECTION_TITLE_INSET = 18;
 static constexpr int PANEL_INNER = 12;
-static constexpr int HISTORY_ICON_TEXT_GAP = 8;
-static constexpr int HISTORY_TEXT_LEFT_MARGIN = 54;
+static constexpr int ACTION_GUTTER_WIDTH = 62;
+static constexpr int ACTION_GUTTER_INSET = 4;
+static constexpr int HISTORY_TEXT_LEFT_MARGIN = 10;
 static constexpr int HISTORY_TEXT_RIGHT_MARGIN = 8;
 static constexpr int PROMPT_TEXT_RIGHT_MARGIN = 12;
 static constexpr int PANEL_RADIUS = 14;
 
 static constexpr const wchar_t* HISTORY_CLASS_NAME = L"VTTHistoryWindow";
+static constexpr const wchar_t* ACTION_GUTTER_CLASS_NAME =
+    L"VTTHistoryActionGutter";
 static constexpr const wchar_t* EDIT_OWNER_PROP = L"VTTHistoryWindowOwner";
-static constexpr const wchar_t* COPY_BUTTON_OWNER_PROP = L"VTTCopyButtonOwner";
 static constexpr const wchar_t* ENTRY_BEGIN = L"[[VTT_ENTRY_BEGIN:";
 static constexpr const wchar_t* ENTRY_END = L"[[VTT_ENTRY_END:";
 static constexpr COLORREF COLOR_BG = RGB(17, 23, 31);
-static constexpr COLORREF COLOR_BG_TOP = RGB(27, 36, 48);
 static constexpr COLORREF COLOR_PANEL = RGB(31, 40, 52);
 static constexpr COLORREF COLOR_PANEL_EDGE = RGB(72, 88, 105);
 static constexpr COLORREF COLOR_CONTROL = RGB(22, 29, 39);
 static constexpr COLORREF COLOR_BUTTON = RGB(39, 101, 150);
 static constexpr COLORREF COLOR_LABEL = RGB(232, 238, 244);
 static constexpr COLORREF COLOR_MUTED = RGB(150, 164, 178);
-static constexpr COLORREF COLOR_DATE = RGB(110, 170, 235);
 static constexpr COLORREF COLOR_PROFILE = RGB(88, 210, 170);
-static constexpr COLORREF COLOR_TOKENS = RGB(230, 166, 80);
 static constexpr COLORREF COLOR_TEXT = RGB(223, 230, 236);
 static constexpr COLORREF COLOR_ENTRY_CARD = RGB(28, 38, 50);
 static constexpr COLORREF COLOR_ENTRY_HIGHLIGHT = RGB(55, 92, 125);
@@ -93,6 +91,22 @@ std::string trim_ascii(const std::string& text) {
         --end;
     }
     return text.substr(begin, end - begin);
+}
+
+std::wstring normalize_crlf(const std::wstring& text) {
+    std::wstring normalized;
+    normalized.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == L'\r') {
+            normalized.append(L"\r\n");
+            if (i + 1 < text.size() && text[i + 1] == L'\n') ++i;
+        } else if (text[i] == L'\n') {
+            normalized.append(L"\r\n");
+        } else {
+            normalized.push_back(text[i]);
+        }
+    }
+    return normalized;
 }
 
 std::string trim_whitespace(const std::wstring& text, size_t start, size_t end) {
@@ -153,6 +167,32 @@ void apply_dark_control_theme(HWND hwnd) {
     FreeLibrary(ux);
 }
 
+class ScopedWindowRedraw {
+public:
+    ScopedWindowRedraw(std::initializer_list<HWND> windows) {
+        for (HWND window : windows) {
+            if (window && IsWindowVisible(window)) {
+                windows_.push_back(window);
+            }
+        }
+        for (HWND window : windows_) {
+            SendMessageW(window, WM_SETREDRAW, FALSE, 0);
+        }
+    }
+
+    ~ScopedWindowRedraw() {
+        for (auto it = windows_.rbegin(); it != windows_.rend(); ++it) {
+            SendMessageW(*it, WM_SETREDRAW, TRUE, 0);
+        }
+    }
+
+    ScopedWindowRedraw(const ScopedWindowRedraw&) = delete;
+    ScopedWindowRedraw& operator=(const ScopedWindowRedraw&) = delete;
+
+private:
+    std::vector<HWND> windows_;
+};
+
 } // namespace
 
 bool HistoryWindow::initialize(HINSTANCE hInstance, TranscriptHistory* history,
@@ -176,6 +216,18 @@ bool HistoryWindow::initialize(HINSTANCE hInstance, TranscriptHistory* history,
 
     if (!RegisterClassExW(&wc)) {
         if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+    }
+
+    WNDCLASSEXW gutter_class = {};
+    gutter_class.cbSize = sizeof(gutter_class);
+    gutter_class.lpfnWndProc = ActionGutterWndProc;
+    gutter_class.hInstance = hInstance_;
+    gutter_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    gutter_class.hbrBackground = nullptr;
+    gutter_class.lpszClassName = ACTION_GUTTER_CLASS_NAME;
+    if (!RegisterClassExW(&gutter_class) &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return false;
     }
 
     hwnd_ = CreateWindowExW(
@@ -228,11 +280,18 @@ void HistoryWindow::shutdown() {
     prompt_back_button_ = nullptr;
     prompt_save_button_ = nullptr;
     prompt_status_ = nullptr;
-    destroy_copy_buttons();
+    clear_entry_views();
+    release_action_gutter_paint_buffers();
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
+    recorded_edit_ = nullptr;
+    transcribed_edit_ = nullptr;
+    ai_language_edit_ = nullptr;
+    recorded_action_gutter_ = nullptr;
+    transcribed_action_gutter_ = nullptr;
+    ai_language_action_gutter_ = nullptr;
     if (label_font_) DeleteObject(label_font_);
     if (text_font_) DeleteObject(text_font_);
     if (button_font_) DeleteObject(button_font_);
@@ -252,6 +311,7 @@ void HistoryWindow::shutdown() {
     app_icon_large_ = nullptr;
     app_icon_small_ = nullptr;
     if (hInstance_) {
+        UnregisterClassW(ACTION_GUTTER_CLASS_NAME, hInstance_);
         UnregisterClassW(HISTORY_CLASS_NAME, hInstance_);
         hInstance_ = nullptr;
     }
@@ -263,20 +323,25 @@ void HistoryWindow::shutdown() {
 
 void HistoryWindow::show() {
     if (!hwnd_) return;
-    refresh();
-    SetWindowRedraw(hwnd_, FALSE);
+    // Showing the history window is a layout operation, not a data refresh.
+    // Re-running all RichEdit formatting on every open made the first frame
+    // noticeably slow even when the history had not changed.
+    if (history_content_dirty_) refresh();
+    const bool suspend_redraw = IsWindowVisible(hwnd_) != FALSE;
+    if (suspend_redraw) SetWindowRedraw(hwnd_, FALSE);
     layout();
-    update_copy_button_positions();
+    update_entry_action_positions();
     if (IsIconic(hwnd_)) {
         ShowWindow(hwnd_, SW_RESTORE);
     } else {
         ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
     }
     layout();
-    update_copy_button_positions();
-    SetWindowRedraw(hwnd_, TRUE);
+    update_entry_action_positions();
+    if (suspend_redraw) SetWindowRedraw(hwnd_, TRUE);
     RedrawWindow(hwnd_, nullptr, nullptr,
-                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW |
+                 RDW_NOERASE);
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0,
@@ -284,8 +349,7 @@ void HistoryWindow::show() {
     SetForegroundWindow(hwnd_);
     SetFocus(hwnd_);
     scroll_history_to_top();
-    update_copy_button_positions();
-    PostMessageW(hwnd_, WM_APP + 2, 0, 0);
+    update_entry_action_positions();
 }
 
 void HistoryWindow::refresh() {
@@ -293,47 +357,45 @@ void HistoryWindow::refresh() {
         !ai_language_edit_) return;
 
     HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
-    if (hwnd_) {
-        SetWindowRedraw(hwnd_, FALSE);
-    }
-    for (HWND edit : edits) {
-        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+    {
+        ScopedWindowRedraw redraw({hwnd_, recorded_edit_, transcribed_edit_,
+                                   ai_language_edit_});
+
+        std::wstring recorded = normalize_crlf(
+            utf8_to_wide(history_->format_recorded()));
+        std::wstring transcribed = normalize_crlf(
+            utf8_to_wide(history_->format_transcribed()));
+        std::wstring ai_language = normalize_crlf(
+            utf8_to_wide(history_->format_ai_language()));
+
+        recorded = strip_delimiters_and_capture_ranges(
+            recorded, panel_ranges_.recorded);
+        transcribed = strip_delimiters_and_capture_ranges(
+            transcribed, panel_ranges_.transcribed);
+        ai_language = strip_delimiters_and_capture_ranges(
+            ai_language, panel_ranges_.ai_language);
+
+        SetWindowTextW(recorded_edit_, recorded.c_str());
+        SetWindowTextW(transcribed_edit_, transcribed.c_str());
+        SetWindowTextW(ai_language_edit_, ai_language.c_str());
+        rebuild_entry_range_cache(recorded_edit_, recorded);
+        rebuild_entry_range_cache(transcribed_edit_, transcribed);
+        rebuild_entry_range_cache(ai_language_edit_, ai_language);
+        apply_entry_paragraph_spacing();
+        apply_header_colors(recorded_edit_);
+        apply_header_colors(transcribed_edit_);
+        apply_header_colors(ai_language_edit_);
+        apply_entry_cards();
+        rebuild_entry_views();
+        scroll_history_to_top();
+        update_entry_action_positions();
     }
 
-    std::wstring recorded = utf8_to_wide(history_->format_recorded());
-    std::wstring transcribed = utf8_to_wide(history_->format_transcribed());
-    std::wstring ai_language = utf8_to_wide(history_->format_ai_language());
-
-    recorded = strip_delimiters_and_capture_ranges(recorded,
-                                                   panel_ranges_.recorded);
-    transcribed = strip_delimiters_and_capture_ranges(transcribed,
-                                                      panel_ranges_.transcribed);
-    ai_language = strip_delimiters_and_capture_ranges(ai_language,
-                                                      panel_ranges_.ai_language);
-
-    SetWindowTextW(recorded_edit_, recorded.c_str());
-    SetWindowTextW(transcribed_edit_, transcribed.c_str());
-    SetWindowTextW(ai_language_edit_, ai_language.c_str());
-    apply_entry_paragraph_spacing();
-    highlighted_entry_ = -1;
-    set_profile_link_hover(nullptr, -1, -1);
-    rebuild_copy_buttons();
-    apply_header_colors(recorded_edit_);
-    apply_header_colors(transcribed_edit_);
-    apply_header_colors(ai_language_edit_);
-    apply_entry_cards();
-    scroll_history_to_top();
-    update_copy_button_positions();
-
-    for (HWND edit : edits) {
-        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(edit, nullptr, TRUE);
-    }
-    if (hwnd_) {
-        SetWindowRedraw(hwnd_, TRUE);
-        RedrawWindow(hwnd_, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-    }
+    for (HWND edit : edits) InvalidateRect(edit, nullptr, FALSE);
+    if (hwnd_) RedrawWindow(hwnd_, nullptr, nullptr,
+                            RDW_INVALIDATE | RDW_ALLCHILDREN |
+                            RDW_UPDATENOW | RDW_NOERASE);
+    history_content_dirty_ = false;
 }
 
 void HistoryWindow::create_child_controls() {
@@ -358,7 +420,7 @@ void HistoryWindow::create_child_controls() {
     ShowWindow(transcribed_label_, SW_HIDE);
     ShowWindow(ai_language_label_, SW_HIDE);
 
-    DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS |
+    DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS |
                        WS_VSCROLL | ES_MULTILINE |
                        ES_AUTOVSCROLL | ES_READONLY | ES_LEFT | ES_NOHIDESEL;
 
@@ -376,6 +438,17 @@ void HistoryWindow::create_child_controls() {
         0, L"RICHEDIT50W", L"",
         edit_style,
         0, 0, 0, 0, hwnd_, nullptr, hInstance_, nullptr);
+
+    DWORD gutter_style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS;
+    recorded_action_gutter_ = CreateWindowExW(
+        0, ACTION_GUTTER_CLASS_NAME, L"", gutter_style,
+        0, 0, 0, 0, hwnd_, nullptr, hInstance_, this);
+    transcribed_action_gutter_ = CreateWindowExW(
+        0, ACTION_GUTTER_CLASS_NAME, L"", gutter_style,
+        0, 0, 0, 0, hwnd_, nullptr, hInstance_, this);
+    ai_language_action_gutter_ = CreateWindowExW(
+        0, ACTION_GUTTER_CLASS_NAME, L"", gutter_style,
+        0, 0, 0, 0, hwnd_, nullptr, hInstance_, this);
 
     clear_button_ = CreateWindowExW(
         0, L"BUTTON", L"Clear",
@@ -405,6 +478,17 @@ void HistoryWindow::create_child_controls() {
     subclass_edit(recorded_edit_);
     subclass_edit(transcribed_edit_);
     subclass_edit(ai_language_edit_);
+
+    // RichEdit sends EN_VSCROLL before it performs some scrollbar/thumb
+    // operations.  Keep the existing event mask and add scroll notifications
+    // so the sibling action gutter gets a final, post-scroll layout pass even
+    // when no WM_MOUSEWHEEL reaches the subclassed edit.
+    for (HWND edit : {recorded_edit_, transcribed_edit_, ai_language_edit_}) {
+        if (!edit) continue;
+        LRESULT mask = SendMessageW(edit, EM_GETEVENTMASK, 0, 0);
+        SendMessageW(edit, EM_SETEVENTMASK, 0,
+                     mask | static_cast<LRESULT>(ENM_SCROLL));
+    }
 }
 
 void HistoryWindow::layout() {
@@ -419,7 +503,6 @@ void HistoryWindow::layout() {
     GetClientRect(hwnd_, &rc);
 
     int padding = 22;
-    int label_height = 30;
     int gap = 16;
     int width = rc.right - rc.left;
     int height = rc.bottom - rc.top;
@@ -437,23 +520,36 @@ void HistoryWindow::layout() {
     transcribed_panel_rc_ = {x2, panel_top, x2 + panel_width, panel_top + panel_height};
     ai_language_panel_rc_ = {x3, panel_top, x3 + panel_width, panel_top + panel_height};
 
-    int button_width = (std::max)(CLEAR_BUTTON_WIDTH, 92);
+    int button_width = 92;
     int button_x = x3 + panel_width - edit_margin - button_width;
     int button_y = panel_top + 16;
 
-    MoveWindow(recorded_label_, 0, 0, 0, 0, TRUE);
-    MoveWindow(transcribed_label_, 0, 0, 0, 0, TRUE);
-    MoveWindow(ai_language_label_, 0, 0, 0, 0, TRUE);
-    MoveWindow(clear_button_, button_x, button_y, button_width, 32, TRUE);
-    MoveWindow(recorded_edit_, x1 + edit_margin, panel_top + edit_top_offset,
-               panel_width - edit_margin * 2, edit_height, TRUE);
-    MoveWindow(transcribed_edit_, x2 + edit_margin, panel_top + edit_top_offset,
-               panel_width - edit_margin * 2, edit_height, TRUE);
-    MoveWindow(ai_language_edit_, x3 + edit_margin, panel_top + edit_top_offset,
-               panel_width - edit_margin * 2, edit_height, TRUE);
+    // Reposition the complete layout first, then paint it once. Repainting
+    // each child from MoveWindow made the opening/resize path present several
+    // intermediate white frames.
+    MoveWindow(recorded_label_, 0, 0, 0, 0, FALSE);
+    MoveWindow(transcribed_label_, 0, 0, 0, 0, FALSE);
+    MoveWindow(ai_language_label_, 0, 0, 0, 0, FALSE);
+    MoveWindow(clear_button_, button_x, button_y, button_width, 32, FALSE);
+    const int edit_width = panel_width - edit_margin * 2 -
+                           ACTION_GUTTER_WIDTH;
+    const int edit_y = panel_top + edit_top_offset;
+    MoveWindow(recorded_action_gutter_, x1 + edit_margin, edit_y,
+               ACTION_GUTTER_WIDTH, edit_height, FALSE);
+    MoveWindow(transcribed_action_gutter_, x2 + edit_margin, edit_y,
+               ACTION_GUTTER_WIDTH, edit_height, FALSE);
+    MoveWindow(ai_language_action_gutter_, x3 + edit_margin, edit_y,
+               ACTION_GUTTER_WIDTH, edit_height, FALSE);
+    MoveWindow(recorded_edit_, x1 + edit_margin + ACTION_GUTTER_WIDTH, edit_y,
+               edit_width, edit_height, FALSE);
+    MoveWindow(transcribed_edit_, x2 + edit_margin + ACTION_GUTTER_WIDTH,
+               edit_y, edit_width, edit_height, FALSE);
+    MoveWindow(ai_language_edit_, x3 + edit_margin + ACTION_GUTTER_WIDTH,
+               edit_y, edit_width, edit_height, FALSE);
 
-    update_copy_button_positions();
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    update_entry_action_positions();
+    RedrawWindow(hwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
 }
 
 void HistoryWindow::create_fonts_and_brushes() {
@@ -520,25 +616,20 @@ void HistoryWindow::draw_steel_button(const DRAWITEMSTRUCT* item) {
     HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
 
     RECT memRect = {0, 0, w, h};
+    const bool inside_panel =
+        item->CtlID == IDC_CLEAR_BUTTON ||
+        item->CtlID == IDC_PROFILE_NEW ||
+        item->CtlID == IDC_PROFILE_RENAME;
+    FillRect(memDC, &memRect,
+             inside_panel ? panel_brush_ : background_brush_);
 
     bool pressed = (item->itemState & ODS_SELECTED) != 0;
     bool focused = (item->itemState & ODS_FOCUS) != 0;
-    bool hot = item->hwndItem == hover_button_;
-    bool highlighted_copy = false;
-    for (const auto& entry_view : history_entry_views_) {
-        if (entry_view.copy_button == item->hwndItem) {
-            highlighted_copy = entry_view.entry_index == highlighted_entry_;
-            break;
-        }
-    }
 
     COLORREF fill = pressed
         ? RGB(29, 78, 118)
-        : (hot ? RGB(27, 78, 118)
-               : (highlighted_copy ? COLOR_ENTRY_HIGHLIGHT : COLOR_BUTTON));
-    COLORREF border = highlighted_copy
-        ? RGB(115, 170, 215)
-        : (focused ? RGB(120, 185, 235) : RGB(68, 132, 178));
+        : COLOR_BUTTON;
+    COLORREF border = focused ? RGB(120, 185, 235) : RGB(68, 132, 178);
 
     HBRUSH brush = CreateSolidBrush(fill);
     HPEN pen = CreatePen(PS_SOLID, 1, border);
@@ -591,69 +682,288 @@ void HistoryWindow::draw_steel_button(const DRAWITEMSTRUCT* item) {
     DeleteDC(memDC);
 }
 
-void HistoryWindow::draw_profile_button(const DRAWITEMSTRUCT* item) {
-    if (!item) return;
+void HistoryWindow::draw_entry_action(HDC hdc, const RECT& rect,
+                                      EntryAction action, bool hot,
+                                      bool pressed, bool highlighted) const {
+    if (!hdc || action == EntryAction::none ||
+        rect.right <= rect.left || rect.bottom <= rect.top) {
+        return;
+    }
 
-    RECT rc = item->rcItem;
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
+    COLORREF fill = COLOR_BUTTON;
+    COLORREF border = RGB(68, 132, 178);
+    COLORREF glyph = RGB(245, 250, 255);
+    if (action == EntryAction::profile) {
+        fill = highlighted ? RGB(56, 110, 96) : RGB(35, 72, 64);
+        border = highlighted ? RGB(145, 240, 210) : RGB(88, 170, 145);
+        glyph = RGB(235, 255, 248);
+        if (hot) fill = RGB(24, 86, 70);
+        if (pressed) fill = RGB(39, 104, 84);
+    } else {
+        if (highlighted) {
+            fill = COLOR_ENTRY_HIGHLIGHT;
+            border = RGB(115, 170, 215);
+        }
+        if (hot) fill = RGB(27, 78, 118);
+        if (pressed) fill = RGB(29, 68, 105);
+    }
 
-    HDC memDC = CreateCompatibleDC(item->hDC);
-    HBITMAP memBmp = CreateCompatibleBitmap(item->hDC, w, h);
-    HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+    int saved_dc = SaveDC(hdc);
+    if (!saved_dc) return;
+    SelectObject(hdc, GetStockObject(DC_BRUSH));
+    SelectObject(hdc, GetStockObject(DC_PEN));
+    SetDCBrushColor(hdc, fill);
+    SetDCPenColor(hdc, border);
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 9, 9);
 
-    bool pressed = (item->itemState & ODS_SELECTED) != 0;
-    bool focused = (item->itemState & ODS_FOCUS) != 0;
-    bool hot = item->hwndItem == hover_button_;
-    bool highlighted_profile = false;
+    int cx = (rect.left + rect.right) / 2;
+    int cy = (rect.top + rect.bottom) / 2 + (pressed ? 1 : 0);
+    SetDCPenColor(hdc, glyph);
+    if (action == EntryAction::copy) {
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, cx - 6, cy - 6, cx + 3, cy + 3);
+        Rectangle(hdc, cx - 3, cy - 3, cx + 6, cy + 6);
+    } else {
+        SetDCBrushColor(hdc, glyph);
+        Ellipse(hdc, cx - 3, cy - 7, cx + 4, cy);
+        RoundRect(hdc, cx - 7, cy + 2, cx + 8, cy + 8, 6, 6);
+    }
+    RestoreDC(hdc, saved_dc);
+}
+
+void HistoryWindow::paint_entry_actions(HWND edit, HDC hdc) const {
+    if (!edit || !hdc || profile_mode_) {
+        return;
+    }
+
+    auto intersects_clip = [&](const RECT& rect) {
+        if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
+        return RectVisible(hdc, &rect) != FALSE;
+    };
+
     for (const auto& entry_view : history_entry_views_) {
-        if (entry_view.profile_button == item->hwndItem) {
-            highlighted_profile = entry_view.entry_index == highlighted_entry_;
-            break;
+        if (entry_view.edit != edit) continue;
+
+        // The same entry index is highlighted in every panel.  This is a
+        // single-row update (old + new entry only), so it does not trigger a
+        // full document reformat while the pointer moves.
+        const bool highlighted = highlighted_entry_ == entry_view.entry_index;
+        const bool copy_hot =
+            hover_action_edit_ == edit &&
+            hover_action_entry_ == entry_view.entry_index &&
+            hover_action_ == EntryAction::copy;
+        const bool copy_pressed =
+            pressed_action_edit_ == edit &&
+            pressed_action_entry_ == entry_view.entry_index &&
+            pressed_action_ == EntryAction::copy;
+        if (intersects_clip(entry_view.copy_rect)) {
+            draw_entry_action(hdc, entry_view.copy_rect, EntryAction::copy,
+                              copy_hot, copy_pressed, highlighted);
+        }
+
+        const bool profile_hot =
+            hover_action_edit_ == edit &&
+            hover_action_entry_ == entry_view.entry_index &&
+            hover_action_ == EntryAction::profile;
+        const bool profile_pressed =
+            pressed_action_edit_ == edit &&
+            pressed_action_entry_ == entry_view.entry_index &&
+            pressed_action_ == EntryAction::profile;
+        if (intersects_clip(entry_view.profile_rect)) {
+            draw_entry_action(hdc, entry_view.profile_rect,
+                              EntryAction::profile, profile_hot,
+                              profile_pressed, highlighted);
+        }
+    }
+}
+
+HWND HistoryWindow::action_gutter_for_edit(HWND edit) const {
+    if (edit == recorded_edit_) return recorded_action_gutter_;
+    if (edit == transcribed_edit_) return transcribed_action_gutter_;
+    if (edit == ai_language_edit_) return ai_language_action_gutter_;
+    return nullptr;
+}
+
+HWND HistoryWindow::edit_for_action_gutter(HWND gutter) const {
+    if (gutter == recorded_action_gutter_) return recorded_edit_;
+    if (gutter == transcribed_action_gutter_) return transcribed_edit_;
+    if (gutter == ai_language_action_gutter_) return ai_language_edit_;
+    return nullptr;
+}
+
+HistoryWindow::PaintBuffer* HistoryWindow::paint_buffer_for_gutter(
+    HWND gutter) {
+    if (gutter == recorded_action_gutter_) {
+        return &recorded_gutter_paint_buffer_;
+    }
+    if (gutter == transcribed_action_gutter_) {
+        return &transcribed_gutter_paint_buffer_;
+    }
+    if (gutter == ai_language_action_gutter_) {
+        return &ai_language_gutter_paint_buffer_;
+    }
+    return nullptr;
+}
+
+void HistoryWindow::release_action_gutter_paint_buffers() {
+    auto release = [](PaintBuffer& buffer) {
+        if (buffer.dc && buffer.bitmap && buffer.previous_bitmap) {
+            SelectObject(buffer.dc, buffer.previous_bitmap);
+        }
+        if (buffer.bitmap) DeleteObject(buffer.bitmap);
+        if (buffer.dc) DeleteDC(buffer.dc);
+        buffer = {};
+    };
+    release(recorded_gutter_paint_buffer_);
+    release(transcribed_gutter_paint_buffer_);
+    release(ai_language_gutter_paint_buffer_);
+}
+
+void HistoryWindow::draw_action_gutter(HWND gutter, HDC hdc) const {
+    if (!gutter || !hdc) return;
+    RECT client = {};
+    GetClientRect(gutter, &client);
+    draw_action_gutter_region(gutter, hdc, client);
+}
+
+void HistoryWindow::draw_action_gutter_region(HWND gutter, HDC hdc,
+                                              const RECT& dirty) const {
+    if (!gutter || !hdc || dirty.right <= dirty.left ||
+        dirty.bottom <= dirty.top) {
+        return;
+    }
+
+    const int saved_dc = SaveDC(hdc);
+    IntersectClipRect(hdc, dirty.left, dirty.top, dirty.right, dirty.bottom);
+
+    // The gutter owns an opaque surface.  Only the invalidated region is
+    // cleared and redrawn, so moving the pointer between actions cannot
+    // cause every icon in the panel to be rasterized again.
+    FillRect(hdc, &dirty, control_brush_);
+    RECT client = {};
+    GetClientRect(gutter, &client);
+    {
+        const int marker_dc = SaveDC(hdc);
+        SelectObject(hdc, GetStockObject(DC_BRUSH));
+        SetDCBrushColor(hdc, COLOR_ENTRY_HIGHLIGHT);
+        HWND edit = edit_for_action_gutter(gutter);
+        for (const auto& entry_view : history_entry_views_) {
+            if (entry_view.edit != edit ||
+                entry_view.entry_index != highlighted_entry_ ||
+                entry_view.copy_rect.right <= entry_view.copy_rect.left) {
+                continue;
+            }
+            RECT marker = {0,
+                           (std::max)(LONG(0), entry_view.copy_rect.top - 2),
+                           (std::max)(LONG(0), client.right - 1),
+                           (std::min)(client.bottom,
+                                      entry_view.copy_rect.bottom + 2)};
+            if (marker.bottom > marker.top) {
+                FillRect(hdc, &marker,
+                         reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            }
+        }
+        RestoreDC(hdc, marker_dc);
+    }
+    if (client.right > dirty.left && client.right <= dirty.right) {
+        SelectObject(hdc, GetStockObject(DC_PEN));
+        SetDCPenColor(hdc, COLOR_PANEL_EDGE);
+        MoveToEx(hdc, client.right - 1, dirty.top, nullptr);
+        LineTo(hdc, client.right - 1, dirty.bottom);
+    }
+
+    paint_entry_actions(edit_for_action_gutter(gutter), hdc);
+    RestoreDC(hdc, saved_dc);
+}
+
+void HistoryWindow::paint_action_gutter(HWND gutter) {
+    if (!gutter) return;
+    HRGN update_region = CreateRectRgn(0, 0, 0, 0);
+    const int update_region_state = update_region
+        ? GetUpdateRgn(gutter, update_region, FALSE)
+        : ERROR;
+    PAINTSTRUCT paint = {};
+    HDC target_dc = BeginPaint(gutter, &paint);
+    if (!target_dc) {
+        if (update_region) DeleteObject(update_region);
+        EndPaint(gutter, &paint);
+        return;
+    }
+
+    RECT client = {};
+    GetClientRect(gutter, &client);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    PaintBuffer* buffer = paint_buffer_for_gutter(gutter);
+    if (buffer && !buffer->dc) {
+        buffer->dc = CreateCompatibleDC(target_dc);
+    }
+    if (buffer && buffer->dc &&
+        (!buffer->bitmap || buffer->width < width ||
+         buffer->height < height)) {
+        if (buffer->bitmap) {
+            SelectObject(buffer->dc, buffer->previous_bitmap);
+            DeleteObject(buffer->bitmap);
+            buffer->bitmap = nullptr;
+            buffer->previous_bitmap = nullptr;
+        }
+        buffer->width = (std::max)(buffer->width, width);
+        buffer->height = (std::max)(buffer->height, height);
+        buffer->bitmap = CreateCompatibleBitmap(
+            target_dc, buffer->width, buffer->height);
+        if (buffer->bitmap) {
+            buffer->previous_bitmap =
+                SelectObject(buffer->dc, buffer->bitmap);
+            buffer->initialized = false;
+        } else {
+            buffer->width = 0;
+            buffer->height = 0;
+            buffer->initialized = false;
         }
     }
 
-    COLORREF fill = pressed
-        ? RGB(39, 86, 74)
-        : (hot ? RGB(24, 58, 50)
-               : (highlighted_profile ? RGB(56, 110, 96) : RGB(35, 72, 64)));
-    COLORREF border = highlighted_profile
-        ? RGB(145, 240, 210)
-        : (focused ? RGB(120, 224, 190) : RGB(88, 170, 145));
+    if (buffer && buffer->dc && buffer->bitmap) {
+        RECT dirty = paint.rcPaint;
+        bool has_complex_update =
+            update_region_state == SIMPLEREGION ||
+            update_region_state == COMPLEXREGION;
+        if (has_complex_update) {
+            RECT region_box = {};
+            if (GetRgnBox(update_region, &region_box) != NULLREGION) {
+                dirty = region_box;
+            } else {
+                has_complex_update = false;
+            }
+        }
+        if (!buffer->initialized) {
+            draw_action_gutter(gutter, buffer->dc);
+            buffer->initialized = true;
+        } else {
+            if (has_complex_update) {
+                const int saved_dc = SaveDC(buffer->dc);
+                SelectClipRgn(buffer->dc, update_region);
+                draw_action_gutter_region(gutter, buffer->dc, dirty);
+                RestoreDC(buffer->dc, saved_dc);
+            } else {
+                draw_action_gutter_region(gutter, buffer->dc, dirty);
+            }
+        }
+        BitBlt(target_dc, dirty.left, dirty.top,
+               dirty.right - dirty.left, dirty.bottom - dirty.top,
+               buffer->dc, dirty.left, dirty.top, SRCCOPY);
+    } else {
+        draw_action_gutter(gutter, target_dc);
+    }
+    EndPaint(gutter, &paint);
+    if (update_region) DeleteObject(update_region);
+}
 
-    HBRUSH brush = CreateSolidBrush(fill);
-    HPEN border_pen = CreatePen(PS_SOLID, 1, border);
-    HGDIOBJ old_brush = SelectObject(memDC, brush);
-    HGDIOBJ old_pen = SelectObject(memDC, border_pen);
-    RoundRect(memDC, 0, 0, w, h, 9, 9);
-    SelectObject(memDC, old_pen);
-    SelectObject(memDC, old_brush);
-    DeleteObject(border_pen);
-    DeleteObject(brush);
-
-    RECT iconRect = {0, 0, w, h};
-    if (pressed) OffsetRect(&iconRect, 0, 1);
-
-    HPEN icon_pen = CreatePen(PS_SOLID, 1, RGB(245, 255, 252));
-    HBRUSH icon_brush = CreateSolidBrush(RGB(235, 255, 248));
-    HGDIOBJ old_icon_pen = SelectObject(memDC, icon_pen);
-    HGDIOBJ old_icon_brush = SelectObject(memDC, icon_brush);
-
-    int cx = w / 2;
-    int cy = h / 2;
-    Ellipse(memDC, cx - 3, cy - 7, cx + 4, cy);
-    RoundRect(memDC, cx - 7, cy + 2, cx + 8, cy + 8, 6, 6);
-
-    SelectObject(memDC, old_icon_brush);
-    SelectObject(memDC, old_icon_pen);
-    DeleteObject(icon_brush);
-    DeleteObject(icon_pen);
-
-    BitBlt(item->hDC, rc.left, rc.top, w, h, memDC, 0, 0, SRCCOPY);
-
-    SelectObject(memDC, oldBmp);
-    DeleteObject(memBmp);
-    DeleteDC(memDC);
+void HistoryWindow::redraw_action_gutter(HWND edit, bool immediate) const {
+    HWND gutter = action_gutter_for_edit(edit);
+    if (!gutter || !IsWindowVisible(gutter)) return;
+    UINT flags = RDW_INVALIDATE | RDW_NOERASE;
+    if (immediate) flags |= RDW_UPDATENOW;
+    RedrawWindow(gutter, nullptr, nullptr, flags);
 }
 
 void HistoryWindow::draw_combo_item(const DRAWITEMSTRUCT* item) {
@@ -736,14 +1046,15 @@ void HistoryWindow::apply_entry_paragraph_spacing() {
     HWND rich_edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
     for (HWND edit : rich_edits) {
         if (!edit) continue;
-        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SendMessageW(edit, EM_SETSEL, 0, static_cast<LPARAM>(-1));
         PARAFORMAT2 pf = {};
         pf.cbSize = sizeof(pf);
         pf.dwMask = PFM_SPACEAFTER | PFM_SPACEBEFORE;
         pf.dySpaceAfter = 60;
         pf.dySpaceBefore = 20;
         SendMessageW(edit, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&pf));
-        SendMessageW(edit, EM_SETSEL, -1, -1);
+        SendMessageW(edit, EM_SETSEL, static_cast<WPARAM>(-1),
+                     static_cast<LPARAM>(-1));
     }
 }
 
@@ -752,11 +1063,34 @@ void HistoryWindow::apply_entry_cards() {
     for (HWND edit : rich_edits) {
         if (!edit) continue;
 
-        auto ranges = entry_ranges(edit);
-        for (const auto& range : ranges) {
-            apply_entry_background(edit, range.first, range.second,
-                                   COLOR_ENTRY_CARD);
-        }
+        // Entry delimiters have already been removed from the RichEdit text,
+        // so the card surface is one contiguous range.  Formatting every
+        // entry separately caused hundreds of selection/scroll round-trips
+        // while opening the history window.  One operation per panel keeps
+        // the same visual background and makes refresh proportional to the
+        // number of panels, not the number of entries.
+        const int length = GetWindowTextLengthW(edit);
+        if (length <= 0) continue;
+
+        CHARRANGE saved = {};
+        POINT scroll_pos = {};
+        SendMessageW(edit, EM_EXGETSEL, 0,
+                     reinterpret_cast<LPARAM>(&saved));
+        SendMessageW(edit, EM_GETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&scroll_pos));
+        set_char_range(edit, 0, length);
+
+        CHARFORMAT2W format = {};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_BACKCOLOR;
+        format.crBackColor = COLOR_ENTRY_CARD;
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
+                     reinterpret_cast<LPARAM>(&format));
+
+        SendMessageW(edit, EM_EXSETSEL, 0,
+                     reinterpret_cast<LPARAM>(&saved));
+        SendMessageW(edit, EM_SETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&scroll_pos));
     }
 }
 
@@ -769,18 +1103,6 @@ void HistoryWindow::subclass_edit(HWND edit) {
                           reinterpret_cast<LONG_PTR>(EditWndProc)));
     if (!original_edit_proc_) {
         original_edit_proc_ = previous;
-    }
-}
-
-void HistoryWindow::subclass_copy_button(HWND button) {
-    if (!button) return;
-
-    SetPropW(button, COPY_BUTTON_OWNER_PROP, this);
-    WNDPROC previous = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtrW(button, GWLP_WNDPROC,
-                          reinterpret_cast<LONG_PTR>(CopyButtonWndProc)));
-    if (!original_copy_button_proc_) {
-        original_copy_button_proc_ = previous;
     }
 }
 
@@ -851,6 +1173,7 @@ LRESULT CALLBACK HistoryWindow::ComboSubclassProc(HWND hwnd, UINT msg,
 }
 
 std::wstring HistoryWindow::get_edit_text(HWND edit) const {
+    if (!edit) return {};
     int length = GetWindowTextLengthW(edit);
     if (length <= 0) return {};
 
@@ -860,58 +1183,80 @@ std::wstring HistoryWindow::get_edit_text(HWND edit) const {
     return text;
 }
 
-std::vector<std::pair<int, int>> HistoryWindow::entry_display_ranges(HWND edit) const {
-    std::wstring text = get_edit_text(edit);
-    std::vector<int> starts;
-
-    for (size_t pos = 0; pos < text.size(); ++pos) {
-        bool at_line_start = pos == 0 || text[pos - 1] == L'\r' ||
-                             text[pos - 1] == L'\n';
-        if (!at_line_start || text[pos] != L'[') continue;
-
-        size_t line_end = text.find_first_of(L"\r\n", pos);
-        if (line_end == std::wstring::npos) line_end = text.size();
-
-        std::wstring line = text.substr(pos, line_end - pos);
-        if (line.find(L"]") != std::wstring::npos &&
-            line.find(L"Tokens:") != std::wstring::npos) {
-            starts.push_back(static_cast<int>(pos));
-        }
-    }
-
-    std::vector<std::pair<int, int>> ranges;
-    for (size_t i = 0; i < starts.size(); ++i) {
-        int start = starts[i];
-        int end = (i + 1 < starts.size())
-            ? starts[i + 1]
-            : static_cast<int>(text.size());
-        ranges.emplace_back(start, end);
-    }
-
-    return ranges;
+const std::vector<std::pair<int, int>>&
+HistoryWindow::entry_display_ranges(HWND edit) const {
+    static const std::vector<std::pair<int, int>> empty;
+    if (edit == recorded_edit_) return panel_ranges_.recorded;
+    if (edit == transcribed_edit_) return panel_ranges_.transcribed;
+    if (edit == ai_language_edit_) return panel_ranges_.ai_language;
+    return empty;
 }
 
-std::vector<std::pair<int, int>> HistoryWindow::entry_ranges(HWND edit) const {
-    std::wstring text = get_edit_text(edit);
-    auto display_ranges = entry_display_ranges(edit);
-    std::vector<std::pair<int, int>> ranges;
-    ranges.reserve(display_ranges.size());
+const std::vector<std::pair<int, int>>&
+HistoryWindow::entry_ranges(HWND edit) const {
+    static const std::vector<std::pair<int, int>> empty;
+    if (edit == recorded_edit_) return panel_cp_ranges_.recorded;
+    if (edit == transcribed_edit_) return panel_cp_ranges_.transcribed;
+    if (edit == ai_language_edit_) return panel_cp_ranges_.ai_language;
+    return empty;
+}
 
-    for (const auto& range : display_ranges) {
-        ranges.emplace_back(
-            rich_edit_cp_from_text_offset(text, static_cast<size_t>(range.first)),
-            rich_edit_cp_from_text_offset(text, static_cast<size_t>(range.second)));
+void HistoryWindow::rebuild_entry_range_cache(HWND edit,
+                                              const std::wstring& text) {
+    std::vector<std::pair<int, int>>* cached = nullptr;
+    if (edit == recorded_edit_) cached = &panel_cp_ranges_.recorded;
+    if (edit == transcribed_edit_) cached = &panel_cp_ranges_.transcribed;
+    if (edit == ai_language_edit_) cached = &panel_cp_ranges_.ai_language;
+    if (!cached) return;
+
+    const auto& display_ranges = entry_display_ranges(edit);
+    cached->clear();
+    cached->reserve(display_ranges.size());
+
+    size_t cursor = 0;
+    int cp = 0;
+    auto advance_to = [&](size_t target) {
+        target = (std::min)(target, text.size());
+        while (cursor < target) {
+            if (text[cursor] == L'\r' && cursor + 1 < target &&
+                text[cursor + 1] == L'\n') {
+                cursor += 2;
+            } else {
+                ++cursor;
+            }
+            ++cp;
+        }
+        return cp;
+    };
+
+    for (const auto& display_range : display_ranges) {
+        size_t start = static_cast<size_t>((std::max)(0, display_range.first));
+        size_t end = static_cast<size_t>((std::max)(display_range.first,
+                                                     display_range.second));
+        end = (std::min)(end, text.size());
+        while (end > start &&
+               (text[end - 1] == L'\r' || text[end - 1] == L'\n' ||
+                text[end - 1] == L' ' || text[end - 1] == L'\t')) {
+            --end;
+        }
+
+        const int cp_start = advance_to(start);
+        const int cp_end = advance_to(end);
+        cached->emplace_back(cp_start, cp_end);
     }
-
-    return ranges;
 }
 
 int HistoryWindow::entry_index_from_char(HWND edit, int char_index) const {
-    auto ranges = entry_ranges(edit);
-    for (size_t i = 0; i < ranges.size(); ++i) {
-        if (char_index >= ranges[i].first && char_index < ranges[i].second) {
-            return static_cast<int>(i);
-        }
+    const auto& ranges = entry_ranges(edit);
+    auto it = std::upper_bound(
+        ranges.begin(), ranges.end(), char_index,
+        [](int value, const std::pair<int, int>& range) {
+            return value < range.first;
+        });
+    if (it == ranges.begin()) return -1;
+    --it;
+    if (char_index >= it->first && char_index < it->second) {
+        return static_cast<int>(std::distance(ranges.begin(), it));
     }
     return -1;
 }
@@ -962,46 +1307,14 @@ std::wstring HistoryWindow::strip_delimiters_and_capture_ranges(
     return output;
 }
 
-int HistoryWindow::entry_index_from_line(HWND edit, int line_index) const {
-    if (!edit || line_index < 0) return -1;
-
-    int line_count = static_cast<int>(SendMessageW(edit, EM_GETLINECOUNT, 0, 0));
-    if (line_index >= line_count) return -1;
-
-    int line_start = static_cast<int>(SendMessageW(edit, EM_LINEINDEX,
-                                                   line_index, 0));
-    if (line_start < 0) return -1;
-
-    int length = GetWindowTextLengthW(edit);
-    int next_line_start = (line_index + 1 < line_count)
-        ? static_cast<int>(SendMessageW(edit, EM_LINEINDEX, line_index + 1, 0))
-        : length;
-    if (next_line_start < line_start) next_line_start = length;
-
-    std::wstring text = get_edit_text(edit);
-    int line_end = next_line_start;
-    if (line_end > static_cast<int>(text.size())) {
-        line_end = static_cast<int>(text.size());
-    }
-    while (line_end > line_start &&
-           (text[static_cast<size_t>(line_end - 1)] == L'\r' ||
-            text[static_cast<size_t>(line_end - 1)] == L'\n' ||
-            text[static_cast<size_t>(line_end - 1)] == L' ' ||
-            text[static_cast<size_t>(line_end - 1)] == L'\t')) {
-        --line_end;
-    }
-    if (line_end <= line_start) return -1;
-
-    return entry_index_from_char(edit, line_start);
-}
-
 void HistoryWindow::handle_edit_mouse_move(HWND edit, LPARAM lParam) {
-    if (updating_highlight_) return;
-
-    int length = GetWindowTextLengthW(edit);
-    if (length <= 0) {
-        clear_highlight();
-        return;
+    if (tracked_mouse_edit_ != edit) {
+        TRACKMOUSEEVENT tracking = {};
+        tracking.cbSize = sizeof(tracking);
+        tracking.dwFlags = TME_LEAVE;
+        tracking.hwndTrack = edit;
+        TrackMouseEvent(&tracking);
+        tracked_mouse_edit_ = edit;
     }
 
     RECT rc;
@@ -1009,152 +1322,432 @@ void HistoryWindow::handle_edit_mouse_move(HWND edit, LPARAM lParam) {
     int x = GET_X_LPARAM(lParam);
     int y = GET_Y_LPARAM(lParam);
     if (x < 0 || y < 0 || x >= rc.right || y >= rc.bottom) {
-        set_profile_link_hover(nullptr, -1, -1);
-        clear_highlight();
+        set_entry_action_hover(nullptr, -1, EntryAction::none);
+        set_highlighted_entry(-1);
         return;
     }
+
+    set_entry_action_hover(nullptr, -1, EntryAction::none);
 
     int char_index = char_index_at(edit, x, y);
-    update_profile_link_hover(edit, char_index);
-    int entry_index = entry_index_from_char(edit, char_index);
-    if (entry_index < 0) {
-        clear_highlight();
-        return;
-    }
-    if (entry_index == highlighted_entry_) return;
-
-    highlight_entry(entry_index, edit);
+    const int entry_index = entry_index_from_char(edit, char_index);
+    set_highlighted_entry(entry_index);
+    ensure_highlighted_entry_visible(edit, entry_index);
 }
 
-void HistoryWindow::handle_copy_button_mouse_move(HWND button) {
-    if (updating_highlight_) return;
+void HistoryWindow::handle_action_gutter_mouse_move(HWND gutter,
+                                                    int x, int y) {
+    HWND edit = edit_for_action_gutter(gutter);
+    if (!edit) return;
 
+    if (tracked_action_gutter_ != gutter) {
+        TRACKMOUSEEVENT tracking = {};
+        tracking.cbSize = sizeof(tracking);
+        tracking.dwFlags = TME_LEAVE;
+        tracking.hwndTrack = gutter;
+        TrackMouseEvent(&tracking);
+        tracked_action_gutter_ = gutter;
+    }
+
+    int entry_index = -1;
+    EntryAction action = EntryAction::none;
+    if (entry_action_at(edit, x, y, entry_index, action)) {
+        set_entry_action_hover(edit, entry_index, action);
+    } else {
+        // Empty gutter space still belongs to the row under the pointer.  It
+        // lets the same entry remain marked when moving from text to its
+        // action area, without scanning or repainting the whole document.
+        const int char_index = char_index_at(edit, HISTORY_TEXT_LEFT_MARGIN, y);
+        entry_index = entry_index_from_char(edit, char_index);
+        set_entry_action_hover(nullptr, -1, EntryAction::none);
+    }
+    set_highlighted_entry(entry_index);
+    ensure_highlighted_entry_visible(edit, entry_index);
+}
+
+bool HistoryWindow::entry_action_at(HWND edit, int x, int y,
+                                    int& entry_index,
+                                    EntryAction& action) const {
+    POINT point = {x, y};
     for (const auto& entry_view : history_entry_views_) {
-        if (entry_view.copy_button != button &&
-            entry_view.profile_button != button) {
+        if (entry_view.edit != edit) continue;
+        if (entry_view.profile_rect.right > entry_view.profile_rect.left &&
+            PtInRect(&entry_view.profile_rect, point)) {
+            entry_index = entry_view.entry_index;
+            action = EntryAction::profile;
+            return true;
+        }
+        if (entry_view.copy_rect.right > entry_view.copy_rect.left &&
+            PtInRect(&entry_view.copy_rect, point)) {
+            entry_index = entry_view.entry_index;
+            action = EntryAction::copy;
+            return true;
+        }
+    }
+    entry_index = -1;
+    action = EntryAction::none;
+    return false;
+}
+
+void HistoryWindow::invalidate_entry_action(HWND edit, int entry_index,
+                                            EntryAction action) const {
+    if (!edit || entry_index < 0 || action == EntryAction::none) return;
+    for (const auto& entry_view : history_entry_views_) {
+        if (entry_view.edit != edit ||
+            entry_view.entry_index != entry_index) {
             continue;
         }
-        if (entry_view.entry_index == highlighted_entry_) return;
-        highlight_entry(entry_view.entry_index, entry_view.edit);
+        RECT rect = action == EntryAction::profile
+            ? entry_view.profile_rect
+            : entry_view.copy_rect;
+        if (rect.right > rect.left && rect.bottom > rect.top) {
+            InflateRect(&rect, 1, 1);
+            HWND gutter = action_gutter_for_edit(edit);
+            if (gutter) InvalidateRect(gutter, &rect, FALSE);
+        }
         return;
     }
 }
 
-void HistoryWindow::highlight_entry(int entry_index, HWND source_edit) {
-    if (updating_highlight_) return;
-    updating_highlight_ = true;
+void HistoryWindow::set_entry_action_hover(HWND edit, int entry_index,
+                                           EntryAction action) {
+    if (hover_action_edit_ == edit &&
+        hover_action_entry_ == entry_index &&
+        hover_action_ == action) {
+        return;
+    }
 
-    int previous_entry = highlighted_entry_;
-    HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
-    for (HWND edit : edits) {
-        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+    invalidate_entry_action(hover_action_edit_, hover_action_entry_,
+                            hover_action_);
+    hover_action_edit_ = edit;
+    hover_action_entry_ = entry_index;
+    hover_action_ = action;
+    invalidate_entry_action(hover_action_edit_, hover_action_entry_,
+                            hover_action_);
+}
 
-        int previous_start = 0;
-        int previous_end = 0;
-        if (entry_cp_range(edit, previous_entry, previous_start, previous_end)) {
-            clear_entry_background(edit, previous_start, previous_end);
-        }
+void HistoryWindow::set_highlighted_entry(int entry_index) {
+    if (entry_index < 0) entry_index = -1;
+    if (highlighted_entry_ == entry_index) return;
 
+    const int old_entry = highlighted_entry_;
+    const bool old_scroll_guard = handling_history_scroll_;
+
+    // RichEdit repaints (and can briefly reposition its viewport) for every
+    // EM_SETCHARFORMAT call.  Doing that once per panel while the mouse moves
+    // produces the visible blink/jump that used to make the three history
+    // columns look unsynchronised.  Freeze the visible edits, change both
+    // rows, then restore each edit's selection/scroll position and present
+    // one small invalidation per affected row.
+    struct EditState {
+        HWND edit = nullptr;
+        CHARRANGE selection = {};
+        POINT scroll = {};
+        RECT dirty = {};
+        bool frozen = false;
+    };
+    std::vector<EditState> states;
+    states.reserve(3);
+
+    auto add_dirty_range = [&](EditState& state, int row) {
+        if (row < 0) return;
         int start = 0;
         int end = 0;
-        if (entry_cp_range(edit, entry_index, start, end)) {
-            apply_entry_background(edit, start, end, COLOR_ENTRY_HIGHLIGHT);
-            if (edit != source_edit) {
-                center_entry(edit, start);
-            }
+        if (!entry_cp_range(state.edit, row, start, end)) return;
+
+        RECT client = {};
+        GetClientRect(state.edit, &client);
+        POINTL first = {};
+        POINTL last = {};
+        SendMessageW(state.edit, EM_POSFROMCHAR,
+                     reinterpret_cast<WPARAM>(&first), start);
+        SendMessageW(state.edit, EM_POSFROMCHAR,
+                     reinterpret_cast<WPARAM>(&last),
+                     (std::max)(start, end - 1));
+
+        // EM_POSFROMCHAR returns large negative values for characters outside
+        // the viewport.  Such a row needs no immediate repaint; RichEdit will
+        // paint its new colour when it is scrolled into view.
+        if (first.y < -32000 || last.y < -32000) return;
+        const int first_y = static_cast<int>(first.y);
+        const int last_y = static_cast<int>(last.y);
+        const int top = (std::max)(0, (std::min)(first_y, last_y) - 2);
+        const int bottom = (std::min)(static_cast<int>(client.bottom),
+                                      (std::max)(first_y, last_y) + 20);
+        if (bottom <= top) return;
+        RECT row_rect = {0, top, client.right, bottom};
+        if (state.dirty.right <= state.dirty.left ||
+            state.dirty.bottom <= state.dirty.top) {
+            state.dirty = row_rect;
+        } else {
+            UnionRect(&state.dirty, &state.dirty, &row_rect);
         }
-
-        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(edit, nullptr, FALSE);
-    }
-
-    highlighted_entry_ = entry_index;
-    update_copy_button_positions();
-    for (const auto& entry_view : history_entry_views_) {
-        if (entry_view.copy_button) {
-            InvalidateRect(entry_view.copy_button, nullptr, TRUE);
-        }
-        if (entry_view.profile_button) {
-            InvalidateRect(entry_view.profile_button, nullptr, TRUE);
-        }
-    }
-    updating_highlight_ = false;
-}
-
-void HistoryWindow::clear_highlight() {
-    if (highlighted_entry_ < 0 || updating_highlight_) return;
-    updating_highlight_ = true;
-
-    HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
-    for (HWND edit : edits) {
-        int start = 0;
-        int end = 0;
-        if (!entry_cp_range(edit, highlighted_entry_, start, end)) continue;
-
-        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
-        clear_entry_background(edit, start, end);
-        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(edit, nullptr, FALSE);
-    }
-
-    highlighted_entry_ = -1;
-    set_profile_link_hover(nullptr, -1, -1);
-    for (const auto& entry_view : history_entry_views_) {
-        if (entry_view.copy_button) {
-            InvalidateRect(entry_view.copy_button, nullptr, TRUE);
-        }
-        if (entry_view.profile_button) {
-            InvalidateRect(entry_view.profile_button, nullptr, TRUE);
-        }
-    }
-    updating_highlight_ = false;
-}
-
-void HistoryWindow::destroy_copy_buttons() {
-    for (auto& entry_view : history_entry_views_) {
-        if (entry_view.copy_button) DestroyWindow(entry_view.copy_button);
-        if (entry_view.profile_button) DestroyWindow(entry_view.profile_button);
-    }
-    hover_button_ = nullptr;
-    history_entry_views_.clear();
-}
-
-void HistoryWindow::rebuild_copy_buttons() {
-    destroy_copy_buttons();
+    };
 
     HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
     for (HWND edit : edits) {
         if (!edit) continue;
-        auto ranges = entry_display_ranges(edit);
-        for (int i = 0; i < static_cast<int>(ranges.size()); ++i) {
-            HWND btn = CreateWindowExW(
-                0, L"BUTTON", L"",
-                WS_CHILD | WS_CLIPSIBLINGS | BS_PUSHBUTTON | BS_OWNERDRAW,
-                0, 0, ENTRY_COPY_WIDTH, ENTRY_COPY_HEIGHT,
-                edit, nullptr, hInstance_, nullptr);
-            if (!btn) continue;
-            SendMessageW(btn, WM_SETFONT,
-                         reinterpret_cast<WPARAM>(button_font_), TRUE);
-            subclass_copy_button(btn);
-            HWND profile_btn = CreateWindowExW(
-                0, L"BUTTON", L"",
-                WS_CHILD | WS_CLIPSIBLINGS | BS_PUSHBUTTON | BS_OWNERDRAW,
-                0, 0, PROFILE_BUTTON_WIDTH, PROFILE_BUTTON_HEIGHT,
-                edit, nullptr, hInstance_, nullptr);
-            if (profile_btn) {
-                SendMessageW(profile_btn, WM_SETFONT,
-                             reinterpret_cast<WPARAM>(button_font_), TRUE);
-                subclass_copy_button(profile_btn);
+        EditState state;
+        state.edit = edit;
+        SendMessageW(edit, EM_EXGETSEL, 0,
+                     reinterpret_cast<LPARAM>(&state.selection));
+        SendMessageW(edit, EM_GETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&state.scroll));
+        add_dirty_range(state, old_entry);
+        add_dirty_range(state, entry_index);
+        state.frozen = IsWindowVisible(edit) != FALSE;
+        if (state.frozen) SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+        states.push_back(state);
+    }
+
+    handling_history_scroll_ = true;
+
+    auto apply_background_without_viewport_roundtrip =
+        [&](HWND edit, int start, int end, COLORREF color) {
+            if (!edit || start >= end) return;
+            set_char_range(edit, start, end);
+            CHARFORMAT2W format = {};
+            format.cbSize = sizeof(format);
+            format.dwMask = CFM_BACKCOLOR;
+            format.crBackColor = color;
+            format.dwEffects = 0;
+            SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
+                         reinterpret_cast<LPARAM>(&format));
+        };
+
+    for (const auto& state : states) {
+        if (old_entry >= 0) {
+            int start = 0;
+            int end = 0;
+            if (entry_cp_range(state.edit, old_entry, start, end)) {
+                apply_background_without_viewport_roundtrip(
+                    state.edit, start, end, COLOR_ENTRY_CARD);
             }
-            history_entry_views_.push_back({btn, profile_btn, edit, i});
+        }
+        if (entry_index >= 0) {
+            int start = 0;
+            int end = 0;
+            if (entry_cp_range(state.edit, entry_index, start, end)) {
+                apply_background_without_viewport_roundtrip(
+                    state.edit, start, end, COLOR_ENTRY_HIGHLIGHT);
+            }
         }
     }
-    update_copy_button_positions();
+
+    for (const auto& state : states) {
+        SendMessageW(state.edit, EM_EXSETSEL, 0,
+                     reinterpret_cast<LPARAM>(&state.selection));
+        SendMessageW(state.edit, EM_SETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&state.scroll));
+    }
+
+    highlighted_entry_ = entry_index;
+
+    for (const auto& state : states) {
+        if (!state.frozen) continue;
+        // Discard the large invalidation RichEdit may have accumulated while
+        // formatting.  Repaint only the old/new visible rows below.
+        ValidateRect(state.edit, nullptr);
+        SendMessageW(state.edit, WM_SETREDRAW, TRUE, 0);
+        if (state.dirty.right > state.dirty.left &&
+            state.dirty.bottom > state.dirty.top) {
+            RedrawWindow(state.edit, &state.dirty, nullptr,
+                         RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        }
+    }
+
+    handling_history_scroll_ = old_scroll_guard;
+
+    auto invalidate_row = [&](int row) {
+        if (row < 0) return;
+        for (const auto& entry_view : history_entry_views_) {
+            if (entry_view.entry_index != row) continue;
+            HWND gutter = action_gutter_for_edit(entry_view.edit);
+            if (!gutter || entry_view.copy_rect.right <= entry_view.copy_rect.left) {
+                continue;
+            }
+            RECT dirty = entry_view.copy_rect;
+            if (entry_view.profile_rect.right > entry_view.profile_rect.left) {
+                UnionRect(&dirty, &dirty, &entry_view.profile_rect);
+            }
+            dirty.left = 0;
+            dirty.right = ACTION_GUTTER_WIDTH;
+            InflateRect(&dirty, 0, 3);
+            InvalidateRect(gutter, &dirty, FALSE);
+        }
+    };
+    invalidate_row(old_entry);
+    invalidate_row(entry_index);
+}
+
+void HistoryWindow::ensure_highlighted_entry_visible(HWND source_edit,
+                                                     int entry_index) {
+    if (!source_edit || entry_index < 0 || handling_history_scroll_) return;
+
+    HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
+    std::vector<HWND> to_scroll;
+    for (HWND edit : edits) {
+        if (!edit || edit == source_edit || !IsWindowVisible(edit)) continue;
+
+        int start = 0;
+        int end = 0;
+        if (!entry_cp_range(edit, entry_index, start, end)) continue;
+
+        RECT client = {};
+        GetClientRect(edit, &client);
+        const int top_cp = char_index_at(edit, HISTORY_TEXT_LEFT_MARGIN, 1);
+        const int bottom_cp = char_index_at(
+            edit, HISTORY_TEXT_LEFT_MARGIN,
+            (std::max)(1, static_cast<int>(client.bottom) - 2));
+        const bool visible = top_cp >= 0 && bottom_cp >= top_cp &&
+            start < bottom_cp && end > top_cp;
+        if (!visible) to_scroll.push_back(edit);
+    }
+    if (to_scroll.empty()) return;
+
+    // Align only panels where the linked row is outside the viewport.  This
+    // preserves the user's current scroll position in the source panel and
+    // avoids the old behaviour of recentering all three columns on every
+    // mouse move.  Redraw is suspended for the short batch so the text and
+    // gutter icons appear at their new positions atomically.
+    const bool old_scroll_guard = handling_history_scroll_;
+    handling_history_scroll_ = true;
+    for (HWND edit : to_scroll) {
+        SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+    }
+
+    for (HWND edit : to_scroll) {
+        int start = 0;
+        int end = 0;
+        if (!entry_cp_range(edit, entry_index, start, end)) continue;
+
+        const int target_line = static_cast<int>(
+            SendMessageW(edit, EM_EXLINEFROMCHAR, 0, start));
+        const int first_line = static_cast<int>(
+            SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0));
+        const int lead_lines = (std::max)(1, visible_line_count(edit) / 3);
+        const int desired_first = (std::max)(0, target_line - lead_lines);
+        const int delta = desired_first - first_line;
+        if (delta != 0) {
+            SendMessageW(edit, EM_LINESCROLL, 0, delta);
+        }
+    }
+
+    for (HWND edit : to_scroll) {
+        SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
+        update_entry_action_positions(edit);
+        RedrawWindow(edit, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        redraw_action_gutter(edit, true);
+    }
+    handling_history_scroll_ = old_scroll_guard;
+}
+
+bool HistoryWindow::handle_entry_action_left_down(HWND edit, int x, int y) {
+    int entry_index = -1;
+    EntryAction action = EntryAction::none;
+    if (!entry_action_at(edit, x, y, entry_index, action)) return false;
+
+    set_entry_action_hover(edit, entry_index, action);
+    pressed_action_edit_ = edit;
+    pressed_action_entry_ = entry_index;
+    pressed_action_ = action;
+    HWND gutter = action_gutter_for_edit(edit);
+    if (gutter) SetCapture(gutter);
+    SetFocus(edit);
+    invalidate_entry_action(edit, entry_index, action);
+    return true;
+}
+
+void HistoryWindow::clear_pressed_entry_action() {
+    HWND pressed_edit = pressed_action_edit_;
+    int pressed_entry = pressed_action_entry_;
+    EntryAction pressed_action = pressed_action_;
+    pressed_action_edit_ = nullptr;
+    pressed_action_entry_ = -1;
+    pressed_action_ = EntryAction::none;
+    invalidate_entry_action(pressed_edit, pressed_entry, pressed_action);
+    if (GetCapture() == action_gutter_for_edit(pressed_edit)) {
+        ReleaseCapture();
+    }
+}
+
+bool HistoryWindow::handle_entry_action_left_up(HWND edit, int x, int y) {
+    if (!pressed_action_edit_ || pressed_action_ == EntryAction::none) {
+        return false;
+    }
+
+    HWND pressed_edit = pressed_action_edit_;
+    int pressed_entry = pressed_action_entry_;
+    EntryAction pressed_action = pressed_action_;
+    int hit_entry = -1;
+    EntryAction hit_action = EntryAction::none;
+    bool activate = edit == pressed_edit &&
+        entry_action_at(edit, x, y, hit_entry, hit_action) &&
+        hit_entry == pressed_entry && hit_action == pressed_action;
+    clear_pressed_entry_action();
+
+    if (!activate) return true;
+    if (pressed_action == EntryAction::copy) {
+        copy_highlighted_entry(pressed_edit, pressed_entry);
+        return true;
+    }
+
+    for (const auto& entry_view : history_entry_views_) {
+        if (entry_view.edit == pressed_edit &&
+            entry_view.entry_index == pressed_entry &&
+            !entry_view.profile.empty()) {
+            show_profile_prompt(entry_view.profile);
+            break;
+        }
+    }
+    return true;
+}
+
+void HistoryWindow::clear_entry_views() {
+    set_entry_action_hover(nullptr, -1, EntryAction::none);
+    set_highlighted_entry(-1);
+    clear_pressed_entry_action();
+    history_entry_views_.clear();
+}
+
+void HistoryWindow::rebuild_entry_views() {
+    clear_entry_views();
+
+    HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
+    for (HWND edit : edits) {
+        if (!edit) continue;
+        const auto& ranges = entry_ranges(edit);
+        const auto& links = links_for(edit);
+        size_t link_index = 0;
+        for (int i = 0; i < static_cast<int>(ranges.size()); ++i) {
+            HistoryEntryView entry_view;
+            entry_view.edit = edit;
+            entry_view.entry_index = i;
+            entry_view.start = ranges[static_cast<size_t>(i)].first;
+            entry_view.end = ranges[static_cast<size_t>(i)].second;
+            while (link_index < links.size() &&
+                   links[link_index].end <= entry_view.start) {
+                ++link_index;
+            }
+            if (link_index < links.size()) {
+                const auto& link = links[link_index];
+                if (link.start >= entry_view.start &&
+                    link.end <= entry_view.end) {
+                    entry_view.profile = link.profile;
+                }
+            }
+            history_entry_views_.push_back(std::move(entry_view));
+        }
+    }
+    update_entry_action_positions();
 }
 
 void HistoryWindow::scroll_history_to_top() {
     HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
     POINT top = {0, 0};
+    const bool was_handling_scroll = handling_history_scroll_;
+    handling_history_scroll_ = true;
 
     for (HWND edit : edits) {
         if (!edit) continue;
@@ -1165,157 +1758,96 @@ void HistoryWindow::scroll_history_to_top() {
                      reinterpret_cast<LPARAM>(&top));
         SendMessageW(edit, WM_VSCROLL, SB_TOP, 0);
     }
+    handling_history_scroll_ = was_handling_scroll;
 }
 
-void HistoryWindow::update_copy_button_positions() {
-    for (auto& entry_view : history_entry_views_) {
-        if (!entry_view.copy_button || !entry_view.edit) continue;
+void HistoryWindow::update_entry_action_positions(HWND only_edit) {
+    HWND edits[] = {recorded_edit_, transcribed_edit_, ai_language_edit_};
+    for (HWND edit : edits) {
+        if (!edit || (only_edit && edit != only_edit)) continue;
 
-        auto hide_entry_buttons = [&]() {
-            if (hover_button_ == entry_view.copy_button ||
-                hover_button_ == entry_view.profile_button) {
-                hover_button_ = nullptr;
-            }
-            ShowWindow(entry_view.copy_button, SW_HIDE);
-            if (entry_view.profile_button) {
-                ShowWindow(entry_view.profile_button, SW_HIDE);
-            }
-        };
+        RECT edit_rect = {};
+        GetClientRect(edit, &edit_rect);
+        const int visible_top = 2;
+        const int visible_bottom = edit_rect.bottom - 2;
+        const int text_length = GetWindowTextLengthW(edit);
 
-        int start = 0, end = 0;
-        if (!entry_cp_range(entry_view.edit, entry_view.entry_index, start, end)) {
-            hide_entry_buttons();
-            continue;
-        }
+        int visible_start = char_index_at(edit, HISTORY_TEXT_LEFT_MARGIN,
+                                          visible_top);
+        int visible_end = char_index_at(edit, HISTORY_TEXT_LEFT_MARGIN,
+                                        (std::max)(visible_top,
+                                                   visible_bottom - 1));
+        if (visible_start < 0) visible_start = 0;
+        if (visible_end < visible_start) visible_end = text_length;
 
-        RECT edit_rc;
-        GetClientRect(entry_view.edit, &edit_rc);
-
-        int edit_height = edit_rc.bottom - edit_rc.top;
-        if (edit_height <= ENTRY_COPY_HEIGHT + 8) {
-            hide_entry_buttons();
-            continue;
-        }
-
-        HDC hdc = GetDC(entry_view.edit);
+        HDC hdc = GetDC(edit);
         HFONT font = reinterpret_cast<HFONT>(
-            SendMessageW(entry_view.edit, WM_GETFONT, 0, 0));
-        HGDIOBJ old_font = font ? SelectObject(hdc, font) : nullptr;
-        TEXTMETRICW tm = {};
-        GetTextMetricsW(hdc, &tm);
-        if (old_font) SelectObject(hdc, old_font);
-        ReleaseDC(entry_view.edit, hdc);
-
-        int line_height = tm.tmHeight + tm.tmExternalLeading;
+            SendMessageW(edit, WM_GETFONT, 0, 0));
+        HGDIOBJ old_font = hdc && font ? SelectObject(hdc, font) : nullptr;
+        TEXTMETRICW metrics = {};
+        if (hdc) GetTextMetricsW(hdc, &metrics);
+        if (hdc && old_font) SelectObject(hdc, old_font);
+        if (hdc) ReleaseDC(edit, hdc);
+        int line_height = metrics.tmHeight + metrics.tmExternalLeading;
         if (line_height <= 0) line_height = 16;
 
-        POINTL start_pos = {};
-        SendMessageW(entry_view.edit, EM_POSFROMCHAR,
-                     reinterpret_cast<WPARAM>(&start_pos), start);
-        if (start_pos.y <= -32000) {
-            hide_entry_buttons();
-            continue;
-        }
+        for (auto& entry_view : history_entry_views_) {
+            if (entry_view.edit != edit) continue;
+            SetRectEmpty(&entry_view.copy_rect);
+            SetRectEmpty(&entry_view.profile_rect);
 
-        int end_char = (std::max)(start, end - 1);
-        POINTL end_pos = {};
-        SendMessageW(entry_view.edit, EM_POSFROMCHAR,
-                     reinterpret_cast<WPARAM>(&end_pos), end_char);
-        if (end_pos.y <= -32000) {
-            hide_entry_buttons();
-            continue;
-        }
-
-        int visible_top = 2;
-        int visible_bottom = edit_rc.bottom - 2;
-        int entry_top = static_cast<int>(start_pos.y);
-        int entry_bottom = static_cast<int>(end_pos.y) + line_height;
-        if (entry_view.edit == ai_language_edit_) {
-            entry_bottom = (std::max)(entry_bottom,
-                                      entry_top + ENTRY_COPY_HEIGHT + 4);
-        }
-        int y = entry_top + (entry_bottom - entry_top - ENTRY_COPY_HEIGHT) / 2;
-        if (y + ENTRY_COPY_HEIGHT < visible_top || y > visible_bottom) {
-            hide_entry_buttons();
-            continue;
-        }
-
-        int left_column = (std::max)(4, HISTORY_TEXT_LEFT_MARGIN -
-                                        ENTRY_COPY_WIDTH - 14);
-        if (entry_view.edit == ai_language_edit_) {
-            left_column = (std::max)(4, HISTORY_TEXT_LEFT_MARGIN -
-                                        ENTRY_COPY_WIDTH - 18);
-        }
-        int x = left_column;
-
-        MoveWindow(entry_view.copy_button, x, y,
-                   ENTRY_COPY_WIDTH, ENTRY_COPY_HEIGHT, TRUE);
-        SetWindowPos(entry_view.copy_button, HWND_TOP, x, y,
-                     ENTRY_COPY_WIDTH, ENTRY_COPY_HEIGHT,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
-        if (!entry_view.profile_button) continue;
-
-        const ProfileLink* profile_link = nullptr;
-        const auto& links = links_for(entry_view.edit);
-        for (const auto& link : links) {
-            if (link.start >= start && link.end <= end) {
-                profile_link = &link;
-                break;
+            if (visible_bottom <= visible_top + ENTRY_COPY_HEIGHT ||
+                entry_view.end <= visible_start ||
+                entry_view.start > visible_end) {
+                continue;
             }
-        }
-        if (!profile_link) {
-            ShowWindow(entry_view.profile_button, SW_HIDE);
-            continue;
-        }
 
-        auto display_ranges = entry_display_ranges(entry_view.edit);
-        if (entry_view.entry_index >= static_cast<int>(display_ranges.size())) {
-            ShowWindow(entry_view.profile_button, SW_HIDE);
-            continue;
-        }
+            POINTL header_position = {};
+            SendMessageW(edit, EM_POSFROMCHAR,
+                         reinterpret_cast<WPARAM>(&header_position),
+                         entry_view.start);
+            const int header_y = static_cast<int>(header_position.y);
+            if (header_y < 0 || header_y >= visible_bottom) {
+                continue;
+            }
 
-        std::wstring text = get_edit_text(entry_view.edit);
-        const auto& display_range =
-            display_ranges[static_cast<size_t>(entry_view.entry_index)];
-        size_t profile_label = text.find(
-            L"Profile:", static_cast<size_t>(display_range.first));
-        if (profile_label == std::wstring::npos ||
-            profile_label >= static_cast<size_t>(display_range.second)) {
-            ShowWindow(entry_view.profile_button, SW_HIDE);
-            continue;
-        }
+            const int copy_x = ACTION_GUTTER_INSET;
+            // Keep the icon in the same coordinate space as the header line.
+            // Do not clamp it to the gutter edges: clamping made an icon
+            // appear stuck at the top/bottom while its text continued to
+            // scroll.  The gutter's clip naturally hides the offscreen part.
+            const int copy_y = header_y +
+                               (line_height - ENTRY_COPY_HEIGHT) / 2;
+            if (copy_y >= visible_bottom ||
+                copy_y + ENTRY_COPY_HEIGHT <= visible_top) {
+                continue;
+            }
+            entry_view.copy_rect = {
+                copy_x,
+                copy_y,
+                copy_x + ENTRY_COPY_WIDTH,
+                copy_y + ENTRY_COPY_HEIGHT,
+            };
 
-        int profile_label_cp = rich_edit_cp_from_text_offset(text, profile_label);
-        POINTL profile_pos = {};
-        SendMessageW(entry_view.edit, EM_POSFROMCHAR,
-                     reinterpret_cast<WPARAM>(&profile_pos),
-                     profile_label_cp);
-        if (profile_pos.y <= -32000) {
-            ShowWindow(entry_view.profile_button, SW_HIDE);
-            continue;
+            if (entry_view.profile.empty()) continue;
+            const int profile_x = ACTION_GUTTER_INSET + ENTRY_COPY_WIDTH +
+                                  PROFILE_BUTTON_GAP;
+            const int profile_y = header_y +
+                                  (line_height - PROFILE_BUTTON_HEIGHT) / 2;
+            if (profile_y >= visible_bottom ||
+                profile_y + PROFILE_BUTTON_HEIGHT <= visible_top) {
+                continue;
+            }
+            entry_view.profile_rect = {
+                profile_x,
+                profile_y,
+                profile_x + PROFILE_BUTTON_WIDTH,
+                profile_y + PROFILE_BUTTON_HEIGHT,
+            };
         }
-
-        int profile_x = (std::max)(4, static_cast<int>(profile_pos.x) -
-                                      PROFILE_BUTTON_GAP -
-                                      PROFILE_BUTTON_WIDTH);
-        int profile_y = static_cast<int>(profile_pos.y) +
-                        (line_height - PROFILE_BUTTON_HEIGHT) / 2;
-        if (profile_y < visible_top) {
-            profile_y = visible_top;
-        }
-        if (profile_y + PROFILE_BUTTON_HEIGHT > visible_bottom ||
-            profile_x + PROFILE_BUTTON_WIDTH > edit_rc.right - 4) {
-            ShowWindow(entry_view.profile_button, SW_HIDE);
-            continue;
-        }
-
-        MoveWindow(entry_view.profile_button, profile_x, profile_y,
-                   PROFILE_BUTTON_WIDTH, PROFILE_BUTTON_HEIGHT, TRUE);
-        SetWindowPos(entry_view.profile_button, HWND_TOP, profile_x, profile_y,
-                     PROFILE_BUTTON_WIDTH, PROFILE_BUTTON_HEIGHT,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        redraw_action_gutter(edit);
     }
+
 }
 
 void HistoryWindow::copy_highlighted_entry(HWND edit, int entry_index) {
@@ -1348,7 +1880,7 @@ void HistoryWindow::copy_highlighted_entry(HWND edit, int entry_index) {
 std::wstring HistoryWindow::entry_body_text(HWND edit, int entry_index) const {
     if (!edit || entry_index < 0) return {};
 
-    auto ranges = entry_display_ranges(edit);
+    const auto& ranges = entry_display_ranges(edit);
     if (entry_index >= static_cast<int>(ranges.size())) return {};
 
     std::wstring text = get_edit_text(edit);
@@ -1376,72 +1908,14 @@ std::wstring HistoryWindow::entry_body_text(HWND edit, int entry_index) const {
                             : std::wstring();
 }
 
-void HistoryWindow::apply_entry_background(HWND edit, int start, int end,
-                                           COLORREF color) {
-    if (!edit || start >= end) return;
-
-    CHARRANGE saved;
-    POINT scroll_pos = {};
-    SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    SendMessageW(edit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll_pos));
-
-    set_char_range(edit, start, end);
-    CHARFORMAT2W format = {};
-    format.cbSize = sizeof(format);
-    format.dwMask = CFM_BACKCOLOR;
-    format.crBackColor = color;
-    format.dwEffects = 0;
-    SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
-                 reinterpret_cast<LPARAM>(&format));
-
-    SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    SendMessageW(edit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll_pos));
-}
-
-void HistoryWindow::clear_entry_background(HWND edit, int start, int end) {
-    if (!edit || start >= end) return;
-
-    CHARRANGE saved;
-    POINT scroll_pos = {};
-    SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    SendMessageW(edit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll_pos));
-
-    set_char_range(edit, start, end);
-    CHARFORMAT2W format = {};
-    format.cbSize = sizeof(format);
-    format.dwMask = CFM_BACKCOLOR;
-    format.crBackColor = COLOR_ENTRY_CARD;
-    format.dwEffects = 0;
-    SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
-                 reinterpret_cast<LPARAM>(&format));
-
-    SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
-    SendMessageW(edit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll_pos));
-}
-
 bool HistoryWindow::entry_cp_range(HWND edit, int entry_index,
                                    int& start, int& end) const {
     if (!edit || entry_index < 0) return false;
 
-    auto ranges = entry_display_ranges(edit);
+    const auto& ranges = entry_ranges(edit);
     if (entry_index >= static_cast<int>(ranges.size())) return false;
-
-    std::wstring text = get_edit_text(edit);
-    int display_start = ranges[entry_index].first;
-    int display_end = ranges[entry_index].second;
-    while (display_end > display_start &&
-           display_end <= static_cast<int>(text.size()) &&
-           (text[static_cast<size_t>(display_end - 1)] == L'\r' ||
-            text[static_cast<size_t>(display_end - 1)] == L'\n' ||
-            text[static_cast<size_t>(display_end - 1)] == L' ' ||
-            text[static_cast<size_t>(display_end - 1)] == L'\t')) {
-        --display_end;
-    }
-
-    start = rich_edit_cp_from_text_offset(text,
-                                          static_cast<size_t>(display_start));
-    end = rich_edit_cp_from_text_offset(text,
-                                        static_cast<size_t>(display_end));
+    start = ranges[static_cast<size_t>(entry_index)].first;
+    end = ranges[static_cast<size_t>(entry_index)].second;
     return start < end;
 }
 
@@ -1464,39 +1938,11 @@ int HistoryWindow::visible_line_count(HWND edit) const {
     return (std::max)(1, static_cast<int>(rc.bottom - rc.top) / line_height);
 }
 
-void HistoryWindow::center_entry(HWND edit, int start) const {
-    if (!edit || start < 0) return;
-
-    int target_line = static_cast<int>(
-        SendMessageW(edit, EM_EXLINEFROMCHAR, 0, start));
-    if (target_line < 0) return;
-
-    int first_visible = static_cast<int>(
-        SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0));
-    int desired_first = (std::max)(0, target_line - visible_line_count(edit) / 3);
-    int delta = desired_first - first_visible;
-    if (delta != 0) {
-        SendMessageW(edit, EM_LINESCROLL, 0, delta);
-    }
-}
-
 void HistoryWindow::set_char_range(HWND edit, int start, int end) {
     CHARRANGE range;
     range.cpMin = start;
     range.cpMax = end;
     SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
-}
-
-void HistoryWindow::apply_text_color(HWND edit, int start, int end, COLORREF color) {
-    if (!edit || start >= end) return;
-
-    set_char_range(edit, start, end);
-    CHARFORMAT2W format = {};
-    format.cbSize = sizeof(format);
-    format.dwMask = CFM_COLOR;
-    format.crTextColor = color;
-    SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
-                 reinterpret_cast<LPARAM>(&format));
 }
 
 void HistoryWindow::apply_header_colors(HWND edit) {
@@ -1521,8 +1967,10 @@ void HistoryWindow::apply_header_colors(HWND edit) {
                      reinterpret_cast<LPARAM>(&base));
     }
 
-    auto ranges = entry_display_ranges(edit);
-    for (const auto& range : ranges) {
+    const auto& ranges = entry_display_ranges(edit);
+    const auto& cp_ranges = entry_ranges(edit);
+    for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
+        const auto& range = ranges[range_index];
         size_t header_start = text.find(L"[", static_cast<size_t>(range.first));
         if (header_start == std::wstring::npos ||
             header_start >= static_cast<size_t>(range.second)) {
@@ -1535,25 +1983,32 @@ void HistoryWindow::apply_header_colors(HWND edit) {
             header_end = static_cast<size_t>(range.second);
         }
 
-        size_t date_end = text.find(L"]", header_start);
-        size_t profile_start = text.find(L"Profile:", header_start);
-        size_t tokens_start = text.find(L"Tokens:", header_start);
+        std::wstring_view header(text.data() + header_start,
+                                 header_end - header_start);
+        auto absolute_header_offset = [&](size_t offset) {
+            return offset == std::wstring_view::npos
+                ? std::wstring::npos
+                : header_start + offset;
+        };
+        size_t profile_start =
+            absolute_header_offset(header.find(L"Profile:"));
+        size_t tokens_start =
+            absolute_header_offset(header.find(L"Tokens:"));
 
-        if (date_end != std::wstring::npos && date_end <= header_end) {
-            apply_text_color(edit,
-                             rich_edit_cp_from_text_offset(text, header_start),
-                             rich_edit_cp_from_text_offset(text, date_end + 1),
-                             COLOR_DATE);
-        }
+        int header_cp_start = range_index < cp_ranges.size()
+            ? cp_ranges[range_index].first +
+                  static_cast<int>(header_start -
+                                   static_cast<size_t>(range.first))
+            : rich_edit_cp_from_text_offset(text, header_start);
+        auto header_cp_at = [&](size_t offset) {
+            return header_cp_start +
+                   static_cast<int>(offset - header_start);
+        };
+
         if (profile_start != std::wstring::npos && profile_start < header_end) {
             int profile_end = tokens_start != std::wstring::npos
                 ? static_cast<int>(tokens_start)
                 : static_cast<int>(header_end);
-            apply_text_color(edit,
-                             rich_edit_cp_from_text_offset(text, profile_start),
-                             rich_edit_cp_from_text_offset(
-                                 text, static_cast<size_t>(profile_end)),
-                             COLOR_PROFILE);
 
             const wchar_t* prefix = L"Profile:";
             size_t value_start = profile_start + wcslen(prefix);
@@ -1567,10 +2022,8 @@ void HistoryWindow::apply_header_colors(HWND edit) {
                 --value_end;
             }
             if (value_start < value_end) {
-                int value_cp_start = rich_edit_cp_from_text_offset(
-                    text, value_start);
-                int value_cp_end = rich_edit_cp_from_text_offset(
-                    text, value_end);
+                int value_cp_start = header_cp_at(value_start);
+                int value_cp_end = header_cp_at(value_end);
                 apply_profile_link_format(edit, value_cp_start, value_cp_end);
                 ProfileLink link;
                 link.start = value_cp_start;
@@ -1581,12 +2034,10 @@ void HistoryWindow::apply_header_colors(HWND edit) {
                 }
             }
         }
-        if (tokens_start != std::wstring::npos && tokens_start < header_end) {
-            apply_text_color(edit,
-                             rich_edit_cp_from_text_offset(text, tokens_start),
-                             rich_edit_cp_from_text_offset(text, header_end),
-                             COLOR_TOKENS);
-        }
+        // Date/token text intentionally keeps the base COLOR_TEXT style. The
+        // old implementation issued two extra RichEdit format operations for
+        // every entry, which made the first history frame expensive for no
+        // interaction benefit. Profile values remain styled and clickable.
     }
 
     SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&saved));
@@ -1602,71 +2053,6 @@ void HistoryWindow::apply_profile_link_format(HWND edit, int start, int end) {
     format.dwEffects = CFE_UNDERLINE | CFE_BOLD;
     SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
                  reinterpret_cast<LPARAM>(&format));
-}
-
-void HistoryWindow::set_profile_link_hover(HWND edit, int start, int end) {
-    if (edit == hover_profile_edit_ &&
-        start == hover_profile_start_ &&
-        end == hover_profile_end_) {
-        return;
-    }
-
-    HWND previous_edit = hover_profile_edit_;
-    int previous_start = hover_profile_start_;
-    int previous_end = hover_profile_end_;
-
-    auto format_link = [&](HWND target, int link_start, int link_end,
-                           COLORREF color) {
-        if (!target || link_start < 0 || link_end <= link_start) return;
-
-        CHARRANGE saved = {};
-        POINT scroll_pos = {};
-        SendMessageW(target, EM_EXGETSEL, 0,
-                     reinterpret_cast<LPARAM>(&saved));
-        SendMessageW(target, EM_GETSCROLLPOS, 0,
-                     reinterpret_cast<LPARAM>(&scroll_pos));
-
-        set_char_range(target, link_start, link_end);
-        CHARFORMAT2W format = {};
-        format.cbSize = sizeof(format);
-        format.dwMask = CFM_COLOR | CFM_UNDERLINE | CFM_BOLD;
-        format.crTextColor = color;
-        format.dwEffects = CFE_UNDERLINE | CFE_BOLD;
-        SendMessageW(target, EM_SETCHARFORMAT, SCF_SELECTION,
-                     reinterpret_cast<LPARAM>(&format));
-
-        SendMessageW(target, EM_EXSETSEL, 0,
-                     reinterpret_cast<LPARAM>(&saved));
-        SendMessageW(target, EM_SETSCROLLPOS, 0,
-                     reinterpret_cast<LPARAM>(&scroll_pos));
-        InvalidateRect(target, nullptr, FALSE);
-    };
-
-    format_link(previous_edit, previous_start, previous_end, COLOR_PROFILE);
-
-    hover_profile_edit_ = edit;
-    hover_profile_start_ = start;
-    hover_profile_end_ = end;
-
-    format_link(hover_profile_edit_, hover_profile_start_,
-                hover_profile_end_, RGB(36, 155, 122));
-}
-
-void HistoryWindow::update_profile_link_hover(HWND edit, int char_index) {
-    if (!edit || char_index < 0) {
-        set_profile_link_hover(nullptr, -1, -1);
-        return;
-    }
-
-    const auto& links = links_for(edit);
-    for (const auto& link : links) {
-        if (char_index >= link.start && char_index < link.end) {
-            set_profile_link_hover(edit, link.start, link.end);
-            return;
-        }
-    }
-
-    set_profile_link_hover(nullptr, -1, -1);
 }
 
 std::vector<HistoryWindow::ProfileLink>& HistoryWindow::links_for(HWND edit) {
@@ -1697,10 +2083,12 @@ bool HistoryWindow::is_over_profile(HWND edit, int x, int y) const {
     int index = char_index_at(edit, x, y);
     if (index < 0) return false;
     const auto& links = links_for(edit);
-    for (const auto& link : links) {
-        if (index >= link.start && index < link.end) return true;
-    }
-    return false;
+    const auto it = std::lower_bound(
+        links.begin(), links.end(), index,
+        [](const ProfileLink& link, int position) {
+            return link.end <= position;
+        });
+    return it != links.end() && index >= it->start && index < it->end;
 }
 
 bool HistoryWindow::handle_edit_left_click(HWND edit, LPARAM lParam) {
@@ -1709,23 +2097,16 @@ bool HistoryWindow::handle_edit_left_click(HWND edit, LPARAM lParam) {
     int index = char_index_at(edit, x, y);
     if (index < 0) return false;
     const auto& links = links_for(edit);
-    for (const auto& link : links) {
-        if (index >= link.start && index < link.end) {
-            show_profile_prompt(link.profile);
-            return true;
-        }
+    const auto it = std::lower_bound(
+        links.begin(), links.end(), index,
+        [](const ProfileLink& link, int position) {
+            return link.end <= position;
+        });
+    if (it != links.end() && index >= it->start && index < it->end) {
+        show_profile_prompt(it->profile);
+        return true;
     }
     return false;
-}
-
-std::wstring HistoryWindow::get_edit_text_w(HWND edit) const {
-    if (!edit) return {};
-    int length = GetWindowTextLengthW(edit);
-    if (length <= 0) return {};
-    std::wstring text(static_cast<size_t>(length + 1), L'\0');
-    GetWindowTextW(edit, text.data(), length + 1);
-    text.resize(static_cast<size_t>(length));
-    return text;
 }
 
 void HistoryWindow::populate_profile_combo(const std::string& selected) {
@@ -1773,7 +2154,7 @@ void HistoryWindow::select_profile_for_editing(const std::string& profile) {
 }
 
 std::string HistoryWindow::current_profile_name_from_ui() const {
-    std::string name = trim_ascii(wide_to_utf8(get_edit_text_w(prompt_profile_combo_)));
+    std::string name = trim_ascii(wide_to_utf8(get_edit_text(prompt_profile_combo_)));
     return name;
 }
 
@@ -1847,12 +2228,12 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
     //   Step 2 (read-only) — runtime profile selection (informational)
     //   Step 3 (editable) — per-profile transform role applied to cleaned text
     if (!prompt_pre_edit_) {
-        DWORD edit_common = WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+        DWORD edit_common = WS_CHILD | WS_VSCROLL |
                             ES_MULTILINE | ES_AUTOVSCROLL | ES_LEFT |
                             ES_NOHIDESEL | ES_WANTRETURN;
         DWORD edit_editable = edit_common;
         DWORD edit_readonly = edit_common | ES_READONLY;
-        DWORD label_style = WS_CHILD | WS_VISIBLE | SS_LEFT;
+        DWORD label_style = WS_CHILD | SS_LEFT;
 
         prompt_pre_label_ = CreateWindowExW(
             0, L"STATIC",
@@ -1877,7 +2258,7 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
 
         prompt_profile_combo_ = CreateWindowExW(
             0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER |
+            WS_CHILD | WS_VSCROLL | WS_BORDER |
                 CBS_DROPDOWN | CBS_AUTOHSCROLL |
                 CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
             0, 0, 0, 0, hwnd_,
@@ -1887,14 +2268,14 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
 
         prompt_profile_new_button_ = CreateWindowExW(
             0, L"BUTTON", L"New",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
+            WS_CHILD | BS_PUSHBUTTON | BS_OWNERDRAW,
             0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_NEW)),
             hInstance_, nullptr);
 
         prompt_profile_rename_button_ = CreateWindowExW(
             0, L"BUTTON", L"Rename",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
+            WS_CHILD | BS_PUSHBUTTON | BS_OWNERDRAW,
             0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_RENAME)),
             hInstance_, nullptr);
@@ -1911,21 +2292,21 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
 
         prompt_back_button_ = CreateWindowExW(
             0, L"BUTTON", L"Back",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
+            WS_CHILD | BS_PUSHBUTTON | BS_OWNERDRAW,
             0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROMPT_BACK)),
             hInstance_, nullptr);
 
         prompt_save_button_ = CreateWindowExW(
             0, L"BUTTON", L"Save roles",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
+            WS_CHILD | BS_PUSHBUTTON | BS_OWNERDRAW,
             0, 0, 0, 0, hwnd_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROMPT_SAVE)),
             hInstance_, nullptr);
 
         prompt_status_ = CreateWindowExW(
             0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 0, 0,
+            WS_CHILD | SS_CENTER, 0, 0, 0, 0,
             hwnd_, nullptr, hInstance_, nullptr);
 
         SetWindowTextW(prompt_pre_label_,
@@ -1975,47 +2356,58 @@ void HistoryWindow::show_profile_prompt(const std::string& profile) {
     }
     SetWindowTextW(prompt_status_, L"");
 
-    profile_mode_ = true;
-    for (HWND h : { recorded_edit_, transcribed_edit_, ai_language_edit_,
-                    clear_button_ }) {
-        if (h) ShowWindow(h, SW_HIDE);
+    {
+        ScopedWindowRedraw redraw({hwnd_});
+        profile_mode_ = true;
+        for (HWND h : { recorded_edit_, transcribed_edit_, ai_language_edit_,
+                        recorded_action_gutter_, transcribed_action_gutter_,
+                        ai_language_action_gutter_, clear_button_ }) {
+            if (h) ShowWindow(h, SW_HIDE);
+        }
+        set_entry_action_hover(nullptr, -1, EntryAction::none);
+        clear_pressed_entry_action();
+        for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
+                        prompt_profile_label_, prompt_profile_combo_,
+                        prompt_profile_new_button_,
+                        prompt_profile_rename_button_,
+                        prompt_transform_label_, prompt_transform_edit_,
+                        prompt_back_button_, prompt_save_button_,
+                        prompt_status_ }) {
+            if (h) ShowWindow(h, SW_SHOW);
+        }
+        layout();
     }
-    for (const auto& entry_view : history_entry_views_) {
-        if (entry_view.copy_button) ShowWindow(entry_view.copy_button, SW_HIDE);
-        if (entry_view.profile_button) ShowWindow(entry_view.profile_button, SW_HIDE);
-    }
-    for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
-                    prompt_profile_label_, prompt_profile_combo_,
-                    prompt_profile_new_button_, prompt_profile_rename_button_,
-                    prompt_transform_label_, prompt_transform_edit_,
-                    prompt_back_button_, prompt_save_button_,
-                    prompt_status_ }) {
-        if (h) ShowWindow(h, SW_SHOW);
-    }
-    layout();
     SetFocus(prompt_pre_edit_);
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    RedrawWindow(hwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW |
+                 RDW_NOERASE);
 }
 
 void HistoryWindow::show_history_view() {
-    profile_mode_ = false;
-    for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
-                    prompt_profile_label_, prompt_profile_edit_,
-                    prompt_profile_combo_, prompt_profile_new_button_,
-                    prompt_profile_rename_button_,
-                    prompt_transform_label_, prompt_transform_edit_,
-                    prompt_back_button_, prompt_save_button_,
-                    prompt_status_ }) {
-        if (h) ShowWindow(h, SW_HIDE);
+    {
+        ScopedWindowRedraw redraw({hwnd_});
+        profile_mode_ = false;
+        for (HWND h : { prompt_pre_label_, prompt_pre_edit_,
+                        prompt_profile_label_, prompt_profile_edit_,
+                        prompt_profile_combo_, prompt_profile_new_button_,
+                        prompt_profile_rename_button_,
+                        prompt_transform_label_, prompt_transform_edit_,
+                        prompt_back_button_, prompt_save_button_,
+                        prompt_status_ }) {
+            if (h) ShowWindow(h, SW_HIDE);
+        }
+        for (HWND h : { recorded_edit_, transcribed_edit_, ai_language_edit_,
+                        recorded_action_gutter_, transcribed_action_gutter_,
+                        ai_language_action_gutter_, clear_button_ }) {
+            if (h) ShowWindow(h, SW_SHOW);
+        }
+        layout();
+        update_entry_action_positions();
     }
-    for (HWND h : { recorded_edit_, transcribed_edit_, ai_language_edit_,
-                    clear_button_ }) {
-        if (h) ShowWindow(h, SW_SHOW);
-    }
-    layout();
-    update_copy_button_positions();
     SetFocus(hwnd_);
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    RedrawWindow(hwnd_, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW |
+                 RDW_NOERASE);
 }
 
 void HistoryWindow::layout_prompt_window() {
@@ -2092,15 +2484,14 @@ void HistoryWindow::layout_prompt_window() {
     MoveWindow(prompt_transform_label_, 0, 0, 0, 0, TRUE);
     MoveWindow(prompt_transform_edit_, padding + panel_inner, y + panel_header,
                content_width - panel_inner * 2, flex_height, TRUE);
-    y += transform_panel_height;
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void HistoryWindow::save_prompt_edits() {
     if (!config_) return;
 
-    std::string pre = wide_to_utf8(get_edit_text_w(prompt_pre_edit_));
-    std::string transform = wide_to_utf8(get_edit_text_w(prompt_transform_edit_));
+    std::string pre = wide_to_utf8(get_edit_text(prompt_pre_edit_));
+    std::string transform = wide_to_utf8(get_edit_text(prompt_transform_edit_));
     std::string profile_name = current_profile_name_from_ui();
     if (profile_name.empty()) {
         SetWindowTextW(prompt_status_, L"Type a profile name before saving.");
@@ -2154,8 +2545,15 @@ LRESULT CALLBACK HistoryWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (self) self->layout();
             return 0;
 
-        case WM_ERASEBKGND:
+        case WM_ERASEBKGND: {
+            if (self) {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                RECT client = {};
+                GetClientRect(hwnd, &client);
+                FillRect(hdc, &client, self->background_brush_);
+            }
             return 1;
+        }
 
         case WM_PAINT:
             if (self) {
@@ -2233,27 +2631,23 @@ LRESULT CALLBACK HistoryWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     self->draw_steel_button(item);
                     return TRUE;
                 }
-                for (const auto& entry_view : self->history_entry_views_) {
-                    if (entry_view.profile_button == item->hwndItem) {
-                        self->draw_profile_button(item);
-                        return TRUE;
-                    }
-                    if (entry_view.copy_button == item->hwndItem) {
-                        self->draw_steel_button(item);
-                        return TRUE;
-                    }
-                }
             }
             break;
 
         case WM_COMMAND:
             if (self && HIWORD(wParam) == EN_VSCROLL) {
                 HWND edit = reinterpret_cast<HWND>(lParam);
-                if (edit == self->recorded_edit_ ||
+                const bool known_edit = edit == self->recorded_edit_ ||
                     edit == self->transcribed_edit_ ||
-                    edit == self->ai_language_edit_) {
-                    self->update_copy_button_positions();
+                    edit == self->ai_language_edit_;
+                if (known_edit && !self->action_position_update_posted_) {
+                    self->action_position_update_posted_ = true;
+                    if (!PostMessageW(hwnd, WM_APP + 1,
+                                      reinterpret_cast<WPARAM>(edit), 0)) {
+                        self->action_position_update_posted_ = false;
+                    }
                 }
+                return 0;
             }
             if (self && LOWORD(wParam) == IDC_CLEAR_BUTTON &&
                 HIWORD(wParam) == BN_CLICKED) {
@@ -2299,30 +2693,6 @@ LRESULT CALLBACK HistoryWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 }
                 return 0;
             }
-            if (self && HIWORD(wParam) == BN_CLICKED) {
-                HWND button = reinterpret_cast<HWND>(lParam);
-                for (const auto& entry_view : self->history_entry_views_) {
-                    if (entry_view.profile_button == button) {
-                        int start = 0, end = 0;
-                        if (self->entry_cp_range(entry_view.edit,
-                                                 entry_view.entry_index,
-                                                 start, end)) {
-                            const auto& links = self->links_for(entry_view.edit);
-                            for (const auto& link : links) {
-                                if (link.start >= start && link.end <= end) {
-                                    self->show_profile_prompt(link.profile);
-                                    return 0;
-                                }
-                            }
-                        }
-                    }
-                    if (entry_view.copy_button == button) {
-                        self->copy_highlighted_entry(entry_view.edit,
-                                                     entry_view.entry_index);
-                        return 0;
-                    }
-                }
-            }
             break;
 
         case WM_CLOSE:
@@ -2333,13 +2703,23 @@ LRESULT CALLBACK HistoryWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             return 0;
 
         case WM_APP + 1:
-            if (self) self->update_copy_button_positions();
+            if (self) {
+                self->action_position_update_posted_ = false;
+                HWND edit = reinterpret_cast<HWND>(wParam);
+                self->update_entry_action_positions(
+                    edit == self->recorded_edit_ ||
+                            edit == self->transcribed_edit_ ||
+                            edit == self->ai_language_edit_
+                        ? edit
+                        : nullptr);
+                if (edit) self->redraw_action_gutter(edit, true);
+            }
             return 0;
 
         case WM_APP + 2:
             if (self) {
                 self->scroll_history_to_top();
-                self->update_copy_button_positions();
+                self->update_entry_action_positions();
             }
             return 0;
     }
@@ -2355,71 +2735,58 @@ LRESULT CALLBACK HistoryWindow::EditWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
 
     if (self) {
         switch (msg) {
-            case WM_DRAWITEM: {
-                const auto* item =
-                    reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-                for (const auto& entry_view : self->history_entry_views_) {
-                    if (entry_view.profile_button == item->hwndItem) {
-                        self->draw_profile_button(item);
-                        return TRUE;
-                    }
-                    if (entry_view.copy_button == item->hwndItem) {
-                        self->draw_steel_button(item);
-                        return TRUE;
-                    }
+            case WM_ERASEBKGND: {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                if (hdc) {
+                    RECT client = {};
+                    GetClientRect(hwnd, &client);
+                    FillRect(hdc, &client, self->control_brush_);
                 }
-                break;
+                return 1;
             }
-            case WM_COMMAND:
-                if (HIWORD(wParam) == BN_CLICKED) {
-                    HWND button = reinterpret_cast<HWND>(lParam);
-                    for (const auto& entry_view : self->history_entry_views_) {
-                        if (entry_view.profile_button == button) {
-                            int start = 0, end = 0;
-                            if (self->entry_cp_range(entry_view.edit,
-                                                     entry_view.entry_index,
-                                                     start, end)) {
-                                const auto& links =
-                                    self->links_for(entry_view.edit);
-                                for (const auto& link : links) {
-                                    if (link.start >= start && link.end <= end) {
-                                        self->show_profile_prompt(link.profile);
-                                        return 0;
-                                    }
-                                }
-                            }
-                        }
-                        if (entry_view.copy_button == button) {
-                            self->copy_highlighted_entry(entry_view.edit,
-                                                         entry_view.entry_index);
-                            return 0;
-                        }
-                    }
-                }
-                break;
             case WM_MOUSEMOVE:
                 self->handle_edit_mouse_move(hwnd, lParam);
                 break;
-            case WM_LBUTTONDOWN:
+            case WM_MOUSELEAVE: {
+                if (self->tracked_mouse_edit_ == hwnd) {
+                    self->tracked_mouse_edit_ = nullptr;
+                }
+                POINT cursor = {};
+                bool moved_to_gutter = false;
+                if (GetCursorPos(&cursor)) {
+                    HWND under = WindowFromPoint(cursor);
+                    moved_to_gutter = under == self->action_gutter_for_edit(hwnd);
+                }
+                if (moved_to_gutter) break;
+                self->set_entry_action_hover(nullptr, -1,
+                                             EntryAction::none);
+                self->set_highlighted_entry(-1);
+                break;
+            }
+            case WM_LBUTTONDOWN: {
+                const int x = GET_X_LPARAM(lParam);
+                const int y = GET_Y_LPARAM(lParam);
                 if (self->is_over_profile(hwnd,
-                                          GET_X_LPARAM(lParam),
-                                          GET_Y_LPARAM(lParam))) {
+                                          x, y)) {
                     SetFocus(hwnd);
                     return 0;
                 }
                 break;
-            case WM_LBUTTONUP:
+            }
+            case WM_LBUTTONUP: {
                 if (self->handle_edit_left_click(hwnd, lParam)) {
                     return 0;
                 }
                 break;
+            }
             case WM_SETCURSOR:
                 if (LOWORD(lParam) == HTCLIENT) {
                     POINT pt;
-                    if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) &&
-                        self->is_over_profile(hwnd, pt.x, pt.y)) {
-                        SetCursor(LoadCursor(nullptr, IDC_HAND));
-                        return TRUE;
+                    if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt)) {
+                        if (self->is_over_profile(hwnd, pt.x, pt.y)) {
+                            SetCursor(LoadCursor(nullptr, IDC_HAND));
+                            return TRUE;
+                        }
                     }
                 }
                 break;
@@ -2430,63 +2797,167 @@ LRESULT CALLBACK HistoryWindow::EditWndProc(HWND hwnd, UINT msg, WPARAM wParam, 
     if (!original) {
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
-    LRESULT result = CallWindowProcW(original, hwnd, msg, wParam, lParam);
-    bool scroll_related_key =
+    const bool scroll_related_key =
         msg == WM_KEYDOWN &&
         (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_PRIOR ||
          wParam == VK_NEXT || wParam == VK_HOME || wParam == VK_END);
-    if (self && (msg == WM_MOUSEWHEEL || msg == WM_VSCROLL ||
-                 msg == WM_HSCROLL || scroll_related_key)) {
-        self->update_copy_button_positions();
+    const bool scroll_message =
+        msg == WM_MOUSEWHEEL || msg == WM_VSCROLL ||
+        msg == WM_MOUSEHWHEEL || msg == WM_HSCROLL ||
+        scroll_related_key;
+    const bool programmatic_scroll =
+        msg == EM_LINESCROLL || msg == EM_SCROLL ||
+        msg == EM_SETSCROLLPOS || msg == EM_SCROLLCARET;
+    const bool selection_auto_scroll = GetCapture() == hwnd &&
+        ((msg == WM_MOUSEMOVE && (wParam & MK_LBUTTON) != 0) ||
+         msg == WM_TIMER);
+    const bool owns_scroll = self &&
+                             (scroll_message || programmatic_scroll ||
+                              selection_auto_scroll) &&
+                             !self->handling_history_scroll_;
+    POINT scroll_before = {};
+
+    if (owns_scroll) {
+        SendMessageW(hwnd, EM_GETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&scroll_before));
+        self->handling_history_scroll_ = true;
+        if (scroll_message) {
+            self->set_entry_action_hover(nullptr, -1, EntryAction::none);
+        }
+    }
+
+    LRESULT result = CallWindowProcW(original, hwnd, msg, wParam, lParam);
+
+    if (owns_scroll) {
+        POINT scroll_after = {};
+        SendMessageW(hwnd, EM_GETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&scroll_after));
+        const bool scroll_changed =
+            scroll_before.x != scroll_after.x ||
+            scroll_before.y != scroll_after.y;
+        // Update immediately for the common path and once more after the
+        // native RichEdit has finished processing any deferred thumb/wheel
+        // scroll.  The posted pass is coalesced so a fast wheel does not
+        // queue one full layout per message.
+        if (scroll_changed || scroll_message || programmatic_scroll) {
+            self->update_entry_action_positions(hwnd);
+        }
+        self->handling_history_scroll_ = false;
+        if (scroll_message || programmatic_scroll || scroll_changed) {
+            self->redraw_action_gutter(hwnd, true);
+            if (!self->action_position_update_posted_ && self->hwnd_) {
+                self->action_position_update_posted_ = true;
+                if (!PostMessageW(self->hwnd_, WM_APP + 1,
+                                  reinterpret_cast<WPARAM>(hwnd), 0)) {
+                    self->action_position_update_posted_ = false;
+                }
+            }
+        }
     }
     return result;
 }
 
-LRESULT CALLBACK HistoryWindow::CopyButtonWndProc(HWND hwnd, UINT msg,
-                                                  WPARAM wParam,
-                                                  LPARAM lParam) {
-    auto* self = reinterpret_cast<HistoryWindow*>(
-        GetPropW(hwnd, COPY_BUTTON_OWNER_PROP));
-    if (msg == WM_NCDESTROY) {
-        RemovePropW(hwnd, COPY_BUTTON_OWNER_PROP);
+LRESULT CALLBACK HistoryWindow::ActionGutterWndProc(
+    HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    HistoryWindow* self = reinterpret_cast<HistoryWindow*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        self = static_cast<HistoryWindow*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(self));
     }
 
-    if (self) {
-        switch (msg) {
-            case WM_MOUSEMOVE: {
-                self->set_profile_link_hover(nullptr, -1, -1);
-                if (self->hover_button_ != hwnd) {
-                    HWND previous = self->hover_button_;
-                    self->hover_button_ = hwnd;
-                    if (previous) InvalidateRect(previous, nullptr, TRUE);
-                    InvalidateRect(hwnd, nullptr, TRUE);
+    if (!self) return DefWindowProcW(hwnd, msg, wParam, lParam);
+    HWND edit = self->edit_for_action_gutter(hwnd);
 
-                    TRACKMOUSEEVENT tme = {};
-                    tme.cbSize = sizeof(tme);
-                    tme.dwFlags = TME_LEAVE;
-                    tme.hwndTrack = hwnd;
-                    TrackMouseEvent(&tme);
-                }
-                self->handle_copy_button_mouse_move(hwnd);
+    switch (msg) {
+        case WM_ERASEBKGND: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            if (hdc) {
+                RECT client = {};
+                GetClientRect(hwnd, &client);
+                FillRect(hdc, &client, self->control_brush_);
+            }
+            return 1;
+        }
+
+        case WM_PAINT:
+            self->paint_action_gutter(hwnd);
+            return 0;
+
+        case WM_PRINTCLIENT: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            if (hdc) self->draw_action_gutter(hwnd, hdc);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+            self->handle_action_gutter_mouse_move(
+                hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+
+        case WM_MOUSELEAVE: {
+            if (self->tracked_action_gutter_ == hwnd) {
+                self->tracked_action_gutter_ = nullptr;
+            }
+            POINT cursor = {};
+            if (edit && GetCursorPos(&cursor) &&
+                WindowFromPoint(cursor) == edit) {
                 break;
             }
-            case WM_MOUSELEAVE:
-                if (self->hover_button_ == hwnd) {
-                    self->hover_button_ = nullptr;
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-                break;
-            case WM_SETCURSOR:
-                SetCursor(LoadCursor(nullptr, IDC_HAND));
-                return TRUE;
+            self->set_entry_action_hover(nullptr, -1, EntryAction::none);
+            self->set_highlighted_entry(-1);
+            return 0;
         }
+
+        case WM_LBUTTONDOWN:
+            if (edit && self->handle_entry_action_left_down(
+                            edit, GET_X_LPARAM(lParam),
+                            GET_Y_LPARAM(lParam))) {
+                return 0;
+            }
+            if (edit) SetFocus(edit);
+            return 0;
+
+        case WM_LBUTTONUP:
+            if (edit) {
+                self->handle_entry_action_left_up(
+                    edit, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            }
+            return 0;
+
+        case WM_CAPTURECHANGED:
+            if (edit && self->pressed_action_edit_ == edit) {
+                self->clear_pressed_entry_action();
+            }
+            return 0;
+
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) == HTCLIENT && edit) {
+                POINT cursor = {};
+                if (GetCursorPos(&cursor) && ScreenToClient(hwnd, &cursor)) {
+                    int entry_index = -1;
+                    EntryAction action = EntryAction::none;
+                    if (self->entry_action_at(edit, cursor.x, cursor.y,
+                                              entry_index, action)) {
+                        SetCursor(LoadCursor(nullptr, IDC_HAND));
+                        return TRUE;
+                    }
+                }
+            }
+            break;
+
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+            return edit ? SendMessageW(edit, msg, wParam, lParam) : 0;
+
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
     }
 
-    WNDPROC original = self ? self->original_copy_button_proc_ : nullptr;
-    if (!original) {
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
-    }
-    return CallWindowProcW(original, hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 } // namespace vtt
