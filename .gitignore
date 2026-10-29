@@ -1,5 +1,7 @@
 # Build directories
 build/
+build-cuda/
+dist/
 out/
 cmake-build-*/
 x64/
@@ -7,10 +9,19 @@ Debug/
 Release/
 build_log.txt
 nul
+/stdout.txt
+/stderr.txt
 
 # Models (large binary files)
 models/*.bin
 models/*.ggml
+models/**/*.gguf
+models/**/*.onnx
+models/**/*.onnx.data
+models/**/vocab.txt
+models/**/*.downloading
+models/**/*.download
+models/**/.cache/
 
 # IDE files
 .vs/
@@ -32,6 +43,7 @@ models/*.ggml
 
 # Config (may contain user preferences)
 config.json
+**/diagnostics/dictation*.jsonl
 
 # OS files
 Thumbs.db
@@ -41,3 +53,7 @@ desktop.ini
 # Third party fetched content
 third_party/
 _deps/
+tools/llama.cpp/
+
+# Temporary verification and native runtime cache
+artifacts/
