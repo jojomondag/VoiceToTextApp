@@ -1,20 +1,9 @@
 #pragma once
 #include <vector>
-#include <functional>
-#include <mutex>
-#include <atomic>
 #include <string>
 #include <memory>
 
 namespace vtt {
-
-struct AudioDevice {
-    std::string name;
-    std::string id;
-    bool is_default;
-};
-
-using AudioCallback = std::function<void(const std::vector<float>&)>;
 
 class AudioCapture {
 public:
@@ -24,8 +13,6 @@ public:
     bool initialize();
     void shutdown();
 
-    // Device management
-    std::vector<AudioDevice> get_devices() const;
     bool select_device(const std::string& device_id); // empty = default
 
     // Recording control
@@ -33,12 +20,15 @@ public:
     bool start_recording();
     void stop_recording();
     bool is_recording() const;
+    // A stable, human-readable reason for the last initialization/start
+    // failure.  The UI uses this instead of collapsing every backend error
+    // into the unhelpful "Mic error" message.
+    std::string last_error() const;
 
     // Get accumulated audio data and clear buffer
-    std::vector<float> get_audio_buffer();
-
-    // Set callback for real-time audio chunks
-    void set_audio_callback(AudioCallback callback);
+    // Drain 16 kHz audio. Keep the resampling phase between live drains;
+    // final=true flushes the last interpolation sample after capture stops.
+    std::vector<float> get_audio_buffer(bool final = true);
 
     // Get current audio level (0.0 - 1.0) for UI
     float get_audio_level() const;

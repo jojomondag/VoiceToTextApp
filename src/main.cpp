@@ -23,7 +23,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
         MessageBoxW(nullptr,
                     L"Failed to initialize VoiceToText.\n\n"
                     L"Please ensure:\n"
-                    L"  - A Whisper GGML model is in the 'models' folder\n"
+                    L"  - The selected Pianissimo model can be downloaded or is cached\n"
                     L"  - Your GPU drivers are up to date\n"
                     L"  - A microphone is connected",
                     L"VoiceToText - Error",
@@ -31,7 +31,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/,
         return 1;
     }
 
-    int result = app.run();
-    app.shutdown();
-    return result;
+    return app.run();
 }

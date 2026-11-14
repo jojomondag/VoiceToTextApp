@@ -17,14 +17,10 @@ using HotkeyCallback = std::function<void(HotkeyAction)>;
 
 class HotkeyManager {
 public:
-    HotkeyManager();
     ~HotkeyManager();
 
     bool initialize(HWND hwnd);
     void shutdown();
-
-    // Register default hotkeys
-    bool register_defaults();
 
     // Custom hotkey registration
     bool register_hotkey(HotkeyAction action, UINT modifiers, UINT vk);

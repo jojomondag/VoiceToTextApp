@@ -1,7 +1,10 @@
 #include "tray_icon.h"
+#include "app_icon.h"
 #include <shellapi.h>
+#include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 #define WM_TRAYICON (WM_APP + 1)
 
@@ -11,18 +14,33 @@
 #define IDM_SETTINGS  40003
 #define IDM_QUIT      40004
 #define IDM_HISTORY   40005
+#define IDM_DICTATION 40006
 #define IDM_MODEL_TINY   40100
 #define IDM_MODEL_BASE   40101
 #define IDM_MODEL_SMALL  40102
 #define IDM_MODEL_MEDIUM 40103
 #define IDM_MODEL_LARGE  40104
-#define IDM_COMPUTE_AUTO 40200
-#define IDM_COMPUTE_GPU  40201
-#define IDM_COMPUTE_CPU  40202
+#define IDM_COMPUTE_WHISPER_GPU  40203
+#define IDM_COMPUTE_WHISPER_CPU  40204
+#define IDM_COMPUTE_GEMMA_GPU    40205
+#define IDM_COMPUTE_GEMMA_CPU    40206
+#define IDM_GEMMA_AUTO      40300
+#define IDM_GEMMA_E2B       40301
+#define IDM_GEMMA_E4B       40302
+#define IDM_GEMMA_12B       40303
+#define IDM_GEMMA_26B_A4B   40304
+#define IDM_GEMMA_31B       40305
 
 namespace vtt {
 
 namespace {
+// A stable GUID lets Windows remember this notification-area icon instead of
+// treating every launch as a new, unrecognised tray application.
+const GUID VOICETOTEXT_TRAY_GUID = {
+    0x6e8d2f15, 0x4f41, 0x4c40,
+    {0x9a, 0x2c, 0x56, 0x9d, 0x0b, 0x4d, 0x2e, 0x71}
+};
+
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) return L"";
 
@@ -59,96 +77,21 @@ TrayIcon::~TrayIcon() {
     shutdown();
 }
 
-HICON TrayIcon::create_color_icon(COLORREF color) {
-    // Create a clear, opaque 32x32 tray icon with a white "V".
-    // Some Windows tray configurations make tiny generic icons hard to spot.
-    int size = 32;
-
-    HDC screen_dc = GetDC(nullptr);
-    HDC mem_dc = CreateCompatibleDC(screen_dc);
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = size;
-    bmi.bmiHeader.biHeight = -size;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP color_bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!color_bmp || !bits) {
-        DeleteDC(mem_dc);
-        ReleaseDC(nullptr, screen_dc);
-        return nullptr;
-    }
-
-    // Fill the bitmap with an opaque color.
-    DWORD* pixels = static_cast<DWORD*>(bits);
-    BYTE r = GetRValue(color);
-    BYTE g = GetGValue(color);
-    BYTE b = GetBValue(color);
-    DWORD pixel = (0xFF << 24) | (r << 16) | (g << 8) | b;
-
-    for (int i = 0; i < size * size; ++i) {
-        pixels[i] = pixel;
-    }
-
-    HBITMAP old_color = static_cast<HBITMAP>(SelectObject(mem_dc, color_bmp));
-    SetBkMode(mem_dc, TRANSPARENT);
-    SetTextColor(mem_dc, RGB(255, 255, 255));
-
-    HFONT font = CreateFontW(
-        24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    HFONT old_font = static_cast<HFONT>(SelectObject(mem_dc, font));
-    RECT text_rect = {0, 1, size, size};
-    DrawTextW(mem_dc, L"V", -1, &text_rect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(mem_dc, old_font);
-    DeleteObject(font);
-    SelectObject(mem_dc, old_color);
-
-    // Create an all-opaque mask.
-    HBITMAP mask_bmp = CreateBitmap(size, size, 1, 1, nullptr);
-    HBITMAP old_mask = static_cast<HBITMAP>(SelectObject(mem_dc, mask_bmp));
-    RECT mask_rect = {0, 0, size, size};
-    HBRUSH opaque_brush = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(mem_dc, &mask_rect, opaque_brush);
-    DeleteObject(opaque_brush);
-    SelectObject(mem_dc, old_mask);
-
-    ICONINFO ii = {};
-    ii.fIcon = TRUE;
-    ii.hbmMask = mask_bmp;
-    ii.hbmColor = color_bmp;
-    HICON icon = CreateIconIndirect(&ii);
-
-    DeleteObject(color_bmp);
-    DeleteObject(mask_bmp);
-    DeleteDC(mem_dc);
-    ReleaseDC(nullptr, screen_dc);
-
-    return icon;
-}
-
 bool TrayIcon::initialize(HWND hwnd, HINSTANCE hInstance) {
     if (initialized_) return true;
 
     hwnd_ = hwnd;
-    hInstance_ = hInstance;
     menu_hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         L"STATIC",
         L"VoiceToTextMenuOwner",
         WS_POPUP,
         0, 0, 0, 0,
-        nullptr, nullptr, hInstance_, nullptr);
+        nullptr, nullptr, hInstance, nullptr);
 
-    // Create icons: blue for idle, red for recording.
-    icon_idle_ = create_color_icon(RGB(0, 120, 215));
-    icon_recording_ = create_color_icon(RGB(220, 50, 50));
+    // Create icons: app logo for idle, red-centered logo for recording.
+    icon_idle_ = create_app_icon(32, RGB(0, 120, 215));
+    icon_recording_ = create_recording_app_icon(32, RGB(220, 50, 50));
 
     if (!icon_idle_) {
         // Fallback to a system icon
@@ -162,14 +105,28 @@ bool TrayIcon::initialize(HWND hwnd, HINSTANCE hInstance) {
     nid_.cbSize = sizeof(NOTIFYICONDATAW);
     nid_.hWnd = hwnd_;
     nid_.uID = 1;
-    nid_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_GUID;
     nid_.uCallbackMessage = WM_TRAYICON;
     nid_.hIcon = icon_idle_;
+    nid_.guidItem = VOICETOTEXT_TRAY_GUID;
     wcscpy_s(nid_.szTip, L"VoiceToText - Ready");
 
     if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
-        tray_log("Shell_NotifyIconW(NIM_ADD) failed", GetLastError());
-        return false;
+        const DWORD first_error = GetLastError();
+        tray_log("Shell_NotifyIconW(NIM_ADD) failed", first_error);
+
+        // Some Explorer/taskbar hosts reject GUID/show-tip registrations
+        // (notably after Explorer restarts or in a newly created desktop
+        // session). Retry with the classic hWnd/uID registration so the app
+        // still has a usable tray entry instead of appearing to start and
+        // then becoming unreachable.
+        nid_.uFlags &= ~(NIF_GUID | NIF_SHOWTIP);
+        ZeroMemory(&nid_.guidItem, sizeof(nid_.guidItem));
+        if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
+            tray_log("Shell_NotifyIconW fallback failed", GetLastError());
+            return false;
+        }
+        tray_log("Shell_NotifyIconW fallback succeeded");
     }
     tray_log("Shell_NotifyIconW(NIM_ADD) succeeded");
 
@@ -232,20 +189,28 @@ void TrayIcon::set_current_model(const std::string& model_size) {
     }
 }
 
-void TrayIcon::set_current_compute_mode(const std::string& compute_mode) {
-    if (!compute_mode.empty()) {
-        current_compute_mode_ = compute_mode;
+void TrayIcon::set_current_compute_mode(const std::string& whisper_mode,
+                                        const std::string& gemma_mode) {
+    if (!whisper_mode.empty()) {
+        current_whisper_compute_mode_ = whisper_mode;
+    }
+    if (!gemma_mode.empty()) {
+        current_gemma_compute_mode_ = gemma_mode;
     }
 }
 
-void TrayIcon::set_compute_info(const std::string& active_backend,
-                                const std::string& cpu_label,
-                                const std::string& gpu_label,
-                                const std::string& reason) {
-    if (!active_backend.empty()) active_compute_backend_ = active_backend;
-    if (!cpu_label.empty()) cpu_label_ = cpu_label;
-    if (!gpu_label.empty()) gpu_label_ = gpu_label;
-    if (!reason.empty()) compute_reason_ = reason;
+void TrayIcon::set_current_gemma_model(const std::string& model_id,
+                                       const std::string& recommended_model_id) {
+    if (!model_id.empty()) {
+        current_gemma_model_ = model_id;
+    }
+    if (!recommended_model_id.empty()) {
+        recommended_gemma_model_ = recommended_model_id;
+    }
+}
+
+void TrayIcon::set_installed_gemma_models(const std::vector<std::string>& model_ids) {
+    installed_gemma_models_ = model_ids;
 }
 
 void TrayIcon::set_tooltip(const std::string& tooltip) {
@@ -263,20 +228,39 @@ void TrayIcon::set_tooltip(const std::string& tooltip) {
 
 std::string TrayIcon::model_size_from_command(UINT cmd) const {
     switch (cmd) {
-        case IDM_MODEL_TINY: return "tiny";
-        case IDM_MODEL_BASE: return "base";
-        case IDM_MODEL_SMALL: return "small";
-        case IDM_MODEL_MEDIUM: return "medium";
-        case IDM_MODEL_LARGE: return "large";
+        case IDM_MODEL_TINY: return "gguf-q8";
+        case IDM_MODEL_BASE: return "onnx-int4";
+        case IDM_MODEL_SMALL: return "onnx-int8";
+        case IDM_MODEL_MEDIUM: return "onnx-fp16";
+        case IDM_MODEL_LARGE: return "onnx-fp32";
         default: return {};
     }
 }
 
-std::string TrayIcon::compute_mode_from_command(UINT cmd) const {
+std::string TrayIcon::whisper_compute_from_command(UINT cmd) const {
     switch (cmd) {
-        case IDM_COMPUTE_AUTO: return "auto";
-        case IDM_COMPUTE_GPU: return "gpu";
-        case IDM_COMPUTE_CPU: return "cpu";
+        case IDM_COMPUTE_WHISPER_GPU: return "gpu";
+        case IDM_COMPUTE_WHISPER_CPU: return "cpu";
+        default: return {};
+    }
+}
+
+std::string TrayIcon::gemma_compute_from_command(UINT cmd) const {
+    switch (cmd) {
+        case IDM_COMPUTE_GEMMA_GPU: return "gpu";
+        case IDM_COMPUTE_GEMMA_CPU: return "cpu";
+        default: return {};
+    }
+}
+
+std::string TrayIcon::gemma_model_from_command(UINT cmd) const {
+    switch (cmd) {
+        case IDM_GEMMA_AUTO: return "auto";
+        case IDM_GEMMA_E2B: return "e2b";
+        case IDM_GEMMA_E4B: return "e4b";
+        case IDM_GEMMA_12B: return "12b";
+        case IDM_GEMMA_26B_A4B: return "26b-a4b";
+        case IDM_GEMMA_31B: return "31b";
         default: return {};
     }
 }
@@ -302,7 +286,7 @@ void TrayIcon::show_notification(const std::string& title, const std::string& me
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
 
-void TrayIcon::handle_message(WPARAM wParam, LPARAM lParam) {
+void TrayIcon::handle_message(LPARAM lParam) {
     UINT msg = LOWORD(lParam);
 
     switch (msg) {
@@ -338,7 +322,50 @@ void TrayIcon::show_context_menu() {
     }
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_LANGUAGE, L"Switch Language");
+    AppendMenuW(menu, MF_STRING, IDM_DICTATION, L"Live dictation...");
+    AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                L"Speech language: Swedish (Pianissimo)");
+
+    // Compute Mode at the top — per-component submenus
+    HMENU computeMenu = CreatePopupMenu();
+    if (computeMenu) {
+        HMENU whisperCompute = CreatePopupMenu();
+        if (whisperCompute) {
+            const bool onnx = current_model_size_.rfind("onnx-", 0) == 0;
+            AppendMenuW(whisperCompute, MF_STRING |
+                (onnx ? MF_DISABLED | MF_GRAYED : 0) |
+                (current_whisper_compute_mode_ == "gpu" ? MF_CHECKED : 0),
+                IDM_COMPUTE_WHISPER_GPU, L"GPU (Vulkan, GGUF)");
+            AppendMenuW(whisperCompute, MF_STRING |
+                (current_whisper_compute_mode_ == "cpu" ? MF_CHECKED : 0),
+                IDM_COMPUTE_WHISPER_CPU, L"CPU (GGUF / ONNX)");
+            AppendMenuW(computeMenu, MF_POPUP,
+                reinterpret_cast<UINT_PTR>(whisperCompute), L"Pianissimo");
+        }
+
+        HMENU gemmaCompute = CreatePopupMenu();
+        if (gemmaCompute) {
+            AppendMenuW(gemmaCompute, MF_STRING |
+                (current_gemma_compute_mode_ == "gpu" ? MF_CHECKED : 0),
+                IDM_COMPUTE_GEMMA_GPU, L"GPU");
+            AppendMenuW(gemmaCompute, MF_STRING |
+                (current_gemma_compute_mode_ == "cpu" ? MF_CHECKED : 0),
+                IDM_COMPUTE_GEMMA_CPU, L"CPU");
+            AppendMenuW(computeMenu, MF_POPUP,
+                reinterpret_cast<UINT_PTR>(gemmaCompute), L"Gemma");
+        }
+
+        AppendMenuW(computeMenu, MF_SEPARATOR, 0, nullptr);
+        std::wstring whisperStatus = L"Pianissimo: " + utf8_to_wide(current_whisper_compute_mode_);
+        std::wstring gemmaStatus = L"Gemma: " + utf8_to_wide(current_gemma_compute_mode_);
+        AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                    whisperStatus.c_str());
+        AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
+                    gemmaStatus.c_str());
+
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(computeMenu),
+                    L"Compute Mode");
+    }
 
     HMENU modelMenu = CreatePopupMenu();
     if (modelMenu) {
@@ -348,11 +375,11 @@ void TrayIcon::show_context_menu() {
             const char* size;
         };
         const ModelItem models[] = {
-            {IDM_MODEL_TINY, L"Tiny - fastest", "tiny"},
-            {IDM_MODEL_BASE, L"Base", "base"},
-            {IDM_MODEL_SMALL, L"Small - balanced", "small"},
-            {IDM_MODEL_MEDIUM, L"Medium - recommended", "medium"},
-            {IDM_MODEL_LARGE, L"Large - best quality", "large"},
+            {IDM_MODEL_TINY, L"GGUF Q8 (~740 MB)", "gguf-q8"},
+            {IDM_MODEL_BASE, L"ONNX int4 - smallest (~515 MB)", "onnx-int4"},
+            {IDM_MODEL_SMALL, L"ONNX int8 - recommended (~660 MB)", "onnx-int8"},
+            {IDM_MODEL_MEDIUM, L"ONNX fp16 (~1.28 GB)", "onnx-fp16"},
+            {IDM_MODEL_LARGE, L"ONNX fp32 (~2.56 GB)", "onnx-fp32"},
         };
 
         for (const auto& model : models) {
@@ -364,48 +391,45 @@ void TrayIcon::show_context_menu() {
         }
 
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(modelMenu),
-                    L"KB Whisper Model");
+                    L"Pianissimo Model");
     }
 
-    HMENU computeMenu = CreatePopupMenu();
-    if (computeMenu) {
-        struct ComputeItem {
+    HMENU gemmaMenu = CreatePopupMenu();
+    if (gemmaMenu) {
+        struct GemmaItem {
             UINT id;
             std::wstring label;
-            const char* mode;
-        };
-        std::wstring autoLabel = L"Auto - using ";
-        autoLabel += utf8_to_wide(active_compute_backend_);
-        const ComputeItem modes[] = {
-            {IDM_COMPUTE_AUTO, autoLabel, "auto"},
-            {IDM_COMPUTE_GPU, L"GPU", "gpu"},
-            {IDM_COMPUTE_CPU, L"CPU", "cpu"},
+            const char* model;
         };
 
-        for (const auto& mode : modes) {
+        std::wstring autoLabel = L"Auto - recommends ";
+        autoLabel += utf8_to_wide(recommended_gemma_model_);
+        const GemmaItem models[] = {
+            {IDM_GEMMA_AUTO, autoLabel, "auto"},
+            {IDM_GEMMA_E2B, L"Gemma 4 E2B - recommended", "e2b"},
+            {IDM_GEMMA_E4B, L"Gemma 4 E4B - higher quality", "e4b"},
+            {IDM_GEMMA_12B, L"Gemma 4 12B - large", "12b"},
+            {IDM_GEMMA_26B_A4B, L"Gemma 4 26B A4B - very large", "26b-a4b"},
+            {IDM_GEMMA_31B, L"Gemma 4 31B - overkill", "31b"},
+        };
+
+        for (const auto& model : models) {
             UINT flags = MF_STRING;
-            if (current_compute_mode_ == mode.mode) {
+            if (current_gemma_model_ == model.model) {
                 flags |= MF_CHECKED;
             }
-            AppendMenuW(computeMenu, flags, mode.id, mode.label.c_str());
+            std::wstring label = model.label;
+            bool installed = std::find(installed_gemma_models_.begin(),
+                                       installed_gemma_models_.end(),
+                                       model.model) != installed_gemma_models_.end();
+            if (installed) {
+                label += L" - installed";
+            }
+            AppendMenuW(gemmaMenu, flags, model.id, label.c_str());
         }
 
-        AppendMenuW(computeMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring activeLabel = L"Active: " + utf8_to_wide(active_compute_backend_);
-        std::wstring cpuLabel = L"CPU: " + utf8_to_wide(cpu_label_);
-        std::wstring gpuLabel = L"GPU: " + utf8_to_wide(gpu_label_);
-        std::wstring whyLabel = L"Why: " + utf8_to_wide(compute_reason_);
-        AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
-                    activeLabel.c_str());
-        AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
-                    cpuLabel.c_str());
-        AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
-                    gpuLabel.c_str());
-        AppendMenuW(computeMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
-                    whyLabel.c_str());
-
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(computeMenu),
-                    L"Compute Mode");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(gemmaMenu),
+                    L"Gemma Model");
     }
 
     AppendMenuW(menu, MF_STRING, IDM_HISTORY, L"History...");
@@ -440,6 +464,9 @@ void TrayIcon::show_context_menu() {
         case IDM_HISTORY:
             callback_(TrayAction::OpenHistory, {});
             break;
+        case IDM_DICTATION:
+            callback_(TrayAction::OpenDictation, {});
+            break;
         case IDM_SETTINGS:
             callback_(TrayAction::OpenSettings, {});
             break;
@@ -452,9 +479,19 @@ void TrayIcon::show_context_menu() {
                 callback_(TrayAction::SelectModel, model_size);
                 break;
             }
-            std::string compute_mode = compute_mode_from_command(cmd);
-            if (!compute_mode.empty()) {
-                callback_(TrayAction::SelectComputeMode, compute_mode);
+            std::string whisper_mode = whisper_compute_from_command(cmd);
+            if (!whisper_mode.empty()) {
+                callback_(TrayAction::SelectWhisperComputeMode, whisper_mode);
+                break;
+            }
+            std::string gemma_mode = gemma_compute_from_command(cmd);
+            if (!gemma_mode.empty()) {
+                callback_(TrayAction::SelectGemmaComputeMode, gemma_mode);
+                break;
+            }
+            std::string gemma_model = gemma_model_from_command(cmd);
+            if (!gemma_model.empty()) {
+                callback_(TrayAction::SelectGemmaModel, gemma_model);
             }
             break;
         }

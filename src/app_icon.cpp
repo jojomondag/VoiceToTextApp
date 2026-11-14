@@ -1,8 +1,11 @@
 #include "app_icon.h"
+#include "../resources/resource.h"
 
 namespace vtt {
 
-HICON create_app_icon(int size, COLORREF background) {
+namespace {
+
+HICON create_fallback_app_icon(int size, COLORREF background) {
     if (size <= 0) size = 32;
 
     HDC screen_dc = GetDC(nullptr);
@@ -70,6 +73,32 @@ HICON create_app_icon(int size, COLORREF background) {
     DeleteDC(mem_dc);
     ReleaseDC(nullptr, screen_dc);
     return icon;
+}
+
+HICON load_app_icon(int resource_id, int size, COLORREF background) {
+    if (size <= 0) size = 32;
+
+    HICON icon = static_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(resource_id),
+        IMAGE_ICON,
+        size,
+        size,
+        LR_DEFAULTCOLOR));
+
+    if (icon) return icon;
+
+    return create_fallback_app_icon(size, background);
+}
+
+} // namespace
+
+HICON create_app_icon(int size, COLORREF background) {
+    return load_app_icon(IDI_APP_ICON, size, background);
+}
+
+HICON create_recording_app_icon(int size, COLORREF background) {
+    return load_app_icon(IDI_RECORDING_ICON, size, background);
 }
 
 } // namespace vtt

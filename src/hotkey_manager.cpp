@@ -2,8 +2,6 @@
 
 namespace vtt {
 
-HotkeyManager::HotkeyManager() = default;
-
 HotkeyManager::~HotkeyManager() {
     shutdown();
 }
@@ -21,16 +19,6 @@ void HotkeyManager::shutdown() {
     }
     hotkey_map_.clear();
     hwnd_ = nullptr;
-}
-
-bool HotkeyManager::register_defaults() {
-    bool ok = true;
-    ok &= register_hotkey(HotkeyAction::ToggleRecording,
-                          MOD_CONTROL | MOD_SHIFT, VK_SPACE);
-    ok &= register_hotkey(HotkeyAction::CancelRecording, 0, VK_ESCAPE);
-    ok &= register_hotkey(HotkeyAction::SwitchLanguage,
-                          MOD_CONTROL | MOD_SHIFT, 'L');
-    return ok;
 }
 
 bool HotkeyManager::register_hotkey(HotkeyAction action, UINT modifiers, UINT vk) {

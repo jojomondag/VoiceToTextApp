@@ -1,15 +1,8 @@
 #include "text_injector.h"
+#include <vector>
+#include <windows.h>
 
 namespace vtt {
-
-TextInjector::TextInjector() = default;
-TextInjector::~TextInjector() { shutdown(); }
-
-bool TextInjector::initialize() {
-    return true;
-}
-
-void TextInjector::shutdown() {}
 
 void TextInjector::set_method(const std::string& method) {
     method_ = method;
@@ -19,20 +12,23 @@ void TextInjector::set_keystroke_delay_ms(int ms) {
     keystroke_delay_ms_ = ms;
 }
 
-bool TextInjector::inject_text(const std::string& text) {
-    if (text.empty()) return false;
+void TextInjector::set_owner_window(HWND owner) {
+    owner_window_ = owner;
+}
 
-    if (method_ == "clipboard") {
-        return inject_via_clipboard(text);
-    } else if (method_ == "keystrokes") {
-        return inject_via_keystrokes(text);
+bool TextInjector::inject_text(const std::string& text, HWND expected_window) {
+    if (text.empty()) return false;
+    if (expected_window && GetForegroundWindow() != expected_window) return false;
+
+    if (method_ == "keystrokes") {
+        return inject_via_keystrokes(text, expected_window);
     }
 
     // "auto" -- prefer clipboard as it handles Unicode better
-    return inject_via_clipboard(text);
+    return inject_via_clipboard(text, expected_window);
 }
 
-bool TextInjector::inject_via_clipboard(const std::string& text) {
+bool TextInjector::inject_via_clipboard(const std::string& text, HWND expected_window) {
     // Convert UTF-8 to wide string
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
     if (wlen <= 0) return false;
@@ -49,13 +45,18 @@ bool TextInjector::inject_via_clipboard(const std::string& text) {
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, pMem, wlen);
     GlobalUnlock(hMem);
 
-    if (!OpenClipboard(nullptr)) {
+    // EmptyClipboard must assign ownership to our window before we can
+    // publish CF_UNICODETEXT. A null owner prevents SetClipboardData.
+    if (!owner_window_ || !OpenClipboard(owner_window_)) {
         GlobalFree(hMem);
         return false;
     }
 
-    EmptyClipboard();
-    SetClipboardData(CF_UNICODETEXT, hMem);
+    if (!EmptyClipboard() || !SetClipboardData(CF_UNICODETEXT, hMem)) {
+        CloseClipboard();
+        GlobalFree(hMem);
+        return false;
+    }
     CloseClipboard();
     // hMem is now owned by the clipboard
 
@@ -80,11 +81,11 @@ bool TextInjector::inject_via_clipboard(const std::string& text) {
     inputs[3].ki.wVk = VK_CONTROL;
     inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
 
-    SendInput(4, inputs, sizeof(INPUT));
-    return true;
+    if (expected_window && GetForegroundWindow() != expected_window) return false;
+    return SendInput(4, inputs, sizeof(INPUT)) == 4;
 }
 
-bool TextInjector::inject_via_keystrokes(const std::string& text) {
+bool TextInjector::inject_via_keystrokes(const std::string& text, HWND expected_window) {
     // Convert to wide string for Unicode keystroke injection
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
     if (wlen <= 0) return false;
@@ -93,6 +94,7 @@ bool TextInjector::inject_via_keystrokes(const std::string& text) {
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wtext.data(), wlen);
 
     for (int i = 0; i < wlen - 1; ++i) { // -1 to skip null terminator
+        if (expected_window && GetForegroundWindow() != expected_window) return false;
         INPUT inputs[2] = {};
 
         // Key down
@@ -105,7 +107,7 @@ bool TextInjector::inject_via_keystrokes(const std::string& text) {
         inputs[1].ki.wScan = wtext[i];
         inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
 
-        SendInput(2, inputs, sizeof(INPUT));
+        if (SendInput(2, inputs, sizeof(INPUT)) != 2) return false;
 
         if (keystroke_delay_ms_ > 0) {
             Sleep(static_cast<DWORD>(keystroke_delay_ms_));
