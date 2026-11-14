@@ -5,7 +5,7 @@ configuration notes for VoiceToText.
 
 ## Requirements
 
-- Windows 10/11, 64-bit.
+- Windows 10/11, 64-bit (for Linux see [Linux](#linux)).
 - Visual Studio 2022 or Build Tools with the C++ workload.
 - CMake 3.20 or newer.
 - A microphone.
@@ -262,6 +262,131 @@ is preserved rather than applying an unconfirmed rewrite. Editor capabilities
 determine whether the selected mode can safely replace the active span; replacement
 is not available in every app.
 
+## Linux
+
+The Linux build shares the dictation core (speech recognition, live modes,
+Gemma, History) with Windows. Its UI is Qt 6 and lives in `src/linux`.
+
+### Requirements
+
+- A Wayland session. Global hotkeys and window tracking use Hyprland.
+- Build: CMake 3.20+, Ninja, a C++17 compiler, Qt 6 (`qt6-base`),
+  `wayland` (client library and `wayland-scanner`), libcurl, OpenSSL, and
+  optionally `layer-shell-qt` (overlay as a layer surface).
+- Run time: `wl-clipboard`, a compositor with the virtual-keyboard protocol
+  (wlroots compositors, Hyprland), a system tray that speaks
+  StatusNotifierItem, PulseAudio or PipeWire for the microphone.
+
+```bash
+sudo pacman -S cmake ninja qt6-base layer-shell-qt wayland curl openssl wl-clipboard
+```
+
+### Build, Install, Run
+
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build
+cmake --install build --component app --prefix ~/.local
+VoiceToText
+```
+
+The pinned speech runtimes (transcribe.cpp 0.2.3 and ONNX Runtime 1.28) are
+downloaded at configure time and copied next to the executable. The install
+step puts the program and those libraries in `~/.local/lib/voicetotext`, links
+`~/.local/bin/VoiceToText` to it, and adds a launcher entry.
+
+Only one instance runs per session. A second `VoiceToText` hands a command to
+the running one:
+
+| Command | Action |
+| --- | --- |
+| `--toggle` | Start or stop recording |
+| `--cancel` | Stop recording; text already written stays |
+| `--mode-recorded`, `--mode-clean`, `--mode-ai` | Switch live mode while recording |
+| `--dictation` | Open the live dictation window |
+| `--history` | Open History |
+| `--settings` | Open `config.json` |
+| `--quit` | Exit |
+
+### Hotkeys
+
+Under Hyprland the app registers `Ctrl+Shift+Space` itself while it runs, and
+`Escape` only during a recording, and switches them off when it exits
+(`toggle_key`, `toggle_modifiers`, `cancel_key`, `cancel_modifiers`). If your
+Hyprland config binds the same key, both binds fire: remove one of them.
+
+### How Text Is Written
+
+Words are typed at the keyboard focus as they become stable, through a
+virtual keyboard of the app's own. Each character is put on an ordinary
+letter, digit or punctuation key: tools that number characters from the first
+keycode upwards (`wtype`) make Chromium and the compositor see Escape,
+Backspace or Control being pressed, which loses characters.
+
+Wayland gives an application no way to read another application's text or to
+watch the user's input, which is how the Windows build knows that a dictated
+passage is still untouched. On Linux a language-mode result (Städa text,
+AI-språk, or back to Rösttext) is applied like this instead:
+
+1. The dictated passage is selected backwards from the caret with Shift+Left.
+2. The selection the application publishes (the primary selection) must equal
+   exactly what dictation typed.
+3. Only then is it replaced. Text with line breaks is pasted (the previous
+   clipboard content is put back afterwards); other text is typed.
+
+If you typed, moved the caret, or the field does not select text that way, the
+texts differ, nothing is replaced, and the overlay shows **Texten behålls**.
+
+Dictation stays with the window it started in. If you switch to another window
+while speaking, the words are held (the overlay shows **Väntar på fönstret**)
+and typed into the original window as soon as it has focus again; nothing is
+typed into the window you switched to. Keys cannot be sent to a window without
+focus: Hyprland can address one, but Chromium ignores such keys.
+In a terminal there is no selection to check, so the dictated words are deleted
+by their length and the new text is typed on the same line, flattened to one
+line (a line break would be Enter). This is only right while you leave that
+line alone during dictation.
+
+### Gemma
+
+Choosing a Gemma model in the tray downloads it and, when no `llama-server` is
+on `PATH`, the latest official llama.cpp build for Linux (Vulkan, or CPU when
+Gemma compute is set to CPU) into `tools/llama.cpp` in the data directory.
+
+### Hosted Language Model
+
+Instead of Gemma, the live modes can use a hosted OpenAI-compatible API (this
+works on Windows too). The dictated text is then sent to that service.
+
+```json
+{
+  "llm_cleanup_enabled": true,
+  "llm_provider": "lmstudio",
+  "llm_endpoint": "https://api.deepseek.com/chat/completions",
+  "llm_model": "deepseek-flash",
+  "llm_api_key_file": "deepseek_api_key"
+}
+```
+
+`llm_api_key_file` names a file next to `config.json` that holds only the API
+key; the key is never written to `config.json` or the log. For DeepSeek's API
+reasoning is switched off, which keeps the answers fast.
+
+### File Locations
+
+| What | Where |
+| --- | --- |
+| `config.json` | `~/.config/VoiceToText/` |
+| Models, tools, History, corrections, diagnostics, `voicetotext.log` | `~/.local/share/VoiceToText/` |
+| Autostart entry (`auto_start`) | `~/.config/autostart/voicetotext.desktop` |
+
+### Known Differences
+
+- The `gguf-q8` speech model cannot be downloaded at the moment (its pinned
+  URL answers 401, on Windows too). The ONNX models work.
+- `llm_internal_server_path` may keep its Windows value `llama-server.exe`;
+  the `.exe` is ignored.
+
 ## Packaging
 
 Create a standalone folder:
@@ -296,12 +421,9 @@ Common settings:
 | `use_gpu` | Enables Vulkan GPU use for GGUF when available. |
 | `compute_mode` | `auto`, `cpu`, or `gpu`; ONNX uses CPU. |
 | `n_threads` | CPU inference threads. `0` means auto. |
-| `whisper_fast_mode` | Legacy compatibility setting; no effect with Pianissimo. |
 | `warm_up_model_on_load` | Runs a small warmup after loading the model. |
 | `audio_device` | Optional microphone device index as a string. Empty means Windows default. |
 | `vad_threshold` | Voice activity sensitivity. Lower is more sensitive. |
-| `trim_silence_before_transcription` | Legacy compatibility setting; live dictation handles silence automatically. |
-| `trim_silence_padding_ms` | Legacy compatibility setting; no effect with live Pianissimo dictation. |
 | `toggle_key` | Virtual-key code for the recording hotkey key. |
 | `cancel_key` | Virtual-key code to stop further dictation; text already written stays in place. |
 | `injection_method` | `auto`, `clipboard`, or `keystrokes`. |

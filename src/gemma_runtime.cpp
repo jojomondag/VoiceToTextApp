@@ -1,4 +1,14 @@
 #include "gemma_runtime.h"
+#ifndef _WIN32
+#include <csignal>
+#include <fcntl.h>
+#include <fstream>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +24,7 @@ std::string lower_copy(std::string value) {
     return value;
 }
 
+#ifdef _WIN32
 int installed_ram_gb() {
     MEMORYSTATUSEX status = {};
     status.dwLength = sizeof(status);
@@ -41,6 +52,24 @@ std::string quote_arg(const std::string& arg) {
     return quoted;
 }
 
+#else
+int installed_ram_gb() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    unsigned long long kilobytes = 0;
+    while (meminfo >> key >> kilobytes) {
+        if (key == "MemTotal:") {
+            return static_cast<int>((kilobytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull));
+        }
+        meminfo.ignore(256, '\n');
+    }
+    return 0;
+}
+bool has_nvidia_driver() {
+    std::error_code ec;
+    return std::filesystem::exists("/proc/driver/nvidia/version", ec);
+}
+#endif
 } // namespace
 
 const std::vector<GemmaModelInfo>& gemma_models() {
@@ -127,6 +156,7 @@ GemmaRuntime::~GemmaRuntime() {
     stop();
 }
 
+#ifdef _WIN32
 bool GemmaRuntime::start(const std::string& llama_server_path,
                          const std::string& model_path,
                          const std::string& compute_mode,
@@ -223,4 +253,82 @@ bool GemmaRuntime::running() const {
            exit_code == STILL_ACTIVE;
 }
 
+#else
+bool GemmaRuntime::start(const std::string& llama_server_path,
+                         const std::string& model_path,
+                         const std::string& compute_mode,
+                         int port,
+                         std::string& error) {
+    stop();
+    if (llama_server_path.empty() ||
+        !std::filesystem::exists(llama_server_path)) {
+        error = "llama-server was not found.";
+        return false;
+    }
+    if (model_path.empty() || !std::filesystem::exists(model_path)) {
+        error = "Gemma model file was not found.";
+        return false;
+    }
+
+    const bool gpu = compute_mode == "gpu" || compute_mode == "auto";
+    std::vector<std::string> arguments = {
+        llama_server_path, "-m", model_path, "--host", "127.0.0.1",
+        "--port", std::to_string(port), "--ctx-size", "4096", "--parallel", "1",
+        "--n-gpu-layers", gpu ? "999" : "0",
+        // Frees the GPU memory after 5 idle minutes; the next request reloads the model (~1 s).
+        "--sleep-idle-seconds", "300",
+    };
+    std::vector<char*> argv;
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    argv.push_back(nullptr);
+
+    const std::filesystem::path working_dir =
+        std::filesystem::path(llama_server_path).parent_path();
+    const std::string log_path = (working_dir / "llama-server-vtt.log").string();
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, log_path.c_str(),
+                                     O_WRONLY | O_CREAT | O_APPEND, 0644);
+    posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+    if (!working_dir.empty()) {
+        posix_spawn_file_actions_addchdir_np(&actions, working_dir.c_str());
+    }
+
+    pid_t pid = 0;
+    const int result = posix_spawn(&pid, llama_server_path.c_str(), &actions, nullptr,
+                                   argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (result != 0) {
+        error = "Failed to start llama-server.";
+        return false;
+    }
+    process_ = pid;
+    return true;
+}
+void GemmaRuntime::stop() {
+    if (process_ <= 0) return;
+    int status = 0;
+    if (waitpid(process_, &status, WNOHANG) == 0) {
+        kill(process_, SIGTERM);
+        for (int waited = 0; waited < 3000; waited += 50) {
+            if (waitpid(process_, &status, WNOHANG) != 0) { process_ = 0; return; }
+            usleep(50 * 1000);
+        }
+        kill(process_, SIGKILL);
+        waitpid(process_, &status, 0);
+    }
+    process_ = 0;
+}
+bool GemmaRuntime::running() const {
+    if (process_ <= 0) return false;
+    // The child stays a zombie until stop() reaps it; /proc tells them apart.
+    std::ifstream stat("/proc/" + std::to_string(process_) + "/stat");
+    std::string line;
+    if (!std::getline(stat, line)) return false;
+    const auto close = line.rfind(')');
+    return close != std::string::npos && close + 2 < line.size() && line[close + 2] != 'Z';
+}
+#endif
 } // namespace vtt

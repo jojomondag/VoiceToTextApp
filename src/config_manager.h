@@ -2,7 +2,8 @@
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
-#include <windows.h>
+
+#include "key_codes.h"
 
 namespace vtt {
 
@@ -24,14 +25,11 @@ struct AppConfig {
     bool use_gpu = false;
     std::string compute_mode = "auto";   // "auto", "gpu", "cpu"
     int n_threads = 0;                    // 0 = auto
-    bool whisper_fast_mode = true;
     bool warm_up_model_on_load = true;
 
     // Audio settings
     std::string audio_device;            // empty = default
     float vad_threshold = 0.01f;
-    bool trim_silence_before_transcription = true;
-    int trim_silence_padding_ms = 250;
 
     // Hotkey settings (stored as virtual key codes + modifiers)
     unsigned int toggle_modifiers = MOD_CONTROL | MOD_SHIFT;
@@ -52,6 +50,10 @@ struct AppConfig {
     std::string llm_provider = "lmstudio"; // "lmstudio", "internal"
     std::string llm_endpoint = "http://127.0.0.1:1234/v1/chat/completions";
     std::string llm_model = "local-model";
+    // For a hosted OpenAI-compatible API (llm_provider "lmstudio" with its
+    // endpoint and model): a file holding the API key, relative to the
+    // directory of config.json. The key itself is never stored in config.json.
+    std::string llm_api_key_file;
     std::string llm_internal_model = "auto";
     std::string llm_internal_model_path = "models/llm/gemma-4-E2B-it-Q8_0.gguf";
     std::string llm_internal_compute_mode = "auto";
@@ -177,13 +179,13 @@ struct AppConfig {
     // Serialize most fields automatically; modifiers handled separately
     NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(AppConfig,
         model_id, model_dir, model_path, language, use_gpu, compute_mode, n_threads,
-        whisper_fast_mode, warm_up_model_on_load,
+        warm_up_model_on_load,
         audio_device, vad_threshold,
-        trim_silence_before_transcription, trim_silence_padding_ms,
         toggle_key, cancel_key,
         injection_method, keystroke_delay_ms, pre_injection_delay_ms,
         paste_output_mode, dictation_debug_logging,
         llm_cleanup_enabled, llm_provider, llm_endpoint, llm_model,
+        llm_api_key_file,
         llm_internal_model, llm_internal_model_path,
         llm_internal_compute_mode, llm_internal_server_path,
         llm_internal_port, llm_internal_auto_start, llm_pre_prompt,

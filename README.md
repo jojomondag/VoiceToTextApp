@@ -1,6 +1,6 @@
 # VoiceToText
 
-VoiceToText is a local Windows dictation app built in C++. It records from your
+VoiceToText is a local dictation app for Windows and Linux, built in C++. It records from your
 microphone, transcribes Swedish speech with Pianissimo, and writes it live at
 the text cursor in the app you are already using. Select Städa text or AI-språk
 to transform the current dictation and continue processing new speech in that
@@ -47,13 +47,28 @@ Tagged GitHub releases build a Windows installer automatically. Download
 `VoiceToText-Windows-Setup.exe` from the repository's Releases page and run it;
 the app installs per-user and downloads its speech model on first use.
 
-The application uses Win32 APIs and currently supports Windows only.
+Windows is the primary platform. A Linux build (Wayland, Qt 6) with the same
+features is described under [Linux](#linux).
 
 VoiceToText runs in the Windows notification area rather than as a normal
 taskbar window. If Windows has collapsed notification icons, open the hidden
 icons menu near the clock and enable VoiceToText under taskbar settings.
 
 ![VoiceToText MarketGraphic](assets/MarketGraphic.png)
+
+## Linux
+
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build
+cmake --install build --component app --prefix ~/.local
+VoiceToText
+```
+
+The speech model is downloaded on first start. Under Hyprland the hotkeys
+work as soon as the app runs; on other compositors bind `VoiceToText --toggle`
+yourself. Build requirements, file locations and the differences from Windows
+are in [Setup And Configuration](docs/SETUP_AND_CONFIGURATION.md#linux).
 
 ## Usage
 

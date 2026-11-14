@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/hotkey_manager.h.
+#ifndef _WIN32
+#include "linux/hotkey_manager.h"
+#else
 #include <functional>
 #include <unordered_map>
 #include <string>
@@ -49,3 +53,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

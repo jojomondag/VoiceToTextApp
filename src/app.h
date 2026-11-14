@@ -6,7 +6,11 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "linux/win_compat.h"
+#endif
 
 #include "pianissimo_engine.h"
 #include "speech_model_catalog.h"
@@ -37,6 +41,12 @@ public:
     bool initialize(HINSTANCE hInstance);
     int run();
     void shutdown();
+
+#ifndef _WIN32
+    // Commands from the command line of a second process ("--toggle", ...)
+    // and from the compositor key binds. Must be called on the UI thread.
+    void handle_command(const std::string& command, const std::string& source = {});
+#endif
 
 private:
     // Event handlers
@@ -116,6 +126,10 @@ private:
     HWND hwnd_ = nullptr;
     HINSTANCE hInstance_ = nullptr;
     UINT taskbar_created_msg_ = 0;
+#ifndef _WIN32
+    // When the last start/stop command arrived (for the double-press guard).
+    ULONGLONG last_toggle_command_ = 0;
+#endif
     std::atomic<bool> recording_{false};
     std::atomic<bool> processing_{false};
     std::atomic<bool> downloading_model_{false};

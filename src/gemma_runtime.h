@@ -2,7 +2,11 @@
 
 #include <string>
 #include <vector>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/types.h>
+#endif
 
 namespace vtt {
 
@@ -34,7 +38,11 @@ public:
     bool running() const;
 
 private:
+#ifdef _WIN32
     PROCESS_INFORMATION process_ = {};
+#else
+    pid_t process_ = 0;
+#endif
 };
 
 } // namespace vtt

@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/tray_icon.h.
+#ifndef _WIN32
+#include "linux/tray_icon.h"
+#else
 #include <functional>
 #include <string>
 #include <vector>
@@ -68,3 +72,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

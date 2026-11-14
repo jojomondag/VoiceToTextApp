@@ -1,10 +1,15 @@
 #include "pianissimo_engine.h"
 #include "speech_model_catalog.h"
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <cwctype>
+#endif
 #include <transcribe.h>
 #define ORT_API_MANUAL_INIT
 #include <onnxruntime_cxx_api.h>
@@ -24,6 +29,8 @@
 namespace vtt {
 namespace {
 
+#ifdef _WIN32
+using RuntimeModule = HMODULE;
 std::filesystem::path runtime_directory() {
     std::vector<wchar_t> buffer(32768);
     const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -42,11 +49,46 @@ template <typename T> T symbol(HMODULE module, const char* name) {
     if (!address) throw std::runtime_error(std::string("Speech runtime is missing API ") + name + ".");
     return reinterpret_cast<T>(address);
 }
+#define VTT_TRANSCRIBE_LIBRARY L"transcribe.dll"
+#define VTT_ONNXRUNTIME_LIBRARY L"onnxruntime.dll"
+#else
+using RuntimeModule = void*;
+std::filesystem::path runtime_directory() {
+    std::error_code ec;
+    const auto executable = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (ec || executable.empty()) throw std::runtime_error("Unable to locate speech runtime directory.");
+    return executable.parent_path();
+}
+// The packaged libraries sit next to the executable (or in its lib/ folder)
+// and find their own siblings through their $ORIGIN runpath.
+RuntimeModule load_runtime(const char* name) {
+    const auto directory = runtime_directory();
+    std::string reason;
+    for (const auto& path : {directory / name, directory / "lib" / name}) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) continue;
+        if (auto module = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL)) return module;
+        const char* message = dlerror();
+        reason = message ? message : "unknown error";
+        break;
+    }
+    if (reason.empty()) reason = "not found in " + directory.u8string();
+    throw std::runtime_error(std::string("Unable to load Pianissimo runtime ") + name +
+                             " (" + reason + "). Reinstall the complete application package.");
+}
+template <typename T> T symbol(RuntimeModule module, const char* name) {
+    auto address = dlsym(module, name);
+    if (!address) throw std::runtime_error(std::string("Speech runtime is missing API ") + name + ".");
+    return reinterpret_cast<T>(address);
+}
+#define VTT_TRANSCRIBE_LIBRARY "libtranscribe.so"
+#define VTT_ONNXRUNTIME_LIBRARY "libonnxruntime.so"
+#endif
 
 // The module stays loaded for the process lifetime: ggml's registered backend
 // modules and ORT's API table can outlive an individual loaded model.
 struct TranscribeApi {
-    HMODULE module = nullptr;
+    RuntimeModule module = nullptr;
 #define VTT_TRANSCRIBE_FN(name) decltype(&transcribe_##name) name = nullptr
     VTT_TRANSCRIBE_FN(version);
     VTT_TRANSCRIBE_FN(init_backends_default);
@@ -66,7 +108,7 @@ struct TranscribeApi {
     VTT_TRANSCRIBE_FN(model_backend);
 #undef VTT_TRANSCRIBE_FN
     TranscribeApi() {
-        module = load_runtime(L"transcribe.dll");
+        module = load_runtime(VTT_TRANSCRIBE_LIBRARY);
 #define VTT_LOAD_FN(name) name = symbol<decltype(name)>(module, "transcribe_" #name)
         VTT_LOAD_FN(version); VTT_LOAD_FN(init_backends_default); VTT_LOAD_FN(backend_available);
         VTT_LOAD_FN(model_load_params_init); VTT_LOAD_FN(session_params_init); VTT_LOAD_FN(run_params_init);
@@ -86,7 +128,7 @@ TranscribeApi& transcribe_api() {
 void initialize_ort() {
     static std::once_flag once;
     std::call_once(once, [] {
-        const auto module = load_runtime(L"onnxruntime.dll");
+        const auto module = load_runtime(VTT_ONNXRUNTIME_LIBRARY);
         const auto base = symbol<decltype(&OrtGetApiBase)>(module, "OrtGetApiBase")();
         const auto* api = base->GetApi(ORT_API_VERSION);
         if (!api) throw std::runtime_error("Pianissimo requires the packaged ONNX Runtime 1.28 API.");
@@ -99,6 +141,7 @@ std::string trim(std::string value) {
     const auto last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
 }
+#ifdef _WIN32
 bool begins_word(const std::string& value) {
     if (value.empty()) return false;
     wchar_t character[2]{};
@@ -108,6 +151,34 @@ bool begins_word(const std::string& value) {
     const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), std::min<int>(length, static_cast<int>(value.size())), character, 2);
     return count > 0 && GetStringTypeW(CT_CTYPE1, character, count, kind) && (kind[0] & (C1_ALPHA | C1_DIGIT));
 }
+#else
+// Same contract as the Windows branch: strictly decode the first UTF-8 code
+// point and report whether it is a letter or digit. The Latin ranges are
+// answered here so Swedish text does not depend on the process locale.
+bool begins_word(const std::string& value) {
+    if (value.empty()) return false;
+    const auto byte = [&](size_t index) { return static_cast<unsigned char>(value[index]); };
+    const unsigned char first = byte(0);
+    char32_t code = first;
+    if (first >= 0x80) {
+        const size_t length = first < 0xc2 ? 0 : first < 0xe0 ? 2 : first < 0xf0 ? 3 : first < 0xf5 ? 4 : 0;
+        if (!length || value.size() < length) return false;
+        code = first & (0xff >> (length + 1));
+        for (size_t i = 1; i < length; ++i) {
+            if ((byte(i) & 0xc0) != 0x80) return false;
+            code = (code << 6) | (byte(i) & 0x3f);
+        }
+        const char32_t minimum = length == 2 ? 0x80 : length == 3 ? 0x800 : 0x10000;
+        if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return false;
+    }
+    if (code < 0x80) return (code >= '0' && code <= '9') || (code >= 'A' && code <= 'Z') || (code >= 'a' && code <= 'z');
+    if (code < 0x100) return code == 0xaa || code == 0xb5 || code == 0xba || (code >= 0xc0 && code != 0xd7 && code != 0xf7);
+    if (code < 0x250) return true; // Latin Extended-A and -B are letters only.
+    if (code >= 0x1e00 && code < 0x1f00) return true; // Latin Extended Additional.
+    // A surrogate pair is never C1_ALPHA on Windows, so stay within the BMP.
+    return code < 0x10000 && std::iswalnum(static_cast<wint_t>(code)) != 0;
+}
+#endif
 
 struct OnnxModel {
     Ort::Env environment{ORT_LOGGING_LEVEL_WARNING, "Pianissimo"};
@@ -120,7 +191,7 @@ struct OnnxModel {
     OnnxModel(const std::filesystem::path& directory, const std::string& quantization, int threads) {
         vocabulary.resize(8193);
         std::vector<bool> seen(vocabulary.size(), false);
-        std::ifstream input(directory / L"vocab.txt", std::ios::binary);
+        std::ifstream input(directory / "vocab.txt", std::ios::binary);
         if (!input) throw std::runtime_error("Unable to read Pianissimo vocabulary.");
         std::string line;
         while (std::getline(input, line)) {
@@ -142,7 +213,7 @@ struct OnnxModel {
         options.SetInterOpNumThreads(1);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         const auto suffix = quantization == "fp32" ? std::string() : "." + quantization;
-        preprocessor = Ort::Session(environment, (directory / L"nemo128.onnx").c_str(), options);
+        preprocessor = Ort::Session(environment, (directory / "nemo128.onnx").c_str(), options);
         encoder = Ort::Session(environment, (directory / std::filesystem::u8path("encoder-model" + suffix + ".onnx")).c_str(), options);
         decoder = Ort::Session(environment, (directory / std::filesystem::u8path("decoder_joint-model" + suffix + ".onnx")).c_str(), options);
         state1_shape = state_shape("input_states_1");

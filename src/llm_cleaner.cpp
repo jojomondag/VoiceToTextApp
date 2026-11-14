@@ -1,8 +1,13 @@
 #include "llm_cleaner.h"
 
 #include <nlohmann/json.hpp>
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
+#else
+#include "platform.h"
+#include <cwctype>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -13,13 +18,56 @@
 namespace vtt {
 namespace {
 
+#ifdef _WIN32
 struct ParsedUrl {
     std::wstring host;
     std::wstring path;
     INTERNET_PORT port = INTERNET_DEFAULT_HTTP_PORT;
     bool secure = false;
 };
+#else
+// UTF-8 to code points (wchar_t is 32 bits here). Invalid input yields an
+// empty string, as the Windows conversion does.
+std::wstring utf8_to_wide(const std::string& text) {
+    std::wstring result;
+    result.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        int length = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3
+                   : (lead >> 3) == 0x1E ? 4 : 0;
+        if (length == 0 || i + static_cast<size_t>(length) > text.size()) return {};
+        wchar_t value = length == 1 ? lead : lead & (0xFF >> (length + 1));
+        for (int k = 1; k < length; ++k) {
+            const unsigned char next = static_cast<unsigned char>(text[i + static_cast<size_t>(k)]);
+            if ((next & 0xC0) != 0x80) return {};
+            value = static_cast<wchar_t>((value << 6) | (next & 0x3F));
+        }
+        result.push_back(value);
+        i += static_cast<size_t>(length);
+    }
+    return result;
+}
 
+wchar_t lower_code_point(wchar_t value) {
+    // Latin-1 capitals (À-Þ except ×) regardless of the C locale, else towlower.
+    if (value >= 0x00C0 && value <= 0x00DE && value != 0x00D7) return value + 0x20;
+    return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(value)));
+}
+
+// Letters of the Latin-1 range count regardless of the C locale.
+constexpr int FALSE = 0;
+bool IsCharAlphaW(wchar_t value) {
+    if (value >= 0x00C0 && value <= 0x00FF) return value != 0x00D7 && value != 0x00F7;
+    return std::iswalpha(static_cast<wint_t>(value)) != 0;
+}
+int IsCharUpperW(wchar_t value) {
+    if (value >= 0x00C0 && value <= 0x00DE) return value != 0x00D7;
+    if (value >= 0x00DF && value <= 0x00FF) return 0;
+    return std::iswupper(static_cast<wint_t>(value)) != 0;
+}
+#endif
+
+#ifdef _WIN32
 std::wstring utf8_to_wide(const std::string& text) {
     if (text.empty()) return {};
     int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(),
@@ -31,6 +79,8 @@ std::wstring utf8_to_wide(const std::string& text) {
                         result.data(), size);
     return result;
 }
+
+#endif
 
 std::string trim(const std::string& text) {
     auto begin = std::find_if_not(text.begin(), text.end(), [](unsigned char c) {
@@ -45,7 +95,11 @@ std::string trim(const std::string& text) {
 }
 
 std::wstring lowercase(std::wstring text) {
+#ifdef _WIN32
     if (!text.empty()) CharLowerBuffW(text.data(), static_cast<DWORD>(text.size()));
+#else
+    for (wchar_t& value : text) value = lower_code_point(value);
+#endif
     return text;
 }
 
@@ -120,6 +174,7 @@ std::string rewrite_safeguards() {
            "enough context is present. Return only the rewritten text.";
 }
 
+#ifdef _WIN32
 bool parse_url(const std::string& url, ParsedUrl& parsed) {
     std::wstring wide_url = utf8_to_wide(url);
     if (wide_url.empty()) return false;
@@ -152,6 +207,7 @@ bool parse_url(const std::string& url, ParsedUrl& parsed) {
     return parts.nScheme == INTERNET_SCHEME_HTTP ||
            parts.nScheme == INTERNET_SCHEME_HTTPS;
 }
+#endif
 
 std::string build_request_body(const LlmCleanerConfig& config,
                                const std::string& system_prompt,
@@ -179,7 +235,12 @@ std::string build_request_body(const LlmCleanerConfig& config,
     // Prompt construction needs reasoning to preserve relationships and
     // uncertainty. Give it the configured budget so reasoning does not consume
     // the short proofreading allowance before any visible answer is produced.
-    body["chat_template_kwargs"] = {{"enable_thinking", enable_thinking}};
+    if (config.endpoint.find("deepseek.com") != std::string::npos) {
+        // DeepSeek's API reasons by default; it has its own switch.
+        body["thinking"] = {{"type", enable_thinking ? "enabled" : "disabled"}};
+    } else {
+        body["chat_template_kwargs"] = {{"enable_thinking", enable_thinking}};
+    }
     body["messages"] = nlohmann::json::array({
         {
             {"role", "system"},
@@ -442,6 +503,16 @@ bool LlmCleaner::request_completion(const std::string& input,
                                     bool enable_thinking) const {
     if (!config_.enabled || input.empty()) return false;
 
+#ifndef _WIN32
+    const std::string request_body =
+        build_request_body(config_, system_prompt, input, enable_thinking);
+    std::string reply;
+    if (!platform::http_post_json(config_.endpoint, request_body,
+                                  config_.timeout_ms, reply, config_.api_key)) {
+        return false;
+    }
+    return parse_cleaned_text(reply, output);
+#else
     ParsedUrl url;
     if (!parse_url(config_.endpoint, url)) return false;
 
@@ -473,6 +544,9 @@ bool LlmCleaner::request_completion(const std::string& input,
     std::string body = build_request_body(config_, system_prompt, input, enable_thinking);
     std::wstring headers =
         L"Content-Type: application/json; charset=utf-8\r\n";
+    if (!config_.api_key.empty()) {
+        headers += L"Authorization: Bearer " + utf8_to_wide(config_.api_key) + L"\r\n";
+    }
 
     BOOL ok = WinHttpSendRequest(
         request, headers.c_str(), static_cast<DWORD>(headers.size()),
@@ -513,6 +587,7 @@ bool LlmCleaner::request_completion(const std::string& input,
 
     if (!ok || response.empty()) return false;
     return parse_cleaned_text(response, output);
+#endif
 }
 
 } // namespace vtt

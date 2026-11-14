@@ -1,4 +1,7 @@
 #include "config_manager.h"
+#ifndef _WIN32
+#include "platform.h"
+#endif
 #include <cctype>
 #include <fstream>
 #include <filesystem>
@@ -7,6 +10,7 @@
 namespace vtt {
 namespace {
 
+#ifdef _WIN32
 std::wstring wide_from_utf8(const std::string& text) {
     if (text.empty()) return {};
     int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
@@ -83,6 +87,13 @@ bool repair_config_text(AppConfig& config) {
     changed |= repair_mojibake(config.llm_profile_transform_prompt);
     return changed;
 }
+#else
+// The double-encoded prompts this repairs were only ever written by old
+// Windows builds, so there is nothing to fix elsewhere.
+bool repair_config_text(AppConfig&) {
+    return false;
+}
+#endif
 
 bool migrate_ai_language_prompt(AppConfig& config) {
     // Replace only prompts previously shipped by this application. A user's
@@ -294,10 +305,15 @@ bool migrate_speech_model(AppConfig& config, const nlohmann::json& source) {
 } // namespace
 
 ConfigManager::ConfigManager() {
+#ifdef _WIN32
     // Place config.json next to the executable.
     char exe_path[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
     config_path_ = (std::filesystem::path(exe_path).parent_path() / "config.json").string();
+#else
+    // ~/.config/VoiceToText/config.json
+    config_path_ = platform::default_config_path().string();
+#endif
 }
 
 bool ConfigManager::load(const std::string& path) {
