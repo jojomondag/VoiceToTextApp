@@ -1,11 +1,17 @@
 #include "speech_model_catalog.h"
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#else
+#include <curl/curl.h>
+#include <openssl/evp.h>
+#include <mutex>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -30,6 +36,7 @@ SpeechModelFile preprocessor() {
 SpeechModelFile vocabulary() {
     return onnx_file("vocab.txt", 93939, "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d");
 }
+#ifdef _WIN32
 std::wstring wide(const std::string& input) {
     if (input.empty()) return {};
     const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), static_cast<int>(input.size()), nullptr, 0);
@@ -38,12 +45,15 @@ std::wstring wide(const std::string& input) {
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), static_cast<int>(input.size()), value.data(), size);
     return value;
 }
+#endif
 void check_cancel(const std::atomic<bool>* cancel) {
     if (cancel && cancel->load()) throw std::runtime_error("Model download cancelled.");
 }
 void report(const SpeechModelProgress& progress, const std::string& value) {
     if (progress) progress(value);
 }
+#ifdef _WIN32
+using HashSize = ULONG;
 struct HttpCloser { void operator()(void* value) const { if (value) WinHttpCloseHandle(value); } };
 using HttpHandle = std::unique_ptr<void, HttpCloser>;
 void http_check(bool success, const char* operation) {
@@ -78,6 +88,36 @@ struct Hash {
         return output.str();
     }
 };
+#else
+using HashSize = size_t;
+struct Hash {
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    Hash() {
+        if (!context) throw std::runtime_error("Unable to initialize SHA-256.");
+        if (EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1) {
+            EVP_MD_CTX_free(context); context = nullptr;
+            throw std::runtime_error("Unable to create SHA-256 hash.");
+        }
+    }
+    ~Hash() { if (context) EVP_MD_CTX_free(context); }
+    Hash(const Hash&) = delete;
+    Hash& operator=(const Hash&) = delete;
+    void add(char* bytes, HashSize size) {
+        if (EVP_DigestUpdate(context, bytes, size) != 1)
+            throw std::runtime_error("Unable to hash model file.");
+    }
+    std::string finish() {
+        std::array<unsigned char, 32> digest{};
+        unsigned int length = 0;
+        if (EVP_DigestFinal_ex(context, digest.data(), &length) != 1 || length != digest.size())
+            throw std::runtime_error("Unable to finish model hash.");
+        std::ostringstream output;
+        output << std::hex << std::setfill('0');
+        for (auto byte : digest) output << std::setw(2) << static_cast<int>(byte);
+        return output.str();
+    }
+};
+#endif
 bool verify(const std::filesystem::path& path, const SpeechModelFile& file, const std::atomic<bool>* cancel) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec) || std::filesystem::file_size(path, ec) < file.minimum_bytes || ec) return false;
@@ -88,11 +128,12 @@ bool verify(const std::filesystem::path& path, const SpeechModelFile& file, cons
     while (input) {
         check_cancel(cancel);
         input.read(buffer.data(), buffer.size());
-        if (input.gcount() > 0) hash.add(buffer.data(), static_cast<ULONG>(input.gcount()));
+        if (input.gcount() > 0) hash.add(buffer.data(), static_cast<HashSize>(input.gcount()));
     }
     if (!input.eof()) throw std::runtime_error("Unable to read complete model file " + file.filename + ".");
     return hash.finish() == file.sha256;
 }
+#ifdef _WIN32
 void download(const std::filesystem::path& path, const SpeechModelFile& file,
               const SpeechModelProgress& progress, const std::atomic<bool>* cancel) {
     const auto url = wide(file.url);
@@ -141,6 +182,111 @@ void download(const std::filesystem::path& path, const SpeechModelFile& file,
     output.close();
     if (!output) throw std::runtime_error("Unable to finish writing model file.");
 }
+#else
+struct CurlCloser { void operator()(CURL* value) const { if (value) curl_easy_cleanup(value); } };
+struct Transfer {
+    CURL* handle = nullptr;
+    const std::filesystem::path* path = nullptr;
+    const SpeechModelFile* file = nullptr;
+    const SpeechModelProgress* progress = nullptr;
+    const std::atomic<bool>* cancel = nullptr;
+    std::ofstream output;
+    std::uint64_t received = 0;
+    std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
+    long status = 0;
+    bool cancelled = false, open_failed = false, write_failed = false;
+
+    bool open() {
+        if (output.is_open()) return true;
+        output.open(*path, std::ios::binary | std::ios::trunc);
+        open_failed = !output;
+        return !open_failed;
+    }
+    // libcurl skips the bodies of the redirects it follows, so the first
+    // chunk seen here belongs to the final response.
+    static size_t write(char* data, size_t size, size_t count, void* user) {
+        auto& self = *static_cast<Transfer*>(user);
+        const size_t bytes = size * count;
+        if (!bytes) return 0;
+        // Returning fewer bytes than offered aborts the transfer.
+        if (self.cancel && self.cancel->load()) { self.cancelled = true; return 0; }
+        if (!self.status) curl_easy_getinfo(self.handle, CURLINFO_RESPONSE_CODE, &self.status);
+        if (self.status != 200 || !self.open()) return 0;
+        self.output.write(data, static_cast<std::streamsize>(bytes));
+        if (!self.output) { self.write_failed = true; return 0; }
+        self.received += bytes;
+        if (std::chrono::steady_clock::now() - self.last_report >= std::chrono::milliseconds(500)) {
+            report(*self.progress, self.file->filename + ": " + std::to_string(self.received / 1000000) + " / " + std::to_string(self.file->minimum_bytes / 1000000) + " MB");
+            self.last_report = std::chrono::steady_clock::now();
+        }
+        return bytes;
+    }
+    // Called by libcurl at least once per second, also while no data arrives.
+    static int poll(void* user, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+        auto& self = *static_cast<Transfer*>(user);
+        if (self.cancel && self.cancel->load()) self.cancelled = true;
+        return self.cancelled ? 1 : 0;
+    }
+};
+void download(const std::filesystem::path& path, const SpeechModelFile& file,
+              const SpeechModelProgress& progress, const std::atomic<bool>* cancel) {
+    if (file.url.compare(0, 8, "https://") != 0) throw std::runtime_error("Model downloads require HTTPS.");
+    static std::once_flag once;
+    static CURLcode global = CURLE_FAILED_INIT;
+    std::call_once(once, [] { global = curl_global_init(CURL_GLOBAL_DEFAULT); });
+    std::unique_ptr<CURL, CurlCloser> handle(global == CURLE_OK ? curl_easy_init() : nullptr);
+    if (!handle) throw std::runtime_error("Unable to open model download.");
+    Transfer transfer;
+    transfer.handle = handle.get();
+    transfer.path = &path;
+    transfer.file = &file;
+    transfer.progress = &progress;
+    transfer.cancel = cancel;
+    std::array<char, CURL_ERROR_SIZE> detail{};
+    curl_easy_setopt(handle.get(), CURLOPT_URL, file.url.c_str());
+    curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "VoiceToText-Pianissimo/1.0");
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(handle.get(), CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+    curl_easy_setopt(handle.get(), CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+#endif
+    curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(handle.get(), CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT_MS, 15000L);
+    // WinHTTP's 30 s receive timeout: give up when the transfer stalls.
+    curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, detail.data());
+    curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, &Transfer::write);
+    curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &transfer);
+    curl_easy_setopt(handle.get(), CURLOPT_XFERINFOFUNCTION, &Transfer::poll);
+    curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, &transfer);
+    curl_easy_setopt(handle.get(), CURLOPT_NOPROGRESS, 0L);
+    check_cancel(cancel);
+    const auto result = curl_easy_perform(handle.get());
+    if (transfer.cancelled) throw std::runtime_error("Model download cancelled.");
+    if (result == CURLE_UNSUPPORTED_PROTOCOL) throw std::runtime_error("Model downloads require HTTPS.");
+    if (!transfer.status) curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &transfer.status);
+    if (transfer.status && transfer.status != 200) throw std::runtime_error(file.filename + ": HTTP " + std::to_string(transfer.status) + ".");
+    if (transfer.open_failed) throw std::runtime_error("Unable to write " + file.filename + ".");
+    if (transfer.write_failed) throw std::runtime_error("Unable to save model; check available disk space.");
+    if (result != CURLE_OK) {
+        const char* operation =
+            result == CURLE_URL_MALFORMAT ? "Invalid model URL" :
+            result == CURLE_COULDNT_RESOLVE_PROXY || result == CURLE_COULDNT_RESOLVE_HOST || result == CURLE_COULDNT_CONNECT ||
+            result == CURLE_SSL_CONNECT_ERROR || result == CURLE_PEER_FAILED_VERIFICATION ? "Unable to connect to model host" :
+            transfer.status ? "Model download interrupted" : "Unable to receive model";
+        throw std::runtime_error(std::string(operation) + " (curl error " + std::to_string(static_cast<int>(result)) + ": " +
+                                 (detail[0] ? detail.data() : curl_easy_strerror(result)) + ").");
+    }
+    if (!transfer.open()) throw std::runtime_error("Unable to write " + file.filename + ".");
+    transfer.output.close();
+    if (!transfer.output) throw std::runtime_error("Unable to finish writing model file.");
+}
+#endif
 
 } // namespace
 
@@ -176,7 +322,7 @@ std::string normalize_speech_model_id(const std::string& id) {
 std::string speech_model_directory(const std::string& root, const std::string& model_id) {
     const auto* model = find_speech_model(model_id);
     const auto path = std::filesystem::u8path(root);
-    return (model && model->is_onnx() ? path / L"PianissimoOnnx" : path).u8string();
+    return (model && model->is_onnx() ? path / "PianissimoOnnx" : path).u8string();
 }
 bool speech_model_files_exist(const std::string& root, const std::string& model_id) {
     const auto* model = find_speech_model(model_id);
@@ -204,14 +350,20 @@ bool ensure_speech_model(const std::string& root, const std::string& model_id,
             const auto path = directory / std::filesystem::u8path(file.filename);
             report(progress, "Verifying " + file.filename + "...");
             if (verify(path, file, cancel)) continue;
-            auto temporary = path; temporary += L".downloading";
+            auto temporary = path; temporary += ".downloading";
             try {
                 report(progress, "Downloading " + file.filename + "...");
                 download(temporary, file, progress, cancel);
                 report(progress, "Verifying " + file.filename + "...");
                 if (!verify(temporary, file, cancel)) throw std::runtime_error("SHA-256 verification failed for " + file.filename + ".");
                 check_cancel(cancel);
+#ifdef _WIN32
                 http_check(MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH), "Unable to activate model file");
+#else
+                std::error_code rename_error;
+                std::filesystem::rename(temporary, path, rename_error);
+                if (rename_error) throw std::runtime_error("Unable to activate model file (" + rename_error.message() + ").");
+#endif
             } catch (...) {
                 std::error_code ignored;
                 std::filesystem::remove(temporary, ignored);

@@ -17,7 +17,11 @@ std::string now_timestamp() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm_buf{};
+#ifdef _WIN32
     localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
 
     char buffer[32] = {};
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_buf);
@@ -102,6 +106,11 @@ void TranscriptHistory::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
     save_locked();
+}
+
+std::vector<TranscriptHistoryEntry> TranscriptHistory::entries() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return entries_;
 }
 
 std::string TranscriptHistory::format_recorded() const {

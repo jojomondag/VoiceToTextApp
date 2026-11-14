@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/text_injector.h.
+#ifndef _WIN32
+#include "linux/text_injector.h"
+#else
 #include <string>
 #include <windows.h>
 
@@ -24,3 +28,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/external_dictation_target.h.
+#ifndef _WIN32
+#include "linux/external_dictation_target.h"
+#else
 
 #include <cstdint>
 #include <memory>
@@ -46,15 +50,10 @@ public:
     bool apply_revision(std::uint64_t token, const std::string& source_raw_text,
                         const std::string& transformed_text);
     bool apply_revision(std::uint64_t token, const std::string& transformed_text);
-    // Opaque editors cannot safely revise existing text. A completed processed
-    // chunk can instead be entered once, if its original caret is still valid.
-    bool append_processed(std::uint64_t target_token, int utterance_id,
-                          const std::string& transformed_text);
 
     // Only text delivered during this session, never the external document.
     std::string text_utf8() const;
     bool has_delivered() const;
-    bool is_available() const;
 
 private:
     struct Impl;
@@ -62,3 +61,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/dictation_window.h.
+#ifndef _WIN32
+#include "linux/dictation_window.h"
+#else
 
 #include "live_dictation_buffer.h"
 
@@ -67,3 +71,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

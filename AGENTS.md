@@ -1,34 +1,37 @@
 # VoiceToText project instructions
 
-## Application build destination
+## Building
 
-Whenever building the application, including when the user asks to "build" or
-"bygga", build the `VoiceToText` target in `Release` using
-`artifacts/pianissimo-tooltip-build` as the CMake build directory.
+Linux (the build the user runs daily), from the repository root:
 
-The required executable on Josef's Windows machine is:
-
-```text
-C:\Users\Josef\Documents\Github\VoiceToTextApp\artifacts\pianissimo-tooltip-build\bin\Release\VoiceToText.exe
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build
+cmake --install build --component app --prefix ~/.local
 ```
 
-The user's Windows taskbar shortcut points to this exact file. Keep this path
-stable and update this executable for every application build, unless the user
-explicitly requests a different destination. A build in another directory does
-not satisfy a request to build the app.
+The install step puts the program in `~/.local/lib/voicetotext`, links it as
+`~/.local/bin/VoiceToText` and adds the launcher entry. Quit the running app
+first (`VoiceToText --quit`) and start it again afterwards.
 
-Run from the repository root:
+Windows:
 
 ```powershell
-cmake --build artifacts/pianissimo-tooltip-build --config Release --target VoiceToText
+cmake -S . -B build
+cmake --build build --config Release --target VoiceToText
 ```
 
-If `cmake` is not on PATH, use the installed Visual Studio CMake executable:
+Verify that the build succeeds before reporting completion. If it fails or the
+executable is locked, report the actual problem.
 
-```powershell
-& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' --build artifacts/pianissimo-tooltip-build --config Release --target VoiceToText
-```
+## Layout
 
-Verify that the build succeeds and the executable exists at the required path
-before reporting completion. If the executable is locked or the build fails,
-report the actual problem; do not silently switch output directories.
+- `src/` holds the shared code and the Win32 UI. Each Win32 UI header starts
+  with `#ifndef _WIN32 #include "linux/<same name>.h"`; the Linux (Qt 6,
+  Wayland, Hyprland) counterparts live in `src/linux/`.
+- `src/app.cpp` keeps its Win32 shape on both platforms; on Linux it runs on
+  `src/linux/win_compat.{h,cpp}`.
+- `tests/CMakeLists.txt` builds the Windows regression tests;
+  `tests/linux_speech_smoke/` is a standalone Linux check of the speech engine.
+
+A change to shared code must still compile on the other platform.

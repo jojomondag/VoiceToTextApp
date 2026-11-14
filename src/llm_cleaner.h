@@ -22,6 +22,8 @@ struct LlmCleanerConfig {
     std::string intent_detection_prompt;
     std::string profile_transform_prompt;
     std::vector<LlmProfileDefinition> profiles;
+    // Sent as "Authorization: Bearer ..." when not empty (hosted APIs).
+    std::string api_key;
 };
 
 struct LlmProfileResult {

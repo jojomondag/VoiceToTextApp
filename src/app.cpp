@@ -1,5 +1,7 @@
 #include "app.h"
+#ifdef _WIN32
 #include "app_icon.h"
+#endif
 #include "dictation_stream.h"
 #include "live_text_format.h"
 #include <cmath>
@@ -9,8 +11,18 @@
 #include <functional>
 #include <mutex>
 #include <filesystem>
+#include <fstream>
+#ifdef _WIN32
 #include <urlmon.h>
 #include <winhttp.h>
+#else
+#include "log.h"
+#include "platform.h"
+#include <csignal>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
@@ -26,7 +38,9 @@
 #define WM_LIVE_MODE_RESULT (WM_APP + 9)
 #define AUDIO_LEVEL_TIMER 1
 
+#ifdef _WIN32
 static const wchar_t* APP_CLASS_NAME = L"VoiceToTextMainWindow";
+#endif
 
 namespace {
 struct DictationUpdate {
@@ -47,6 +61,7 @@ struct ModelReady {
     std::string id, error;
     bool use_gpu = false;
 };
+#ifdef _WIN32
 // Diagnostic logging — writes to voicetotext.log next to the exe so the user
 // can see recording/transcription flow even when launched detached from a
 // console. Thread-safe.
@@ -87,6 +102,10 @@ void vtlog(const char* fmt, ...) {
     fflush(f);
 }
 
+#else
+using vtt::vtlog;
+#endif
+
 std::string normalize_paste_output_mode(std::string mode) {
     std::transform(mode.begin(), mode.end(), mode.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -95,6 +114,7 @@ std::string normalize_paste_output_mode(std::string mode) {
     return "clean";
 }
 
+#ifdef _WIN32
 void sync_auto_start(bool enabled) {
     static const wchar_t* RUN_KEY =
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -145,14 +165,54 @@ bool has_nvidia_driver() {
     FreeLibrary(driver);
     return true;
 }
+#else
+void sync_auto_start(bool enabled) {
+    vtt::platform::sync_auto_start(enabled);
+}
+
+std::filesystem::path exe_directory() {
+    return vtt::platform::exe_directory();
+}
+
+// Models, tools, history and diagnostics live in the data directory
+// (~/.local/share/VoiceToText); only config.json is in ~/.config.
+std::filesystem::path config_directory(const vtt::ConfigManager*) {
+    return vtt::platform::data_directory({});
+}
+
+void configure_runtime_dll_search_path() {}
+
+bool has_nvidia_driver() {
+    std::error_code ec;
+    return std::filesystem::exists("/proc/driver/nvidia/version", ec);
+}
+#endif
 
 
+// The API key of a hosted language model, read from the file named by
+// llm_api_key_file (relative to config.json). Empty when none is configured.
+// The key is only ever held in memory and never logged.
+std::string read_llm_api_key(const vtt::AppConfig& cfg, const std::string& config_path) {
+    if (cfg.llm_api_key_file.empty() || cfg.llm_provider == "internal") return {};
+    std::filesystem::path path(cfg.llm_api_key_file);
+    if (path.is_relative()) path = std::filesystem::path(config_path).parent_path() / path;
+    std::ifstream file(path);
+    std::string key;
+    if (!file.is_open() || !std::getline(file, key)) {
+        vtlog("llm: API key file %s is missing or empty", path.string().c_str());
+        return {};
+    }
+    const auto first = key.find_first_not_of(" \t\r\n");
+    const auto last = key.find_last_not_of(" \t\r\n");
+    return first == std::string::npos ? std::string() : key.substr(first, last - first + 1);
+}
 
 long long elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start).count();
 }
 
+#ifdef _WIN32
 std::string quote_arg(const std::string& arg) {
     std::string quoted = "\"";
     for (char c : arg) {
@@ -346,93 +406,43 @@ bool wait_for_llm_server_ready(int port, DWORD timeout_ms, const std::atomic<boo
     return false;
 }
 
-struct AudioTrimResult {
-    std::vector<float> samples;
-    size_t start_sample = 0;
-    size_t end_sample = 0;
-    float threshold = 0.0f;
-    bool trimmed = false;
-};
-
-AudioTrimResult trim_silence_for_transcription(const std::vector<float>& input,
-                                               float vad_threshold,
-                                               int padding_ms) {
-    constexpr int sample_rate = 16000;
-    constexpr int frame_samples = sample_rate / 100; // 10 ms
-
-    AudioTrimResult result;
-    result.end_sample = input.size();
-
-    if (input.size() <= static_cast<size_t>(frame_samples)) {
-        return result;
-    }
-
-    size_t frame_count = (input.size() + frame_samples - 1) / frame_samples;
-    std::vector<float> frame_rms(frame_count, 0.0f);
-
-    float peak_rms = 0.0f;
-    for (size_t frame = 0; frame < frame_count; ++frame) {
-        size_t begin = frame * frame_samples;
-        size_t end = (std::min)(input.size(), begin + static_cast<size_t>(frame_samples));
-        float sum_sq = 0.0f;
-        for (size_t i = begin; i < end; ++i) {
-            sum_sq += input[i] * input[i];
-        }
-        float rms = std::sqrt(sum_sq / static_cast<float>(end - begin));
-        frame_rms[frame] = rms;
-        peak_rms = (std::max)(peak_rms, rms);
-    }
-
-    if (peak_rms < 0.0007f) {
-        return result;
-    }
-
-    float adaptive_threshold = (std::max)(0.0007f, peak_rms * 0.08f);
-    if (vad_threshold > 0.0f) {
-        adaptive_threshold = (std::max)(
-            adaptive_threshold,
-            (std::min)(vad_threshold * 0.20f, peak_rms * 0.18f));
-    }
-    result.threshold = adaptive_threshold;
-
-    size_t first_voice_frame = frame_count;
-    size_t last_voice_frame = 0;
-    for (size_t frame = 0; frame < frame_count; ++frame) {
-        if (frame_rms[frame] >= adaptive_threshold) {
-            first_voice_frame = frame;
-            break;
-        }
-    }
-    if (first_voice_frame == frame_count) {
-        return result;
-    }
-    for (size_t frame = frame_count; frame > first_voice_frame; --frame) {
-        if (frame_rms[frame - 1] >= adaptive_threshold) {
-            last_voice_frame = frame - 1;
-            break;
-        }
-    }
-
-    int padding_frames = (std::max)(0, padding_ms) / 10;
-    size_t start_frame = first_voice_frame > static_cast<size_t>(padding_frames)
-        ? first_voice_frame - static_cast<size_t>(padding_frames)
-        : 0;
-    size_t end_frame = (std::min)(frame_count,
-        last_voice_frame + 1 + static_cast<size_t>(padding_frames));
-
-    result.start_sample = start_frame * frame_samples;
-    result.end_sample = (std::min)(input.size(), end_frame * static_cast<size_t>(frame_samples));
-
-    if (result.start_sample == 0 && result.end_sample >= input.size()) {
-        return result;
-    }
-
-    result.samples.assign(input.begin() + static_cast<std::ptrdiff_t>(result.start_sample),
-                          input.begin() + static_cast<std::ptrdiff_t>(result.end_sample));
-    result.trimmed = true;
-    return result;
+bool download_large_file(const std::string& url,
+                         const std::filesystem::path& output_path,
+                         unsigned long long expected_size,
+                         const std::function<void(float)>& on_progress,
+                         DWORD& exit_code) {
+    return download_file_with_powershell(url, output_path, expected_size,
+                                         on_progress, exit_code);
+}
+#else
+bool download_large_file(const std::string& url,
+                         const std::filesystem::path& output_path,
+                         unsigned long long /*expected_size*/,
+                         const std::function<void(float)>& on_progress,
+                         DWORD& exit_code) {
+    const bool ok = vtt::platform::download_file(url, output_path, [&](float progress) {
+        on_progress((std::min)(progress, 0.98f));
+    });
+    exit_code = ok ? 0 : 1;
+    return ok;
 }
 
+bool wait_for_llm_server_ready(int port, DWORD timeout_ms, const std::atomic<bool>& stopping) {
+    const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/health";
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start).count() <
+           static_cast<long long>(timeout_ms) && !stopping.load()) {
+        if (vtt::platform::http_get_ok(url, 1500)) {
+            return true;
+        }
+        Sleep(1000);
+    }
+    return false;
+}
+#endif
+
+#ifdef _WIN32
 class DownloadProgressCallback : public IBindStatusCallback {
 public:
     explicit DownloadProgressCallback(std::function<void(float)> on_progress)
@@ -481,6 +491,7 @@ private:
     std::atomic<ULONG> ref_count_{1};
     std::function<void(float)> on_progress_;
 };
+#endif
 }  // anon namespace
 
 namespace vtt {
@@ -504,6 +515,7 @@ bool App::initialize(HINSTANCE hInstance) {
 
     sync_auto_start(cfg.auto_start);
 
+#ifdef _WIN32
     // --- 2. Create hidden owner window ---
     // A real hidden top-level window is more reliable than HWND_MESSAGE for
     // notification-area icons, while WS_EX_TOOLWINDOW keeps it off Alt-Tab and
@@ -528,6 +540,12 @@ bool App::initialize(HINSTANCE hInstance) {
     if (!hwnd_) return false;
     SendMessageW(hwnd_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
     SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(wc.hIconSm));
+#else
+    // --- 2. Message target: posted messages and timers arrive in WndProc on
+    // the UI thread, as they do on Windows. ---
+    hwnd_ = compat::create_message_window(&App::WndProc, this);
+    if (!hwnd_) return false;
+#endif
 
     // --- 3. Initialize Pianissimo using the same providers as TLH. ---
     engine_ = std::make_unique<PianissimoEngine>();
@@ -588,8 +606,7 @@ bool App::initialize(HINSTANCE hInstance) {
     correction_store_ = std::make_unique<CorrectionStore>();
     std::filesystem::path correction_path(cfg.llm_corrections_path);
     if (correction_path.is_relative()) {
-        correction_path = std::filesystem::path(config_->get_config_path())
-                              .parent_path() / correction_path;
+        correction_path = config_directory(config_.get()) / correction_path;
     }
     correction_store_->initialize(correction_path.string(),
                                   cfg.llm_corrections_max_entries);
@@ -597,8 +614,7 @@ bool App::initialize(HINSTANCE hInstance) {
     transcript_history_ = std::make_unique<TranscriptHistory>();
     std::filesystem::path history_path(cfg.transcript_history_path);
     if (history_path.is_relative()) {
-        history_path = std::filesystem::path(config_->get_config_path())
-                           .parent_path() / history_path;
+        history_path = config_directory(config_.get()) / history_path;
     }
     transcript_history_->initialize(history_path.string(),
                                     cfg.transcript_history_max_entries);
@@ -684,6 +700,7 @@ bool App::initialize(HINSTANCE hInstance) {
 }
 
 int App::run() {
+#ifdef _WIN32
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
         if (dictation_window_ && dictation_window_->is_visible() &&
@@ -692,6 +709,9 @@ int App::run() {
         DispatchMessage(&msg);
     }
     return static_cast<int>(msg.wParam);
+#else
+    return platform::run_main_loop();
+#endif
 }
 
 void App::shutdown() {
@@ -700,12 +720,14 @@ void App::shutdown() {
     recording_ = false;
     if (audio_) audio_->stop_recording();
     if (live_mode_processor_) live_mode_processor_->shutdown();
+#ifdef _WIN32
     if (hwnd_) {
         MSG leftover{};
         while (PeekMessageW(&leftover, hwnd_, WM_LIVE_MODE_RESULT, WM_LIVE_MODE_RESULT, PM_REMOVE)) {
             delete reinterpret_cast<LiveModeProcessor::Result*>(leftover.lParam);
         }
     }
+#endif
     if (audio_) audio_->stop_recording();
     if (external_dictation_) external_dictation_->cancel_session();
     if (hwnd_) KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
@@ -735,12 +757,19 @@ void App::shutdown() {
     if (engine_) engine_->shutdown();
     if (gemma_runtime_) gemma_runtime_->stop();
 
+#ifdef _WIN32
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
 
     UnregisterClassW(APP_CLASS_NAME, hInstance_);
+#else
+    if (hwnd_) {
+        compat::destroy_message_window(hwnd_);
+        hwnd_ = nullptr;
+    }
+#endif
 }
 
 void App::initialize_tray() {
@@ -796,6 +825,7 @@ void App::open_history_window() {
 LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     App* self = nullptr;
 
+#ifdef _WIN32
     if (msg == WM_NCCREATE) {
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         self = static_cast<App*>(cs->lpCreateParams);
@@ -803,12 +833,15 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     } else {
         self = reinterpret_cast<App*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
+#else
+    self = static_cast<App*>(compat::window_user_data(hwnd));
+#endif
 
     if (!self) {
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 
-    if (msg == self->taskbar_created_msg_) {
+    if (self->taskbar_created_msg_ && msg == self->taskbar_created_msg_) {
         if (self->tray_) {
             self->tray_->shutdown();
         }
@@ -1063,15 +1096,54 @@ void App::on_hotkey(HotkeyAction action) {
 
         case HotkeyAction::OpenSettings:
             // Open the config file in the default editor
+#ifdef _WIN32
             ShellExecuteA(nullptr, "open", config_->get_config_path().c_str(),
                          nullptr, nullptr, SW_SHOW);
+#else
+            platform::open_in_default_app(config_->get_config_path());
+#endif
             break;
     }
 }
 
+#ifndef _WIN32
+void App::handle_command(const std::string& command, const std::string& source) {
+    vtlog("command %s from %s", command.c_str(), source.empty() ? "unknown" : source.c_str());
+    if (command == "toggle") {
+        // Two start/stop commands this close together are one press seen
+        // twice (a double click, a bind and a bar button), not a start and a
+        // deliberate stop.
+        const ULONGLONG now = GetTickCount64();
+        if (last_toggle_command_ && now - last_toggle_command_ < 500) {
+            vtlog("command toggle ignored: %llu ms after the previous one",
+                  static_cast<unsigned long long>(now - last_toggle_command_));
+            return;
+        }
+        last_toggle_command_ = now;
+        on_hotkey(HotkeyAction::ToggleRecording);
+    } else if (command == "cancel") {
+        on_hotkey(HotkeyAction::CancelRecording);
+    } else if (command == "language") {
+        on_hotkey(HotkeyAction::SwitchLanguage);
+    } else if (command == "history") {
+        on_tray_action(TrayAction::OpenHistory);
+    } else if (command == "dictation") {
+        on_tray_action(TrayAction::OpenDictation);
+    } else if (command == "settings") {
+        on_tray_action(TrayAction::OpenSettings);
+    } else if (command == "quit") {
+        on_tray_action(TrayAction::Quit);
+    } else if (command == "mode-recorded" || command == "mode-clean" ||
+               command == "mode-ai") {
+        change_live_mode(command.substr(5));
+    }
+}
+#endif
+
 void App::on_tray_action(TrayAction action, const std::string& value) {
     switch (action) {
         case TrayAction::ToggleRecording:
+            vtlog("toggle from the tray icon");
             on_hotkey(HotkeyAction::ToggleRecording);
             break;
 
@@ -1147,8 +1219,19 @@ std::string App::resolve_model_path(const std::string& model_path) const {
     return (config_directory(config_.get()) / path).string();
 }
 
-std::string App::resolve_llama_server_path(const std::string& server_path) const {
-    if (server_path.empty()) return {};
+std::string App::resolve_llama_server_path(const std::string& configured_path) const {
+    if (configured_path.empty()) return {};
+
+#ifdef _WIN32
+    const std::string& server_path = configured_path;
+#else
+    // config.json may carry the Windows name of the program.
+    std::string server_path = configured_path;
+    if (server_path.size() > 4 &&
+        server_path.compare(server_path.size() - 4, 4, ".exe") == 0) {
+        server_path.resize(server_path.size() - 4);
+    }
+#endif
 
     std::filesystem::path path(server_path);
     if (path.is_absolute() && std::filesystem::exists(path)) {
@@ -1351,10 +1434,53 @@ bool App::ensure_internal_llm_runtime() {
         bool warmup_ok = llm_cleaner_->warm_up();
         vtlog("gemma runtime: warmup finished in %lld ms (ok=%d)",
               elapsed_ms(warmup_start), warmup_ok ? 1 : 0);
+        // The first request of realistic size pays a one-time setup cost of
+        // several seconds on the GPU backend, more than the live modes wait
+        // for. Pay it here instead of on the first dictated sentence.
+        auto prime_start = std::chrono::steady_clock::now();
+        std::string primed;
+        llm_cleaner_->transform_text(u8"Det h\u00e4r \u00e4r ett kort test av dikteringen.",
+                                     cfg.llm_ai_language_prompt, primed);
+        vtlog("gemma runtime: first full request took %lld ms", elapsed_ms(prime_start));
     }
     return true;
 }
 
+#ifndef _WIN32
+bool App::ensure_llama_server_available(std::string& server_path) {
+    std::error_code ec;
+    if (!server_path.empty() && std::filesystem::is_regular_file(server_path, ec)) {
+        return true;
+    }
+    // An installed llama.cpp on PATH works too.
+    std::string on_path = platform::find_program("llama-server");
+    if (!on_path.empty()) {
+        server_path = on_path;
+        return true;
+    }
+
+    const auto& cfg = config_->config();
+    const bool wants_gpu = cfg.llm_internal_compute_mode != "cpu";
+    std::filesystem::path install_dir = config_directory(config_.get()) / "tools" / "llama.cpp";
+    if (tray_) {
+        tray_->show_notification("Installing Gemma runtime",
+                                 "Downloading llama-server for internal Gemma.");
+    }
+    vtlog("gemma runtime: installing llama-server into %s", install_dir.string().c_str());
+    std::string error;
+    if (!platform::install_llama_server(install_dir, wants_gpu, error)) {
+        vtlog("gemma runtime: llama-server install failed: %s", error.c_str());
+        if (tray_) {
+            tray_->show_notification("Gemma runtime install failed",
+                                     "Could not install llama-server.");
+        }
+        return false;
+    }
+
+    server_path = resolve_llama_server_path(cfg.llm_internal_server_path);
+    return std::filesystem::is_regular_file(server_path, ec);
+}
+#else
 bool App::ensure_llama_server_available(std::string& server_path) {
     bool wants_cuda = false;
     if (config_) {
@@ -1431,6 +1557,7 @@ bool App::ensure_llama_server_available(std::string& server_path) {
     server_path = resolve_llama_server_path(config_->config().llm_internal_server_path);
     return std::filesystem::exists(server_path);
 }
+#endif
 
 void App::configure_llm_cleaner() {
     if (!config_ || !llm_cleaner_) return;
@@ -1462,6 +1589,7 @@ void App::configure_llm_cleaner() {
     for (const auto& profile : cfg.llm_profiles) {
         cleaner_config.profiles.push_back({profile.name, profile.instructions});
     }
+    cleaner_config.api_key = read_llm_api_key(cfg, config_->get_config_path());
     llm_cleaner_->configure(cleaner_config);
 }
 
@@ -1592,7 +1720,7 @@ void App::download_and_select_gemma_model(const std::string& model_id,
         std::filesystem::remove(temp_path, ec);
 
         DWORD download_exit = 0;
-        bool download_ok = download_file_with_powershell(
+        bool download_ok = download_large_file(
             url, temp_path, expected_size,
             [this, normalized](float progress) {
                 if (overlay_) {
@@ -1848,6 +1976,7 @@ LiveModeProcessor::Result App::transform_live_mode(const LiveModeProcessor::Requ
     const bool prompt_reasoning = request.mode == "ai" && cfg.llm_provider == "internal";
     cleaner_config.timeout_ms = (std::min)(cfg.llm_timeout_ms, prompt_reasoning ? 30000 : 12000);
     cleaner_config.max_tokens = (std::min)(cfg.llm_max_tokens, prompt_reasoning ? 4096 : 2048);
+    cleaner_config.api_key = read_llm_api_key(cfg, config_->get_config_path());
     LlmCleaner cleaner;
     cleaner.configure(cleaner_config);
     const std::string clean_prompt =
@@ -2045,6 +2174,12 @@ void App::refresh_live_mode_status() {
             {"state", key}, {"mode", mode}, {"revision_token", context.token},
             {"source_bytes", context.raw_text.size()}});
     };
+#ifndef _WIN32
+    if (context.waiting_for_focus) {
+        show("waiting_for_focus", "Väntar på fönstret",
+             L"Orden skrivs in när du går tillbaka till fönstret där du började.");
+    } else
+#endif
     if (context.pending_output) {
         show("editor_pending", "Skriver text...", L"Väntar på att textfältet bekräftar de senaste orden.");
     } else if (mode == "recorded") {
@@ -2111,6 +2246,17 @@ void App::start_recording() {
         tray_->show_notification("Pianissimo", "The speech model is unavailable. Select a model and try again.");
         return;
     }
+#ifndef _WIN32
+    // Gemma sleeps when idle (GemmaRuntime::start): wake it now, so it is loaded when the first phrase is ready.
+    if (const auto& c = config_->config(); c.llm_cleanup_enabled && c.llm_provider == "internal" &&
+        gemma_runtime_ && gemma_runtime_->running()) {
+        std::thread([port = c.llm_internal_port]() {
+            std::string reply;
+            platform::http_post_json("http://127.0.0.1:" + std::to_string(port) + "/v1/chat/completions",
+                R"({"messages":[{"role":"user","content":"OK"}],"max_tokens":1})", 15000, reply, "");
+        }).detach();
+    }
+#endif
     HWND target = GetForegroundWindow();
     DWORD target_pid = 0;
     GetWindowThreadProcessId(target, &target_pid);

@@ -1,0 +1,45 @@
+#pragma once
+// Hyprland IPC: the request socket hyprctl uses
+// ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock), spoken to
+// directly so no process has to be spawned per request.
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace vtt {
+namespace hyprland {
+
+// True when running inside a Hyprland session.
+bool available();
+
+// Sends one request (e.g. "j/activewindow", "eval <lua>") and returns the
+// reply. Returns false when Hyprland cannot be reached.
+bool request(const std::string& command, std::string& reply);
+
+// True when Hyprland runs a Lua config (0.5x+): "keyword" is refused there and
+// binds are added with "eval hl.bind(...)".
+bool uses_lua();
+
+// Path of the event socket (.socket2.sock), empty when not under Hyprland.
+std::string event_socket_path();
+
+// A Lua string literal.
+std::string lua_quote(const std::string& text);
+
+struct Window {
+    std::uintptr_t address = 0;   // Hyprland's window address
+    long pid = 0;
+    std::string window_class;     // lower case
+};
+
+// The focused window. False when there is none or Hyprland is not running.
+bool active_window(Window& window);
+// Looks a window up by address.
+bool find_window(std::uintptr_t address, Window& window);
+// Gives a window keyboard focus.
+bool focus_window(std::uintptr_t address);
+
+
+} // namespace hyprland
+} // namespace vtt

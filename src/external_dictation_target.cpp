@@ -1639,31 +1639,6 @@ bool ExternalDictationTarget::apply_revision(std::uint64_t token, const std::str
     });
 }
 
-bool ExternalDictationTarget::append_processed(std::uint64_t target_token, int utterance_id,
-                                              const std::string& transformed_text) {
-    if (!impl_->worker.joinable()) return false;
-    auto transformed = to_wide(transformed_text);
-    if (transformed.empty() || transformed.find(L'\0') != std::wstring::npos) return false;
-    return impl_->call([this, target_token, utterance_id, transformed = std::move(transformed)] {
-        impl_->observe(impl_->capture());
-        if (!impl_->previous || impl_->previous->kind != Impl::Kind::Append ||
-            impl_->target_token != target_token || !impl_->input_settled()) {
-            impl_->trace("revision_skipped", {{"reason", "processed_chunk_caret_changed"},
-                {"target_token", target_token}});
-            return false;
-        }
-        // A final background result may arrive after microphone capture ends.
-        // It retains the same guarded caret until a new session or user action.
-        const bool was_active = impl_->active;
-        impl_->active = true;
-        const bool delivered = impl_->update(utterance_id, transformed, true, target_token);
-        impl_->active = was_active;
-        if (delivered) impl_->trace("processed_chunk_appended", {{"target_token", target_token},
-            {"utterance_id", utterance_id}, {"characters", transformed.size()}});
-        return delivered;
-    });
-}
-
 std::string ExternalDictationTarget::text_utf8() const {
     std::lock_guard<std::mutex> lock(impl_->published_mutex);
     return impl_->published_text;
@@ -1672,11 +1647,6 @@ std::string ExternalDictationTarget::text_utf8() const {
 bool ExternalDictationTarget::has_delivered() const {
     std::lock_guard<std::mutex> lock(impl_->published_mutex);
     return impl_->published_delivered;
-}
-
-bool ExternalDictationTarget::is_available() const {
-    std::lock_guard<std::mutex> lock(impl_->published_mutex);
-    return impl_->published_available;
 }
 
 } // namespace vtt

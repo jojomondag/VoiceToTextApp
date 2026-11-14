@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/overlay_window.h.
+#ifndef _WIN32
+#include "linux/overlay_window.h"
+#else
 #include <array>
 #include <functional>
 #include <string>
@@ -64,3 +68,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

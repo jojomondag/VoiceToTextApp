@@ -1,6 +1,7 @@
 # Build directories
 build/
 build-cuda/
+build-smoke/
 dist/
 out/
 cmake-build-*/

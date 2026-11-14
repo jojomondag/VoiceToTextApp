@@ -1,4 +1,8 @@
 #pragma once
+// Win32 implementation; other platforms use src/linux/history_window.h.
+#ifndef _WIN32
+#include "linux/history_window.h"
+#else
 
 #include <string>
 #include <utility>
@@ -217,3 +221,4 @@ private:
 };
 
 } // namespace vtt
+#endif // _WIN32

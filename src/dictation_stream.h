@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace vtt {
@@ -31,6 +32,8 @@ private:
     std::size_t context_ = 0;
     std::size_t last_processed_ = 0;
     std::size_t last_voice_ = 0;
+    // Comparable keys of the last words a full window committed.
+    std::vector<std::string> committed_tail_;
     int utterance_ = 0;
     bool finished_ = false;
 };

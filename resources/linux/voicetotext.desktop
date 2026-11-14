@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=VoiceToText
+GenericName=Dictation
+Comment=Local speech-to-text dictation
+Exec=VoiceToText
+Icon=voicetotext
+Terminal=false
+Categories=Utility;AudioVideo;Audio;
+Keywords=dictation;speech;voice;whisper;
+StartupNotify=false

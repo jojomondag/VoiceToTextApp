@@ -26,6 +26,9 @@ public:
                 const std::string& intent_profile);
     void clear();
 
+    // Snapshot of all entries, oldest first.
+    std::vector<TranscriptHistoryEntry> entries() const;
+
     std::string format_recorded() const;
     std::string format_transcribed() const;
     std::string format_ai_language() const;
