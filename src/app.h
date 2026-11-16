@@ -8,6 +8,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
@@ -88,6 +89,7 @@ private:
     std::uint64_t save_dictation_to_history(const std::string& text);
     void enqueue_history_job(std::uint64_t entry_id, const std::string& recorded,
                              int attempts, bool backfill);
+    void schedule_history_backfill();
     void history_worker_loop();
     void run_history_job(const HistoryJob& job);
     bool wait_for_live_llm_idle();
@@ -196,6 +198,7 @@ private:
     std::thread history_thread_;
     std::atomic<bool> history_llm_busy_{false};
     std::unordered_set<std::uint64_t> history_jobs_queued_;
+    std::unordered_map<std::uint64_t, ULONGLONG> history_retry_at_;
     // Entry of the current dictation: saved when capture finished, handed to
     // the worker once its live output is done.
     std::uint64_t history_entry_id_ = 0;

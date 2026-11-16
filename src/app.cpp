@@ -40,10 +40,18 @@
 #define WM_DEFERRED_START (WM_APP + 11)
 #define AUDIO_LEVEL_TIMER 1
 #define GEMMA_IDLE_TIMER 2
+#define HISTORY_BACKFILL_TIMER 3
 // Gemma gives its graphics memory back after this long without work; the next recording starts it again.
 #define GEMMA_IDLE_MS 300000
 // After Stop, how long held words wait for their window to get focus again.
 #define LIVE_FOCUS_WAIT_MS 10000
+// How often History entries still waiting for the language model are retried.
+#define HISTORY_BACKFILL_TICK_MS 15000
+// First retry delay of a failed History entry; doubles per failure up to the cap.
+#define HISTORY_RETRY_BASE_MS 15000
+#define HISTORY_RETRY_MAX_MS 3600000
+// Failed attempts after which an entry keeps its recorded text as transcript.
+#define HISTORY_MAX_ATTEMPTS 10
 // A start pressed while the previous dictation finishes runs when that one is
 // handed off, if that happens within this time; later it is dropped.
 #define DEFERRED_START_MAX_MS 3000
@@ -71,6 +79,8 @@ struct OutputReady {
 struct HistoryJobDone {
     std::uint64_t id = 0;
     bool ok = false;       // filled in
+    bool skipped = false;  // not tried (the internal runtime is not running)
+    int attempts = 0;      // failed attempts so far
     bool learn = false;    // learn corrections from recorded -> cleaned
     std::string recorded, cleaned;
 };
@@ -753,7 +763,10 @@ bool App::initialize(HINSTANCE hInstance) {
     }
     transcript_history_->initialize(history_path.string(),
                                     cfg.transcript_history_max_entries);
+    // Entries still waiting for the language model (also from an earlier
+    // run) are picked up by the backfill timer.
     history_thread_ = std::thread([this]() { history_worker_loop(); });
+    SetTimer(hwnd_, HISTORY_BACKFILL_TIMER, HISTORY_BACKFILL_TICK_MS, nullptr);
 
     // --- 9. Initialize overlay ---
     overlay_ = std::make_unique<OverlayWindow>();
@@ -873,8 +886,9 @@ void App::shutdown() {
 #ifndef _WIN32
     if (hwnd_) KillTimer(hwnd_, GEMMA_IDLE_TIMER);
 #endif
+    if (hwnd_) KillTimer(hwnd_, HISTORY_BACKFILL_TIMER);
     // The History worker abandons a request in flight (its entry stays
-    // marked pending), so this returns at once.
+    // pending and is retried at the next start), so this returns at once.
     {
         std::lock_guard<std::mutex> lock(history_jobs_mutex_);
         history_worker_stop_ = true;
@@ -1034,6 +1048,7 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 self->apply_live_mode_results();
                 self->complete_live_capture();
             }
+            if (wParam == HISTORY_BACKFILL_TIMER) self->schedule_history_backfill();
 #ifndef _WIN32
             if (wParam == GEMMA_IDLE_TIMER && !self->recording_ && !self->processing_ &&
                 !self->history_llm_busy_ &&
@@ -1204,6 +1219,27 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // mode also reads them.
             if (done->learn && self->config_->config().llm_corrections_enabled && self->correction_store_)
                 self->correction_store_->learn_from(done->recorded, done->cleaned);
+            const ULONGLONG now = GetTickCount64();
+            if (done->ok) {
+                self->history_retry_at_.erase(done->id);
+                // The server answers again: retry the waiting entries now.
+                if (!self->history_retry_at_.empty()) {
+                    for (auto& retry : self->history_retry_at_) retry.second = 0;
+                    self->schedule_history_backfill();
+                }
+            } else if (done->skipped) {
+                self->history_retry_at_[done->id] = now + HISTORY_RETRY_BASE_MS;
+            } else if (done->attempts > 0) {
+                ULONGLONG delay = HISTORY_RETRY_BASE_MS;
+                for (int i = 1; i < done->attempts && delay < HISTORY_RETRY_MAX_MS; ++i) delay *= 2;
+                delay = (std::min<ULONGLONG>)(delay, HISTORY_RETRY_MAX_MS);
+                self->history_retry_at_[done->id] = now + delay;
+                vtlog("history: entry %llu attempt %d failed; next try in %llu s",
+                      static_cast<unsigned long long>(done->id), done->attempts,
+                      static_cast<unsigned long long>(delay / 1000));
+            } else {
+                self->history_retry_at_.erase(done->id); // gone, or no longer waiting
+            }
             return 0;
         }
 
@@ -2514,6 +2550,25 @@ void App::enqueue_history_job(std::uint64_t entry_id, const std::string& recorde
     history_jobs_cv_.notify_one();
 }
 
+// Queues History entries still waiting for the language model whose retry
+// time has come. Runs on the UI thread (timer, and after a success).
+void App::schedule_history_backfill() {
+    if (!transcript_history_ || !config_ || shutting_down_ ||
+        !config_->config().llm_cleanup_enabled) return;
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& entry : transcript_history_->entries()) {
+        if (!entry.llm_pending || !entry.id) continue;
+        // The current dictation is handed to the worker when it is finished.
+        if (live_session_active_ && entry.id == history_entry_id_) continue;
+        if (history_jobs_queued_.count(entry.id)) continue;
+        const auto retry = history_retry_at_.find(entry.id);
+        if (retry != history_retry_at_.end() && now < retry->second) continue;
+        vtlog("history: retrying entry %llu (attempts so far %d)",
+              static_cast<unsigned long long>(entry.id), entry.llm_attempts);
+        enqueue_history_job(entry.id, entry.recorded, entry.llm_attempts, true);
+    }
+}
+
 void App::history_worker_loop() {
     for (;;) {
         HistoryJob job;
@@ -2564,7 +2619,7 @@ void App::run_history_job(const HistoryJob& job) {
     const auto post_done = [this, &done]() {
         if (PostMessageW(hwnd_, WM_HISTORY_JOB_DONE, 0, reinterpret_cast<LPARAM>(done.get()))) done.release();
     };
-    if (!cfg.llm_cleanup_enabled) { post_done(); return; }
+    if (!cfg.llm_cleanup_enabled) { done->skipped = true; post_done(); return; }
 
     if (cfg.llm_provider == "internal") {
         // Gemma is the app's own server: check (and for a new dictation
@@ -2575,10 +2630,16 @@ void App::run_history_job(const HistoryJob& job) {
             if (shutting_down_.load()) return;
             Sleep(50);
         }
-        if ((!gemma_runtime_ || !gemma_runtime_->running()) && GetTickCount64() >= gemma_retry_after_)
-            ensure_internal_llm_runtime();
+        if (!gemma_runtime_ || !gemma_runtime_->running()) {
+            // A retry never starts Gemma by itself (it would hold graphics
+            // memory nobody asked for); it waits until a dictation has.
+            if (job.backfill) { done->skipped = true; post_done(); return; }
+            if (GetTickCount64() >= gemma_retry_after_) ensure_internal_llm_runtime();
+        }
         if (!gemma_runtime_ || !gemma_runtime_->running()) {
             work_lock.unlock();
+            done->attempts = transcript_history_->mark_failed(job.entry_id, HISTORY_MAX_ATTEMPTS);
+            if (done->attempts >= HISTORY_MAX_ATTEMPTS) done->attempts = 0;
             vtlog("history: entry %llu waits: Gemma is not running", static_cast<unsigned long long>(job.entry_id));
             post_done();
             return;
@@ -2623,13 +2684,15 @@ void App::run_history_job(const HistoryJob& job) {
     }
 
     // Both failing means the server did not answer (refused, timed out):
-    // the entry stays pending. One failing alone is a rejected result,
-    // which a retry would not change; it is kept as before.
+    // keep the entry pending for a retry. One failing alone is a rejected
+    // result, which a retry would not change; it is kept as before.
     const bool failed = !clean_ok && (!cfg.llm_ai_language_enabled || !ai_ok);
     if (failed) {
-        vtlog("history: entry %llu: language model failed after %lld ms (timeouts %d/%d ms); it stays pending",
+        done->attempts = transcript_history_->mark_failed(job.entry_id, HISTORY_MAX_ATTEMPTS);
+        vtlog("history: entry %llu: language model failed after %lld ms (timeouts %d/%d ms, attempt %d)",
               static_cast<unsigned long long>(job.entry_id), elapsed_ms(started),
-              cleaner_config.timeout_ms, ai_config.timeout_ms);
+              cleaner_config.timeout_ms, ai_config.timeout_ms, done->attempts);
+        if (done->attempts >= HISTORY_MAX_ATTEMPTS) done->attempts = 0;
     } else {
         if (!clean_ok) { cleaned = recorded; profile = "general"; }
         done->ok = transcript_history_->complete(job.entry_id, recorded, cleaned, ai_language, profile);

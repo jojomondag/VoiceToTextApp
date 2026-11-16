@@ -20,6 +20,7 @@ struct TranscriptHistoryEntry {
     // Entries without them (all older ones) are written back unchanged.
     std::uint64_t id = 0;
     bool llm_pending = false;
+    int llm_attempts = 0;
 };
 
 class TranscriptHistory {
@@ -39,6 +40,10 @@ public:
                   const std::string& transcribed,
                   const std::string& ai_language,
                   const std::string& intent_profile);
+    // Counts a failed language-model attempt. At `max_attempts` the entry
+    // stops waiting and keeps the recorded text as its transcript. Returns
+    // the attempt count, or -1 when the entry is gone or not pending.
+    int mark_failed(std::uint64_t id, int max_attempts);
     void clear();
 
     // Snapshot of all entries, oldest first.

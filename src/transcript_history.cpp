@@ -13,6 +13,8 @@
 namespace vtt {
 namespace {
 
+const std::string kPendingText = u8"(V\u00e4ntar p\u00e5 spr\u00e5kmodellen...)";
+
 std::string now_timestamp() {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -55,10 +57,13 @@ int estimate_token_count(const std::string& text) {
 
 void append_entry_text(std::ostringstream& oss,
                        const TranscriptHistoryEntry& entry,
-                       const std::string& text,
+                       const std::string& entry_text,
                        int display_index,
                        int token_count,
                        bool include_profile) {
+    // The language-model columns of an entry still being processed.
+    const std::string& text = include_profile && entry.llm_pending && entry_text.empty()
+        ? kPendingText : entry_text;
     oss << "[[VTT_ENTRY_BEGIN:" << display_index << "]]";
     oss << "[" << entry.timestamp << "]            ";
     if (include_profile) {
@@ -134,6 +139,23 @@ bool TranscriptHistory::complete(std::uint64_t id,
     entry->llm_pending = false;
     save_locked();
     return true;
+}
+
+int TranscriptHistory::mark_failed(std::uint64_t id, int max_attempts) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TranscriptHistoryEntry* entry = find_locked(id);
+    if (!entry || !entry->llm_pending) return -1;
+    ++entry->llm_attempts;
+    if (entry->llm_attempts >= max_attempts) {
+        // Give up: keep what the user said, as a failed cleanup always did.
+        entry->llm_pending = false;
+        if (entry->transcribed.empty()) {
+            entry->transcribed = entry->recorded;
+            entry->transcribed_tokens = entry->recorded_tokens;
+        }
+    }
+    save_locked();
+    return entry->llm_attempts;
 }
 
 void TranscriptHistory::trim_locked() {
@@ -228,6 +250,7 @@ bool TranscriptHistory::load() {
             }
             entry.id = item.value("id", static_cast<std::uint64_t>(0));
             entry.llm_pending = item.value("llm_pending", false);
+            entry.llm_attempts = item.value("llm_attempts", 0);
             if (entry.id >= next_id_) next_id_ = entry.id + 1;
             if (!entry.timestamp.empty()) entries_.push_back(entry);
         }
@@ -260,6 +283,7 @@ bool TranscriptHistory::save_locked() const {
         // these keys, so older entries are written exactly as before.
         if (entry.id != 0) item["id"] = entry.id;
         if (entry.llm_pending) item["llm_pending"] = true;
+        if (entry.llm_attempts > 0) item["llm_attempts"] = entry.llm_attempts;
         json.push_back(std::move(item));
     }
 
