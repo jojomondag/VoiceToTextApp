@@ -336,8 +336,9 @@ void hanging_server_respects_the_time_limit() {
         std::chrono::steady_clock::now() - started).count();
     require(!ok && vtt::LlmCleaner::last_failure() == "request_failed",
             "a request without an answer must fail as request_failed");
-    // WinHTTP rounds its time limits up to whole steps of about 4 s on
-    // current Windows 11 (1500 ms ends after about 4000 ms): allow for that.
+    // Measured on a Windows 11 test machine (build 26300): WinHTTP ended
+    // every time limit on whole steps of about 4 s (1500 ms after about
+    // 4000 ms), so the bound allows for that.
     require(ms >= 1300 && ms < 1500 + 4500, "the time limit was not honoured: " + std::to_string(ms) + " ms");
     std::cout << "PASS: hanging server -> request_failed after " << ms << " ms (limit 1500)\n";
     server.stop();
@@ -362,8 +363,9 @@ void refused_connection_fails_fast() {
     require(!cleaner.transform_text(kDictation, kPrompt, output), "a refused request must fail");
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
-    // Windows retries a refused TCP connection for about 2 s, once for the
-    // model-list probe and once for the completion.
+    // Measured on a Windows 11 test machine (build 26300): each refused
+    // exchange took about 2 s, once for the model-list probe and once for
+    // the completion.
     require(ms < 6000, "a refused connection took " + std::to_string(ms) + " ms");
     std::cout << "PASS: refused connection -> fails in " << ms << " ms\n";
 }
