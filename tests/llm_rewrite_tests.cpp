@@ -64,6 +64,76 @@ void reasoning_request_and_response() {
         output), "reasoning without final content must not replace raw dictation");
 }
 
+// Requests to a TensorFold server carry the fixed exchange in front of the
+// dictation; every other server keeps the plain body byte for byte. The
+// prime requests must send exactly the same prefix, or the cache misses.
+void cache_layout_request_bodies() {
+    vtt::LlmCleanerConfig settings;
+    settings.max_tokens = 4096;
+    require(vtt::build_request_body(settings, "Rewrite faithfully.", "Short request.") ==
+            R"({"chat_template_kwargs":{"enable_thinking":false},"max_tokens":512,)"
+            R"("messages":[{"content":"Rewrite faithfully.","role":"system"},)"
+            R"({"content":"Short request.","role":"user"}],"model":"local-model",)"
+            R"("stream":false,"temperature":0.1})",
+            "the plain request body must stay byte for byte as before");
+    vtt::LlmCleanerConfig hosted = settings;
+    hosted.endpoint = "https://api.deepseek.com/v1/chat/completions";
+    require(vtt::build_request_body(hosted, "Rewrite faithfully.", "Short request.", true) ==
+            R"({"max_tokens":4096,"messages":[{"content":"Rewrite faithfully.","role":"system"},)"
+            R"({"content":"Short request.","role":"user"}],"model":"local-model",)"
+            R"("stream":false,"temperature":0.1,"thinking":{"type":"enabled"}})",
+            "the hosted request body must stay byte for byte as before");
+
+    const std::string system_prompt = vtt::LlmCleaner::rewrite_system_prompt(
+        u8"Skriv om texten.\n\nLearned corrections:\n- \"a\" -> \"b\"");
+    require(system_prompt == std::string(u8"Skriv om texten.\n\nLearned corrections:\n- \"a\" -> \"b\"") +
+            vtt::rewrite_safeguards(), "transform_text and its prime share one prompt");
+    const auto request = nlohmann::json::parse(
+        vtt::build_request_body(settings, system_prompt, "Short request.", false, true));
+    const auto& messages = request.at("messages");
+    require(messages.size() == 4 && messages[0].at("role") == "system" &&
+            messages[0].at("content") == system_prompt && messages[1].at("role") == "user" &&
+            messages[2].at("role") == "assistant" && messages[3].at("role") == "user" &&
+            messages[3].at("content") == "Short request." && request.at("max_tokens") == 512,
+            "the cache layout puts the fixed exchange between prompt and dictation");
+    const auto plain = nlohmann::json::parse(
+        vtt::build_request_body(settings, system_prompt, "Short request."));
+    nlohmann::json plain_rest = plain, layout_rest = request;
+    plain_rest.erase("messages");
+    layout_rest.erase("messages");
+    require(plain_rest == layout_rest, "the cache layout changes only the messages");
+
+    const auto prefix = nlohmann::json(messages.begin(), messages.begin() + 3).dump();
+    for (int step = 0; step < 3; ++step) {
+        const auto prime = nlohmann::json::parse(
+            vtt::build_prime_body(settings, system_prompt, step, false));
+        const auto& sent = prime.at("messages");
+        require(prime.at("max_tokens") == 1 && prime.at("model") == request.at("model") &&
+                prime.at("chat_template_kwargs") == request.at("chat_template_kwargs"),
+                "a prime is a one-token request with the request's settings");
+        if (step == 0) {
+            require(sent.size() == 2 &&
+                    nlohmann::json(sent.begin(), sent.end()).dump() ==
+                    nlohmann::json(messages.begin(), messages.begin() + 2).dump(),
+                    "the first prime sends the prompt and the fixed user turn");
+        } else {
+            require(sent.size() == 4 &&
+                    nlohmann::json(sent.begin(), sent.begin() + 3).dump() == prefix &&
+                    sent[3].at("content") != messages[3].at("content"),
+                    "later primes send the request's exact prefix with a stand-in dictation");
+        }
+    }
+
+    require(vtt::models_url("http://127.0.0.1:30000/v1/chat/completions") ==
+            "http://127.0.0.1:30000/v1/models" && vtt::models_url("http://host/other").empty(),
+            "the model list lives next to the chat endpoint");
+    require(vtt::lists_tensorfold_model(R"({"data":[{"id":"m","owned_by":"tensorfold"}]})") &&
+            !vtt::lists_tensorfold_model(R"({"data":[{"id":"m","owned_by":"llamacpp"}]})") &&
+            !vtt::lists_tensorfold_model(R"({"data":[{"id":"mock"}]})") &&
+            !vtt::lists_tensorfold_model("not json"),
+            "only a model owned by tensorfold selects the cache layout");
+}
+
 void notation_validation() {
     const std::string source = u8"Bygg Teachers Little Helper för alla elever i klassrummet.";
     for (const auto& output : {"Bygg TLH:TA_ALL_STU.", "Bygg [PROGRAM].",
@@ -483,7 +553,8 @@ int main(int argc, char** argv) {
         prompt_migration();
         direct_typing_format();
         reasoning_request_and_response();
-        std::cout << "PASS: rewrite validation, prompt migration, direct-typing format and reasoning budgets\n";
+        cache_layout_request_bodies();
+        std::cout << "PASS: rewrite validation, prompt migration, direct-typing format, reasoning budgets and cache layout\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

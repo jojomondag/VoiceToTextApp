@@ -221,6 +221,37 @@ bool http_get_ok(const std::string& url, int timeout_ms) {
     return result == CURLE_OK;
 }
 
+long http_get(const std::string& url, int timeout_ms, std::string& response,
+              const std::string& bearer_token) {
+    response.clear();
+    ensure_curl();
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return 0;
+
+    curl_slist* headers = nullptr;
+    if (!bearer_token.empty()) {
+        headers = curl_slist_append(headers, ("Authorization: Bearer " + bearer_token).c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "VoiceToText/1.0");
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    long status = 0;
+    if (curl_easy_perform(curl) == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return status;
+}
+
 std::string find_program(const std::string& name) {
     const char* path = std::getenv("PATH");
     if (!path || name.empty()) return {};
