@@ -51,7 +51,9 @@
 #define HISTORY_RETRY_BASE_MS 15000
 #define HISTORY_RETRY_MAX_MS 3600000
 // Failed attempts after which an entry keeps its recorded text as transcript.
-#define HISTORY_MAX_ATTEMPTS 10
+#define HISTORY_MAX_ATTEMPTS 20
+// Attempts after which a result with only one of the two versions is kept.
+#define HISTORY_PARTIAL_RETRIES 2
 // A start pressed while the previous dictation finishes runs when that one is
 // handed off, if that happens within this time; later it is dropped.
 #define DEFERRED_START_MAX_MS 3000
@@ -1299,7 +1301,10 @@ void App::on_hotkey(HotkeyAction action) {
                 // selected mode's final rewrite); the History language model
                 // runs in the background. A start pressed meanwhile runs as
                 // soon as that dictation is handed off; a second press
-                // withdraws it.
+                // withdraws it. Linux only: commands arrive once per press
+                // there (with a double-press guard), while a held Win32
+                // hotkey repeats and would toggle the queued start.
+#ifndef _WIN32
                 if (live_session_active_ && !recording_.load() && !manual_output_requested_) {
                     if (start_after_handoff_) {
                         start_after_handoff_ = 0;
@@ -1310,6 +1315,7 @@ void App::on_hotkey(HotkeyAction action) {
                     }
                     break;
                 }
+#endif
                 vtlog("on_hotkey: ignored (processing in progress)");
                 break;
             }
@@ -2684,14 +2690,17 @@ void App::run_history_job(const HistoryJob& job) {
     }
 
     // Both failing means the server did not answer (refused, timed out):
-    // keep the entry pending for a retry. One failing alone is a rejected
-    // result, which a retry would not change; it is kept as before.
-    const bool failed = !clean_ok && (!cfg.llm_ai_language_enabled || !ai_ok);
+    // keep the entry pending for a retry. One failing alone may be a
+    // timeout too, so it is retried (with more time) on the first attempts;
+    // after that it is taken for a rejected result and kept as before.
+    const bool both_failed = !clean_ok && (!cfg.llm_ai_language_enabled || !ai_ok);
+    const bool one_failed = !both_failed && (!clean_ok || (cfg.llm_ai_language_enabled && !ai_ok));
+    const bool failed = both_failed || (one_failed && job.attempts < HISTORY_PARTIAL_RETRIES);
     if (failed) {
         done->attempts = transcript_history_->mark_failed(job.entry_id, HISTORY_MAX_ATTEMPTS);
-        vtlog("history: entry %llu: language model failed after %lld ms (timeouts %d/%d ms, attempt %d)",
-              static_cast<unsigned long long>(job.entry_id), elapsed_ms(started),
-              cleaner_config.timeout_ms, ai_config.timeout_ms, done->attempts);
+        vtlog("history: entry %llu: language model failed after %lld ms (clean=%d ai=%d, timeouts %d/%d ms, attempt %d)",
+              static_cast<unsigned long long>(job.entry_id), elapsed_ms(started), clean_ok ? 1 : 0,
+              ai_ok ? 1 : 0, cleaner_config.timeout_ms, ai_config.timeout_ms, done->attempts);
         if (done->attempts >= HISTORY_MAX_ATTEMPTS) done->attempts = 0;
     } else {
         if (!clean_ok) { cleaned = recorded; profile = "general"; }
