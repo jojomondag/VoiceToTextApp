@@ -19,6 +19,7 @@
 #include "log.h"
 #include "platform.h"
 #include <csignal>
+#include <cstdlib>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -2920,8 +2921,30 @@ void App::transcribe_live(unsigned long long session) {
     try {
         join_engine_warmup();
         DictationStream stream(config_->config().vad_threshold);
-        const auto publish = [this, session](int id, const std::string& text, bool final) {
+#ifndef _WIN32
+        // Test hook, inert unless the variable is set: the final results of
+        // the listed utterances (comma-separated ids) arrive empty, as when
+        // the speech model hears nothing in a phrase it previewed.
+        std::vector<int> empty_finals;
+        if (const char* list = std::getenv("VTT_TEST_EMPTY_FINALS")) {
+            for (const char* p = list; *p;) {
+                char* end = nullptr;
+                const long id = std::strtol(p, &end, 10);
+                if (end == p) { ++p; continue; }
+                empty_finals.push_back(static_cast<int>(id));
+                p = end;
+            }
+        }
+#endif
+        const auto publish = [&, session](int id, const std::string& published, bool final) {
             if (session != dictation_session_.load() || shutting_down_.load()) return;
+            std::string text = published;
+#ifndef _WIN32
+            if (final && std::find(empty_finals.begin(), empty_finals.end(), id) != empty_finals.end()) {
+                vtlog("test: final result of utterance %d emptied (%zu bytes)", id, text.size());
+                text.clear();
+            }
+#endif
             auto update = std::make_unique<DictationUpdate>(DictationUpdate{session, id, text, final});
             if (PostMessageW(hwnd_, WM_DICTATION_UPDATE, 0, reinterpret_cast<LPARAM>(update.get()))) update.release();
         };
