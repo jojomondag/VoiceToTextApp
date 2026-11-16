@@ -18,6 +18,8 @@
 namespace vtt {
 namespace {
 
+thread_local std::string t_last_failure;
+
 #ifdef _WIN32
 struct ParsedUrl {
     std::wstring host;
@@ -254,27 +256,32 @@ std::string build_request_body(const LlmCleanerConfig& config,
     return body.dump();
 }
 
-bool parse_cleaned_text(const std::string& response, std::string& output) {
+bool parse_cleaned_text(const std::string& response, std::string& output,
+                        std::string* failure = nullptr) {
+    const auto fail = [&](const std::string& reason) {
+        if (failure) *failure = reason;
+        return false;
+    };
     try {
         auto json = nlohmann::json::parse(response);
         const auto& choices = json.at("choices");
-        if (!choices.is_array() || choices.empty()) return false;
+        if (!choices.is_array() || choices.empty()) return fail("no_choices");
 
         // A partial rewrite cannot replace the full dictated span: doing so
         // would erase its unfinished tail. Let the caller keep the raw text.
         const std::string finish_reason = choices.at(0).value("finish_reason", "");
         if (finish_reason == "length" || finish_reason == "content_filter" ||
-            finish_reason == "error") return false;
+            finish_reason == "error") return fail("finish_reason_" + finish_reason);
 
         std::string content = choices.at(0).at("message").at("content")
                                   .get<std::string>();
         content = trim(content);
-        if (content.empty()) return false;
+        if (content.empty()) return fail("empty_content");
 
         output = content;
         return true;
     } catch (const nlohmann::json::exception&) {
-        return false;
+        return fail("unreadable_response");
     }
 }
 
@@ -486,10 +493,18 @@ bool LlmCleaner::transform_text(const std::string& input,
                                 bool enable_thinking) const {
     output.clear();
     std::string rewritten;
-    if (!request_completion(input, system_prompt + rewrite_safeguards(), rewritten, enable_thinking) ||
-        rewrite_has_invented_notation(input, rewritten)) return false;
+    if (!request_completion(input, system_prompt + rewrite_safeguards(), rewritten, enable_thinking))
+        return false;
+    if (rewrite_has_invented_notation(input, rewritten)) {
+        t_last_failure = "invented_notation";
+        return false;
+    }
     output = std::move(rewritten);
     return true;
+}
+
+const std::string& LlmCleaner::last_failure() {
+    return t_last_failure;
 }
 
 bool LlmCleaner::warm_up() const {
@@ -501,7 +516,11 @@ bool LlmCleaner::request_completion(const std::string& input,
                                     const std::string& system_prompt,
                                     std::string& output,
                                     bool enable_thinking) const {
-    if (!config_.enabled || input.empty()) return false;
+    t_last_failure.clear();
+    if (!config_.enabled || input.empty()) {
+        t_last_failure = "disabled_or_empty_input";
+        return false;
+    }
 
 #ifndef _WIN32
     const std::string request_body =
@@ -509,10 +528,13 @@ bool LlmCleaner::request_completion(const std::string& input,
     std::string reply;
     if (!platform::http_post_json(config_.endpoint, request_body,
                                   config_.timeout_ms, reply, config_.api_key)) {
+        // No connection, an HTTP error status, or the time limit.
+        t_last_failure = "request_failed";
         return false;
     }
-    return parse_cleaned_text(reply, output);
+    return parse_cleaned_text(reply, output, &t_last_failure);
 #else
+    t_last_failure = "request_failed"; // until a response has been read
     ParsedUrl url;
     if (!parse_url(config_.endpoint, url)) return false;
 
@@ -586,7 +608,8 @@ bool LlmCleaner::request_completion(const std::string& input,
     WinHttpCloseHandle(session);
 
     if (!ok || response.empty()) return false;
-    return parse_cleaned_text(response, output);
+    t_last_failure.clear();
+    return parse_cleaned_text(response, output, &t_last_failure);
 #endif
 }
 

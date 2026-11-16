@@ -481,14 +481,21 @@ struct ExternalDictationTarget::Impl {
     }
 
     // Selects `count` characters backwards from the caret and waits until the
-    // application reports exactly `expected` as selected.
-    bool select_and_verify(const std::wstring& expected) {
+    // application reports exactly `expected` as selected. On failure `stage`
+    // says which step failed and `seen` describes the last selection read.
+    bool select_and_verify(const std::wstring& expected, const char*& stage,
+                           nlohmann::json& seen) {
         const std::wstring wanted = comparable(expected);
         const auto selection_is = [&](const std::wstring& text, int wait_ms) {
             for (int waited = 0;; waited += 20) {
                 std::wstring selected;
-                if (get_primary_selection(selected) && comparable(selected) == text) return true;
-                if (waited >= wait_ms) return false;
+                const bool read = get_primary_selection(selected);
+                if (read && comparable(selected) == text) return true;
+                if (waited >= wait_ms) {
+                    // Lengths only: the selection holds the user's text.
+                    seen = {{"readable", read}, {"selected_chars", selected.size()}};
+                    return false;
+                }
                 platform::sleep_ms(20);
             }
         };
@@ -498,9 +505,12 @@ struct ExternalDictationTarget::Impl {
 
         // Probe with one character: a field that does not select this way
         // (a terminal inside an editor, a game) is left after a single key.
+        stage = "key";
         if (!send_key("Left", {"shift"}, 1)) return false;
+        stage = "probe";
         if (!selection_is(wanted.substr(wanted.size() - 1), 250)) return false;
 
+        stage = "key";
         std::size_t remaining = expected.size() - 1;
         while (remaining > 0) {
             const int batch = static_cast<int>((std::min)(remaining,
@@ -508,6 +518,7 @@ struct ExternalDictationTarget::Impl {
             if (!send_key("Left", {"shift"}, batch)) return false;
             remaining -= static_cast<std::size_t>(batch);
         }
+        stage = "span";
         return selection_is(wanted, 400 + static_cast<int>(expected.size()));
     }
 
@@ -616,15 +627,27 @@ struct ExternalDictationTarget::Impl {
     }
 
     bool replace_selected(const std::wstring& old_text, const std::wstring& new_text) {
-        if (!select_and_verify(old_text)) {
+        const char* stage = "";
+        nlohmann::json seen = nlohmann::json::object();
+        if (!select_and_verify(old_text, stage, seen)) {
             // Collapse whatever got selected back to the caret.
             send_key("Right");
-            trace("revision_rejected", {{"reason", "selection_did_not_match"},
-                                        {"expected_chars", old_text.size()}});
+            std::string window_class;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                window_class = target.window_class;
+            }
+            seen["reason"] = "selection_did_not_match";
+            seen["expected_chars"] = old_text.size();
+            seen["stage"] = stage;
+            seen["target_class"] = window_class;
+            trace("revision_rejected", seen);
             return false;
         }
-        if (new_text.empty()) return send_key("BackSpace");
-        return write_text(new_text);
+        const bool written = new_text.empty() ? send_key("BackSpace") : write_text(new_text);
+        trace("selection_revision", {{"replaced_chars", old_text.size()},
+                                     {"typed_chars", new_text.size()}, {"written", written}});
+        return written;
     }
 
     // Writes at the caret, over the selection if there is one. Ordinary text

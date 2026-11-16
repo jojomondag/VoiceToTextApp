@@ -2012,12 +2012,14 @@ LiveModeProcessor::Result App::transform_live_mode(const LiveModeProcessor::Requ
     }
     if (shutting_down_) return result;
     if (!cfg.llm_cleanup_enabled) {
+        if (request.mode != "warmup") vtlog("live mode %s: not prepared (language processing is off)", request.mode.c_str());
         result.error = "AI-bearbetning är inte aktiverad. Taltexten bevaras.";
         return result;
     }
     gemma_last_used_ = GetTickCount64();
     if (cfg.llm_provider == "internal" && (!gemma_runtime_ || !gemma_runtime_->running()) &&
         (GetTickCount64() < gemma_retry_after_ || !ensure_internal_llm_runtime())) {
+        if (request.mode != "warmup") vtlog("live mode %s: not prepared (the internal language model is not running)", request.mode.c_str());
         result.error = "Kunde inte starta Gemma. Taltexten bevaras.";
         return result;
     }
@@ -2059,6 +2061,9 @@ LiveModeProcessor::Result App::transform_live_mode(const LiveModeProcessor::Requ
         if (!cleaner.transform_text(request.raw_text, prompt, output, prompt_reasoning) || output.empty()) {
             output.clear();
             error = "AI-resultatet kunde inte användas. Din skrivna text har behållits.";
+            vtlog("live mode %s: rewrite not used (%s) after %lld ms, limit %d ms",
+                  request.mode.c_str(), cleaner.last_failure().empty() ? "empty_content" :
+                  cleaner.last_failure().c_str(), elapsed_ms(started), cleaner_config.timeout_ms);
         }
     };
     // Process only the selected mode, so its result never waits for the other

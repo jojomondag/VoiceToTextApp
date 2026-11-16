@@ -48,6 +48,10 @@ public:
                         std::string& output,
                         bool enable_thinking = false) const;
     bool warm_up() const;
+    // Why the calling thread's last request produced no usable text (empty
+    // after a success). Kept per thread, so a shared cleaner stays race-free.
+    // For diagnostics only.
+    static const std::string& last_failure();
 
 private:
     bool request_completion(const std::string& input,
