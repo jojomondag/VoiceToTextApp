@@ -43,7 +43,8 @@ public:
         bool available = false;
         // Words or a revision are still being written.
         bool pending_output = false;
-        // Words are held because the window they belong in lacks focus.
+        // Words or a language-mode result are held because the window they
+        // belong in lacks focus.
         bool waiting_for_focus = false;
     };
 
@@ -60,6 +61,9 @@ public:
     void poll_focus();
     void finish_session();
     void cancel_session();
+    // Gives up on words and language-mode results waiting for a window
+    // without focus; they are not written. Lasts until the next session.
+    void drop_held();
 
     // Only the last contiguous insertion belongs to dictation. A background
     // result may revise its raw prefix while later speech remains intact.

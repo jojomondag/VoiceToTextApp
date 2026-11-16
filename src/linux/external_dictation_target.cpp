@@ -209,6 +209,8 @@ struct ExternalDictationTarget::Impl {
     bool target_focused = true;
     // Words recognised but not typed yet (the target lacked focus).
     std::size_t held_updates = 0;
+    // A language-mode result is waiting for the target to get focus back.
+    bool revision_waiting = false;
     // The owned span: the speech it came from and what the editor holds for
     // it now. A revision rewrites a prefix of it; the rest is still as typed,
     // so span_raw.substr(revised_raw) == span_typed.substr(revised_typed).
@@ -223,6 +225,9 @@ struct ExternalDictationTarget::Impl {
     // One of this application's own windows has keyboard focus (set on the
     // UI thread; used where the compositor cannot tell us).
     std::atomic<bool> own_window_focused{false};
+    // The session stopped waiting for its window (drop_held): nothing more is
+    // written for it. Cleared when the next session begins.
+    std::atomic<bool> abandoned{false};
 
     // --- Worker-only state --------------------------------------------------
     LiveDictationBuffer buffer;
@@ -383,8 +388,6 @@ struct ExternalDictationTarget::Impl {
     // Types the next stable words of an utterance. True when it is done with
     // this hypothesis (typed, or nothing new in it).
     bool deliver(const Deferred& update) {
-        if (!refresh_target()) return false;
-
         std::wstring document;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -396,10 +399,13 @@ struct ExternalDictationTarget::Impl {
         auto replacement = next.apply(update.utterance, update.hypothesis, update.final,
                                       document, document.size(), document.size());
         if (!replacement || replacement->text.empty()) {
+            // Nothing to type (e.g. the empty last utterance after Stop): never
+            // a reason to hold the session for a window without focus.
             buffer = std::move(next);
             buffer.seal_current_insertion();
             return true;
         }
+        if (!refresh_target()) return false;
 
         // Pending only while keys are actually being sent, so the status does
         // not flicker between every preview.
@@ -558,13 +564,18 @@ struct ExternalDictationTarget::Impl {
             while (!refresh_target()) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    if (request_token != token || !have_target) return;
+                    if (request_token != token || !have_target || abandoned) {
+                        revision_waiting = false;
+                        return;
+                    }
+                    revision_waiting = true;
                 }
                 platform::sleep_ms(100);
             }
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (request_token != token || !can_replace_locked()) return;
+                revision_waiting = false;
+                if (request_token != token || !can_replace_locked() || abandoned) return;
             }
             written = old_tail.empty() ? write_text(new_tail)
                     : terminal ? replace_in_terminal(old_tail, new_tail)
@@ -688,6 +699,8 @@ void ExternalDictationTarget::begin_session() {
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->active = true;
+        impl_->abandoned = false;
+        impl_->revision_waiting = false;
         impl_->revoke_locked("new session");
         impl_->delivered_text.clear();
         impl_->delivered = false;
@@ -751,6 +764,15 @@ void ExternalDictationTarget::cancel_session() {
     });
 }
 
+void ExternalDictationTarget::drop_held() {
+    impl_->abandoned = true;
+    impl_->enqueue([this]() {
+        impl_->deferred.clear();
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->held_updates = 0;
+    });
+}
+
 ExternalDictationTarget::DictationRevision ExternalDictationTarget::revision_context() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     DictationRevision revision;
@@ -760,7 +782,8 @@ ExternalDictationTarget::DictationRevision ExternalDictationTarget::revision_con
     revision.can_replace = revision.readable_target;
     revision.available = impl_->have_target && !impl_->target_is_own;
     revision.pending_output = impl_->operations > 0 || impl_->held_updates > 0;
-    revision.waiting_for_focus = impl_->held_updates > 0 && !impl_->target_focused;
+    revision.waiting_for_focus =
+        (impl_->held_updates > 0 || impl_->revision_waiting) && !impl_->target_focused;
     if (revision.can_replace) revision.raw_text = to_utf8(impl_->owned_raw_locked());
     return revision;
 }
@@ -770,7 +793,8 @@ bool ExternalDictationTarget::apply_revision(std::uint64_t token,
                                              const std::string& transformed_text) {
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (token != impl_->token || !impl_->can_replace_locked() || impl_->span_raw.empty()) {
+        if (token != impl_->token || !impl_->can_replace_locked() || impl_->span_raw.empty() ||
+            impl_->abandoned) {
             return false;
         }
     }

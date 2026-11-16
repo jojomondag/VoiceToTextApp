@@ -37,6 +37,11 @@
 #define WM_MODEL_STATUS (WM_APP + 8)
 #define WM_LIVE_MODE_RESULT (WM_APP + 9)
 #define AUDIO_LEVEL_TIMER 1
+#define GEMMA_IDLE_TIMER 2
+// Gemma gives its graphics memory back after this long without work; the next recording starts it again.
+#define GEMMA_IDLE_MS 300000
+// After Stop, how long held words wait for their window to get focus again.
+#define LIVE_FOCUS_WAIT_MS 10000
 
 #ifdef _WIN32
 static const wchar_t* APP_CLASS_NAME = L"VoiceToTextMainWindow";
@@ -188,6 +193,25 @@ bool has_nvidia_driver() {
 }
 #endif
 
+
+// The system prompt of the AI-language rewrite: the user's prompt followed by
+// their text types (profiles), so the rewrite is written for what the
+// dictation is (an instruction to an agent, a mail, a translation request...).
+// The reply stays plain text; the profile is never named in it.
+std::string ai_language_system_prompt(const vtt::AppConfig& cfg) {
+    std::string prompt = cfg.llm_ai_language_prompt;
+    if (!cfg.llm_intent_profiles_enabled || cfg.llm_profiles.empty()) return prompt;
+    prompt += u8"\n\nTexttyper. Avgör först vilken typ diktatet är, efter vad texten själv är och inte efter "
+              u8"vilka ämnen den nämner. Typens anvisning beskriver resultatet användaren är ute efter: skriv "
+              u8"prompten så att den mottagande AI:n levererar just det. Nämn aldrig typen i svaret.\n";
+    for (const auto& profile : cfg.llm_profiles) {
+        if (profile.name.empty()) continue;
+        prompt += "- " + profile.name;
+        if (!profile.instructions.empty()) prompt += ": " + profile.instructions;
+        prompt += "\n";
+    }
+    return prompt;
+}
 
 // The API key of a hosted language model, read from the file named by
 // llm_api_key_file (relative to config.json). Empty when none is configured.
@@ -392,11 +416,12 @@ bool http_get_ok(const std::wstring& host,
     return ok && status_code >= 200 && status_code < 300;
 }
 
-bool wait_for_llm_server_ready(int port, DWORD timeout_ms, const std::atomic<bool>& stopping) {
+bool wait_for_llm_server_ready(int port, DWORD timeout_ms, const std::atomic<bool>& stopping,
+                               const vtt::GemmaRuntime& runtime) {
     auto start = std::chrono::steady_clock::now();
     while (std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - start).count() <
-           timeout_ms && !stopping.load()) {
+           timeout_ms && !stopping.load() && runtime.running()) {
         if (http_get_ok(L"127.0.0.1", static_cast<INTERNET_PORT>(port),
                         L"/health", 1500)) {
             return true;
@@ -427,16 +452,18 @@ bool download_large_file(const std::string& url,
     return ok;
 }
 
-bool wait_for_llm_server_ready(int port, DWORD timeout_ms, const std::atomic<bool>& stopping) {
+bool wait_for_llm_server_ready(int port, DWORD timeout_ms, const std::atomic<bool>& stopping,
+                               const vtt::GemmaRuntime& runtime) {
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/health";
     auto start = std::chrono::steady_clock::now();
     while (std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - start).count() <
-           static_cast<long long>(timeout_ms) && !stopping.load()) {
+           static_cast<long long>(timeout_ms) && !stopping.load() && runtime.running()) {
         if (vtt::platform::http_get_ok(url, 1500)) {
             return true;
         }
-        Sleep(1000);
+        // Short steps: Gemma starts at each recording after an idle stop.
+        Sleep(250);
     }
     return false;
 }
@@ -585,9 +612,9 @@ bool App::initialize(HINSTANCE hInstance) {
     });
 
     // Register hotkeys from config.
-    // NOTE: CancelRecording (ESC by default) is registered *only* while
-    // recording or its final live processing is active. A bare-ESC hotkey would swallow
-    // every ESC press system-wide and break the key in other applications.
+    // NOTE: CancelRecording (ESC by default) is registered *only* while the
+    // microphone records; stop_recording() releases it. A bare-ESC hotkey swallows
+    // every ESC press system-wide and breaks the key in other applications.
     const bool toggle_registered = hotkeys_->register_hotkey(HotkeyAction::ToggleRecording,
                               cfg.toggle_modifiers, cfg.toggle_key);
     vtlog("recording hotkey registered=%d (error=%lu)", toggle_registered ? 1 : 0,
@@ -668,6 +695,9 @@ bool App::initialize(HINSTANCE hInstance) {
         warmup.urgent = true;
         live_mode_processor_->submit(std::move(warmup));
     }
+#ifndef _WIN32
+    SetTimer(hwnd_, GEMMA_IDLE_TIMER, 30000, nullptr);
+#endif
     dictation_window_->set_stop_callback([this]() { stop_recording(); });
     dictation_window_->set_accept_callback([this](const std::string& text) {
         if (recording_.load() || processing_.load() || text.empty()) return;
@@ -731,6 +761,9 @@ void App::shutdown() {
     if (audio_) audio_->stop_recording();
     if (external_dictation_) external_dictation_->cancel_session();
     if (hwnd_) KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
+#ifndef _WIN32
+    if (hwnd_) KillTimer(hwnd_, GEMMA_IDLE_TIMER);
+#endif
     // Stop capture before waiting for the live worker.
     if (process_thread_.joinable()) {
         process_thread_.join();
@@ -883,6 +916,16 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 self->apply_live_mode_results();
                 self->complete_live_capture();
             }
+#ifndef _WIN32
+            if (wParam == GEMMA_IDLE_TIMER && !self->recording_ && !self->processing_ &&
+                GetTickCount64() - self->gemma_last_used_ >= GEMMA_IDLE_MS) {
+                std::unique_lock<std::mutex> work_lock(self->llm_work_mutex_, std::try_to_lock);
+                if (work_lock.owns_lock() && self->gemma_runtime_ && self->gemma_runtime_->running()) {
+                    self->gemma_runtime_->stop();
+                    vtlog("gemma runtime: stopped after %d idle minutes", GEMMA_IDLE_MS / 60000);
+                }
+            }
+#endif
             return 0;
 
         case WM_LIVE_MODE_RESULT: {
@@ -1412,8 +1455,20 @@ bool App::ensure_internal_llm_runtime() {
 
     vtlog("gemma runtime: process started %s on port %d, waiting for readiness",
           model_path.c_str(), cfg.llm_internal_port);
-    if (!wait_for_llm_server_ready(cfg.llm_internal_port, 180000, shutting_down_)) {
+    if (!wait_for_llm_server_ready(cfg.llm_internal_port, 180000, shutting_down_, *gemma_runtime_)) {
         if (shutting_down_) { gemma_runtime_->stop(); return false; }
+        if (!gemma_runtime_->running()) {
+            // Usually no room in the graphics memory. Dictation asks again for every phrase: wait a little.
+            gemma_retry_after_ = GetTickCount64() + 30000;
+            vtlog("gemma runtime: llama-server stopped while loading the model");
+            if (tray_) {
+                tray_->show_notification("Gemma start failed",
+                                         "llama-server stopped while loading the model. "
+                                         "The graphics memory may be full.");
+            }
+            gemma_runtime_->stop();
+            return false;
+        }
         vtlog("gemma runtime: readiness timed out on port %d",
               cfg.llm_internal_port);
         if (tray_) {
@@ -1440,9 +1495,10 @@ bool App::ensure_internal_llm_runtime() {
         auto prime_start = std::chrono::steady_clock::now();
         std::string primed;
         llm_cleaner_->transform_text(u8"Det h\u00e4r \u00e4r ett kort test av dikteringen.",
-                                     cfg.llm_ai_language_prompt, primed);
+                                     ai_language_system_prompt(cfg), primed);
         vtlog("gemma runtime: first full request took %lld ms", elapsed_ms(prime_start));
     }
+    gemma_last_used_ = GetTickCount64();
     return true;
 }
 
@@ -1959,8 +2015,9 @@ LiveModeProcessor::Result App::transform_live_mode(const LiveModeProcessor::Requ
         result.error = "AI-bearbetning är inte aktiverad. Taltexten bevaras.";
         return result;
     }
+    gemma_last_used_ = GetTickCount64();
     if (cfg.llm_provider == "internal" && (!gemma_runtime_ || !gemma_runtime_->running()) &&
-        !ensure_internal_llm_runtime()) {
+        (GetTickCount64() < gemma_retry_after_ || !ensure_internal_llm_runtime())) {
         result.error = "Kunde inte starta Gemma. Taltexten bevaras.";
         return result;
     }
@@ -2009,7 +2066,7 @@ LiveModeProcessor::Result App::transform_live_mode(const LiveModeProcessor::Requ
     if (request.mode == "clean") {
         prepare(clean_prompt, result.cleaned_text, result.clean_error);
     } else if (request.mode == "ai") {
-        prepare(cfg.llm_ai_language_prompt, result.ai_text, result.ai_error);
+        prepare(ai_language_system_prompt(cfg), result.ai_text, result.ai_error);
     }
     vtlog("prepared live mode: mode=%s source=%zu clean=%zu ai=%zu duration=%lld ms",
           request.mode.c_str(), request.raw_text.size(), result.cleaned_text.size(),
@@ -2207,7 +2264,33 @@ void App::refresh_live_mode_status() {
 void App::complete_live_capture() {
     if (!live_capture_finished_) return;
     const auto waiting_for_output = [this] {
-        if (!external_dictation_->revision_context().pending_output) return false;
+        const auto context = external_dictation_->revision_context();
+        if (!context.pending_output) return false;
+#ifndef _WIN32
+        if (context.waiting_for_focus) {
+            // Stop was pressed (or the last words or the language-mode result
+            // arrived) while another window had focus. Wait a short while for
+            // the user to come back, then let go: what was not written stays in
+            // History, and the next dictation is not blocked by a window the
+            // user may never return to.
+            const ULONGLONG now = GetTickCount64();
+            if (!live_focus_wait_started_) live_focus_wait_started_ = now;
+            if (!live_focus_wait_expired_ && now - live_focus_wait_started_ >= LIVE_FOCUS_WAIT_MS) {
+                live_focus_wait_expired_ = true;
+                vtlog("dictation target: gave up waiting for the window after %d s; unwritten text goes to History only",
+                      LIVE_FOCUS_WAIT_MS / 1000);
+                if (dictation_diagnostics_) dictation_diagnostics_->write("held_output_dropped", {
+                    {"capture_session", dictation_session_.load()}});
+                external_dictation_->drop_held();
+                tray_->show_notification("VoiceToText",
+                    "Fönstret där du dikterade fick inte fokus, så det sista skrevs inte in. Hela dikteringen finns i Historik.");
+            }
+            overlay_->set_status_text("Väntar på fönstret");
+            dictation_window_->set_status(
+                L"Väntar på fönstret där du började. Går du inte tillbaka sparas texten bara i Historik.");
+            return true;
+        }
+#endif
         overlay_->set_status_text("Väntar på textfältet...");
         dictation_window_->set_status(L"Väntar på textfältet. De sista orden finns kvar i kön.");
         return true;
@@ -2246,17 +2329,6 @@ void App::start_recording() {
         tray_->show_notification("Pianissimo", "The speech model is unavailable. Select a model and try again.");
         return;
     }
-#ifndef _WIN32
-    // Gemma sleeps when idle (GemmaRuntime::start): wake it now, so it is loaded when the first phrase is ready.
-    if (const auto& c = config_->config(); c.llm_cleanup_enabled && c.llm_provider == "internal" &&
-        gemma_runtime_ && gemma_runtime_->running()) {
-        std::thread([port = c.llm_internal_port]() {
-            std::string reply;
-            platform::http_post_json("http://127.0.0.1:" + std::to_string(port) + "/v1/chat/completions",
-                R"({"messages":[{"role":"user","content":"OK"}],"max_tokens":1})", 15000, reply, "");
-        }).detach();
-    }
-#endif
     HWND target = GetForegroundWindow();
     DWORD target_pid = 0;
     GetWindowThreadProcessId(target, &target_pid);
@@ -2282,6 +2354,18 @@ void App::start_recording() {
         config_->save();
     }
     refresh_live_mode_settings();
+#ifndef _WIN32
+    // The idle timer may have stopped Gemma: start it now, so it is loaded when the first phrase is ready.
+    if (cfg.llm_cleanup_enabled && cfg.llm_provider == "internal") {
+        LiveModeProcessor::Request warmup;
+        warmup.session = session;
+        warmup.mode_generation = live_mode_generation_;
+        warmup.mode = "warmup";
+        warmup.raw_text = "OK";
+        warmup.urgent = true;
+        live_mode_processor_->submit(std::move(warmup));
+    }
+#endif
     last_live_token_ = 0;
     last_live_raw_.clear();
     live_capture_finished_ = false;
@@ -2296,6 +2380,8 @@ void App::start_recording() {
     mode_switch_policy_.clear();
     live_results_.clear();
     live_result_wait_started_ = 0;
+    live_focus_wait_started_ = 0;
+    live_focus_wait_expired_ = false;
     vtlog("direct dictation started: session=%llu", session);
     if (dictation_diagnostics_) dictation_diagnostics_->write("capture_started", {
         {"capture_session", session}, {"model", current_model_size()}});
@@ -2328,6 +2414,9 @@ void App::stop_recording() {
     audio_->stop_recording();
     recording_ = false;
     processing_ = true;
+    // Give ESC back now. The final processing can wait a long time for the text
+    // field (e.g. hidden behind an editor), and ESC must work everywhere meanwhile.
+    hotkeys_->unregister_hotkey(HotkeyAction::CancelRecording);
     if (tray_) tray_->set_recording(false);
     live_status_key_.clear();
     if (overlay_) overlay_->show(OverlayState::Processing, "Slutför dikteringen...");
@@ -2403,7 +2492,9 @@ void App::process_text(std::string text, unsigned long long session) {
             cfg = live_settings_;
         }
         if (!output->recorded.empty() && cfg.llm_cleanup_enabled && llm_cleaner_) {
-            if (cfg.llm_provider == "internal" && (!gemma_runtime_ || !gemma_runtime_->running()))
+            gemma_last_used_ = GetTickCount64();
+            if (cfg.llm_provider == "internal" && (!gemma_runtime_ || !gemma_runtime_->running()) &&
+                GetTickCount64() >= gemma_retry_after_)
                 ensure_internal_llm_runtime();
             configure_llm_cleaner();
             std::string corrections;
@@ -2420,7 +2511,7 @@ void App::process_text(std::string text, unsigned long long session) {
             // Build both versions from the original. Otherwise a proofreading
             // guess becomes an apparently supplied requirement in the prompt.
             if (cfg.llm_ai_language_enabled)
-                llm_cleaner_->transform_text(output->recorded, cfg.llm_ai_language_prompt,
+                llm_cleaner_->transform_text(output->recorded, ai_language_system_prompt(cfg),
                                              output->ai_language, cfg.llm_provider == "internal");
         }
         const std::string mode = normalize_paste_output_mode(cfg.paste_output_mode);

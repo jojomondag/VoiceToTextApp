@@ -146,6 +146,8 @@ private:
     std::string applied_live_raw_;
     std::string live_status_key_;
     ULONGLONG live_result_wait_started_ = 0;
+    ULONGLONG live_focus_wait_started_ = 0;
+    bool live_focus_wait_expired_ = false;
     ULONGLONG last_live_mode_poll_ = 0;
     bool live_session_active_ = false;
     bool live_capture_finished_ = false;
@@ -157,6 +159,8 @@ private:
     AppConfig live_settings_;
     std::string live_corrections_;
     std::mutex llm_work_mutex_;
+    std::atomic<ULONGLONG> gemma_last_used_{0};
+    ULONGLONG gemma_retry_after_ = 0; // guarded by llm_work_mutex_
     std::atomic<bool> live_llm_busy_{false};
     std::thread process_thread_;
     std::thread model_download_thread_;

@@ -211,6 +211,10 @@ struct OnnxModel {
         Ort::SessionOptions options;
         options.SetIntraOpNumThreads(threads > 0 ? threads : std::clamp(static_cast<int>(std::thread::hardware_concurrency() / 2), 1, 6));
         options.SetInterOpNumThreads(1);
+        // Idle worker threads sleep instead of spinning. Spinning cost 3-4x the
+        // CPU time, and on a busy machine it starved the recogniser itself:
+        // Stop took 10-17 s to drain at load 100, against 0.5 s without it.
+        options.AddConfigEntry("session.intra_op.allow_spinning", "0");
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         const auto suffix = quantization == "fp32" ? std::string() : "." + quantization;
         preprocessor = Ort::Session(environment, (directory / "nemo128.onnx").c_str(), options);
