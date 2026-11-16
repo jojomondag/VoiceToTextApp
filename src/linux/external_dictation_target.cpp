@@ -31,6 +31,8 @@ namespace {
 // Longer spans are left alone: selecting them key by key takes too long.
 constexpr std::size_t kSpanLimit = 3000;
 constexpr int kKeysPerBatch = 150;
+// The longest text selected forwards (see select_and_verify).
+constexpr std::size_t kForwardSelectLimit = 400;
 
 std::wstring to_wide(const std::string& text) {
     std::wstring result;
@@ -540,6 +542,14 @@ struct ExternalDictationTarget::Impl {
         // serves nothing; select the same characters forwards there. Any
         // other failure (nothing claimed, other text) is refused as before.
         if (!(seen.value("readable", false) && seen.value("selected_chars", 1) == 0)) {
+            return false;
+        }
+        // Such an entry takes longer per cursor key the longer its line is
+        // (measured: about 3 ms at 700 characters, 22 ms at 2100), and this
+        // needs twice the keys; past this length the application would stall
+        // for many seconds, so the rewrite is refused instead.
+        if (expected.size() > kForwardSelectLimit) {
+            stage = "forward_limit";
             return false;
         }
         stage = "key";
