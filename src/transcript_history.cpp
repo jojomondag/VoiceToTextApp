@@ -93,13 +93,62 @@ void TranscriptHistory::append(const std::string& recorded,
         estimate_token_count(transcribed),
         estimate_token_count(ai_language),
     });
+    trim_locked();
+    save_locked();
+}
 
+std::uint64_t TranscriptHistory::append_pending(const std::string& recorded) {
+    if (recorded.empty()) return 0;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    TranscriptHistoryEntry entry;
+    entry.timestamp = now_timestamp();
+    entry.recorded = recorded;
+    entry.recorded_tokens = estimate_token_count(recorded);
+    entry.id = next_id_++;
+    entry.llm_pending = true;
+    entries_.push_back(std::move(entry));
+    const std::uint64_t id = entries_.back().id;
+    trim_locked();
+    save_locked();
+    return id;
+}
+
+bool TranscriptHistory::complete(std::uint64_t id,
+                                 const std::string& recorded,
+                                 const std::string& transcribed,
+                                 const std::string& ai_language,
+                                 const std::string& intent_profile) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TranscriptHistoryEntry* entry = find_locked(id);
+    if (!entry) return false;
+    if (!recorded.empty()) {
+        entry->recorded = recorded;
+        entry->recorded_tokens = estimate_token_count(recorded);
+    }
+    entry->transcribed = transcribed;
+    entry->ai_language = ai_language;
+    entry->intent_profile = intent_profile.empty() ? "general" : intent_profile;
+    entry->transcribed_tokens = estimate_token_count(transcribed);
+    entry->ai_language_tokens = estimate_token_count(ai_language);
+    entry->llm_pending = false;
+    save_locked();
+    return true;
+}
+
+void TranscriptHistory::trim_locked() {
     if (static_cast<int>(entries_.size()) > max_entries_) {
         entries_.erase(entries_.begin(),
                        entries_.begin() + (entries_.size() - max_entries_));
     }
+}
 
-    save_locked();
+TranscriptHistoryEntry* TranscriptHistory::find_locked(std::uint64_t id) {
+    if (id == 0) return nullptr;
+    for (auto& entry : entries_) {
+        if (entry.id == id) return &entry;
+    }
+    return nullptr;
 }
 
 void TranscriptHistory::clear() {
@@ -177,6 +226,9 @@ bool TranscriptHistory::load() {
             if (entry.ai_language_tokens <= 0) {
                 entry.ai_language_tokens = estimate_token_count(entry.ai_language);
             }
+            entry.id = item.value("id", static_cast<std::uint64_t>(0));
+            entry.llm_pending = item.value("llm_pending", false);
+            if (entry.id >= next_id_) next_id_ = entry.id + 1;
             if (!entry.timestamp.empty()) entries_.push_back(entry);
         }
         return true;
@@ -194,7 +246,7 @@ bool TranscriptHistory::save_locked() const {
 
     nlohmann::json json = nlohmann::json::array();
     for (const auto& entry : entries_) {
-        json.push_back({
+        nlohmann::json item = {
             {"timestamp", entry.timestamp},
             {"recorded", entry.recorded},
             {"transcribed", entry.transcribed},
@@ -203,12 +255,31 @@ bool TranscriptHistory::save_locked() const {
             {"recorded_tokens", entry.recorded_tokens},
             {"transcribed_tokens", entry.transcribed_tokens},
             {"ai_language_tokens", entry.ai_language_tokens},
-        });
+        };
+        // Only entries made by the background language-model step carry
+        // these keys, so older entries are written exactly as before.
+        if (entry.id != 0) item["id"] = entry.id;
+        if (entry.llm_pending) item["llm_pending"] = true;
+        json.push_back(std::move(item));
     }
 
-    std::ofstream file(path_);
-    if (!file.is_open()) return false;
-    file << json.dump(4) << std::endl;
+    // Write a temporary file and rename it over the old one, so an exit in
+    // the middle of a save never leaves a torn file (which load() would
+    // reject, and the next save would then replace with an empty history).
+    const std::string temp_path = path_ + ".tmp";
+    {
+        std::ofstream file(temp_path);
+        if (!file.is_open()) return false;
+        file << json.dump(4) << std::endl;
+        file.flush();
+        if (!file.good()) return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp_path, path_, ec);
+    if (ec) {
+        std::filesystem::remove(temp_path, ec);
+        return false;
+    }
     return true;
 }
 
