@@ -135,6 +135,7 @@ else()
         src/linux/main.cpp
         src/linux/win_compat.cpp
         src/linux/platform_linux.cpp
+        src/linux/process_priority.cpp
         src/linux/hyprland_ipc.cpp
         src/linux/wayland_input.cpp
         src/linux/virtual_keyboard.cpp

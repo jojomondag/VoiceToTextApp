@@ -1,5 +1,6 @@
 #include "app.h"
 #include "app_icon.h"
+#include "process_priority.h"
 
 #include <QApplication>
 #include <QMessageBox>
@@ -187,6 +188,7 @@ int main(int argc, char** argv) {
     if (send_command("ping")) return 0;
 
     int server_fd = open_server_socket();
+    vtt::raise_own_cpu_weight();
 
     QApplication qt_app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("VoiceToText"));
