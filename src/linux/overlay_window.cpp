@@ -1,6 +1,7 @@
 #include "overlay_window.h"
 
 #include "../../resources/version.h"
+#include "log.h"
 #include "platform.h"
 #include "ui_thread.h"
 
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <vector>
@@ -31,6 +33,8 @@ namespace {
 constexpr int OVERLAY_WIDTH = 500;
 constexpr int OVERLAY_HEIGHT = 140;
 constexpr int OVERLAY_COMPACT_HEIGHT = 60;
+constexpr int OVERLAY_QUEUED_HEIGHT = 86; // compact plus the queued-start line
+constexpr int QUEUED_LINE_HEIGHT = 20;
 constexpr int OVERLAY_TOP = 20;
 constexpr int DOT_RADIUS = 10;
 constexpr int CORNER_RADIUS = 20;
@@ -73,6 +77,8 @@ const QColor COLOR_LISTENING(66, 133, 244);
 const QColor COLOR_PROCESSING(251, 188, 4);
 const QColor COLOR_ERROR(234, 67, 53);
 const QColor COLOR_TEXT(255, 255, 255);
+
+const char* const QUEUED_START_TEXT = u8"Ny diktering startar efteråt · tryck igen för att ångra";
 
 float clampf(float value, float low, float high) {
     if (value < low) return low;
@@ -233,9 +239,12 @@ public:
     }
 
     std::function<void(const std::string&)> on_mode_selected;
+    // Mirrors queued_start_ for OverlayWindow::queued_start_shown().
+    std::atomic<bool>* queued_start_flag = nullptr;
 
     void present(OverlayState state, const std::string& text) {
         dismiss_tooltip();
+        if (state != OverlayState::Processing) clear_queued_start("state changed");
         state_ = state;
         text_ = QString::fromStdString(text);
         progress_ = 0.0f;
@@ -248,9 +257,7 @@ public:
             return;
         }
 
-        const int height = state_ == OverlayState::Processing ? OVERLAY_COMPACT_HEIGHT
-                                                              : OVERLAY_HEIGHT;
-        if (this->height() != height) setFixedSize(OVERLAY_WIDTH, height);
+        resize_for_state();
 
         if (!layer_shell_) {
             // No layer shell: best effort, top centre of the primary screen.
@@ -266,6 +273,7 @@ public:
 
     void dismiss() {
         dismiss_tooltip();
+        clear_queued_start("overlay hidden");
         state_ = OverlayState::Hidden;
         hover_button_ = -1;
         if (isVisible()) QWidget::hide();
@@ -303,6 +311,26 @@ public:
     void set_paste_output_mode(const std::string& mode) {
         paste_output_mode_ = normalize_paste_mode(mode);
         if (isVisible()) update();
+    }
+
+    // Only marked while the Processing pill is on screen; otherwise nobody
+    // would see it, and the caller treats the start as not shown.
+    void set_queued_start(bool queued) {
+        if (!queued) {
+            clear_queued_start("withdrawn");
+            return;
+        }
+        if (!isVisible() || state_ != OverlayState::Processing) {
+            vtlog("overlay: queued start not shown (visible=%d state=%d)",
+                  isVisible() ? 1 : 0, static_cast<int>(state_));
+            return;
+        }
+        if (queued_start_) return;
+        queued_start_ = true;
+        if (queued_start_flag) queued_start_flag->store(true);
+        resize_for_state();
+        update();
+        vtlog("overlay: queued start shown (pill %dx%d)", width(), height());
     }
 
 protected:
@@ -405,6 +433,26 @@ protected:
                    g.fontMetrics().elidedText(display_text, Qt::ElideRight,
                                               static_cast<int>(use_width + 1.0)));
 
+        if (state_ == OverlayState::Processing && queued_start_) {
+            // The next dictation waits for this one: a small blue dot (the
+            // listening colour) and one line under the processing text.
+            const qreal line_y = OVERLAY_COMPACT_HEIGHT - 6.0;
+            g.setPen(Qt::NoPen);
+            g.setBrush(COLOR_LISTENING);
+            g.drawEllipse(QPointF(dot_x, line_y + QUEUED_LINE_HEIGHT / 2.0), 5.0, 5.0);
+            QFont queued_font = this->font();
+            queued_font.setPixelSize(14);
+            g.setFont(queued_font);
+            g.setPen(with_alpha(COLOR_TEXT, 220));
+            const QRectF line_rect(left_bound, line_y, OVERLAY_WIDTH - PADDING - left_bound,
+                                   QUEUED_LINE_HEIGHT);
+            g.drawText(line_rect, Qt::AlignLeft | Qt::AlignVCenter,
+                       g.fontMetrics().elidedText(QString::fromUtf8(QUEUED_START_TEXT),
+                                                  Qt::ElideRight,
+                                                  static_cast<int>(line_rect.width())));
+            g.setFont(font);
+        }
+
         if (state_ == OverlayState::Downloading) {
             const qreal bar_x = PADDING;
             const qreal bar_y = OVERLAY_HEIGHT - PADDING - 22;
@@ -502,6 +550,22 @@ protected:
     }
 
 private:
+    void clear_queued_start(const char* reason) {
+        if (queued_start_flag) queued_start_flag->store(false);
+        if (!queued_start_) return;
+        queued_start_ = false;
+        vtlog("overlay: queued start mark removed (%s)", reason);
+        resize_for_state();
+        if (isVisible()) update();
+    }
+
+    void resize_for_state() {
+        const int height = state_ != OverlayState::Processing ? OVERLAY_HEIGHT
+                           : queued_start_ ? OVERLAY_QUEUED_HEIGHT
+                                           : OVERLAY_COMPACT_HEIGHT;
+        if (this->height() != height) setFixedSize(OVERLAY_WIDTH, height);
+    }
+
     int hit_test(const QPoint& point) const {
         for (int i = 0; i < PASTE_BUTTON_COUNT; ++i) {
             if (button_rects_[i].contains(point)) return i;
@@ -575,6 +639,7 @@ private:
     std::array<QImage, PASTE_BUTTON_COUNT> icons_;
     std::array<QImage, PASTE_BUTTON_COUNT> faded_icons_;
     int hover_button_ = -1;
+    bool queued_start_ = false;
     QElapsedTimer clock_;
     QTimer tooltip_timer_;
     TooltipWidget tooltip_;
@@ -589,6 +654,8 @@ struct OverlayWindow::State {
     // Remembered so they can be set before the window exists.
     std::string paste_output_mode = "clean";
     std::function<void(const std::string&)> callback;
+    // Set and cleared by the widget on the UI thread; read by the app core.
+    std::atomic<bool> queued_start_shown{false};
 };
 
 OverlayWindow::OverlayWindow() : state_(std::make_shared<State>()) {}
@@ -602,6 +669,7 @@ bool OverlayWindow::initialize(HINSTANCE /*hInstance*/) {
         state_->widget = new OverlayWidget();
         state_->widget->set_paste_output_mode(state_->paste_output_mode);
         state_->widget->on_mode_selected = state_->callback;
+        state_->widget->queued_start_flag = &state_->queued_start_shown;
     }
     return true;
 }
@@ -648,6 +716,20 @@ void OverlayWindow::set_paste_output_mode(const std::string& mode) {
         state->paste_output_mode = mode;
         if (state->widget) state->widget->set_paste_output_mode(mode);
     });
+}
+
+void OverlayWindow::set_queued_start(bool queued) {
+    ui::run([state = state_, queued]() {
+        if (state->widget) {
+            state->widget->set_queued_start(queued);
+        } else if (queued) {
+            vtlog("overlay: queued start not shown (overlay turned off)");
+        }
+    });
+}
+
+bool OverlayWindow::queued_start_shown() const {
+    return state_->queued_start_shown.load();
 }
 
 void OverlayWindow::set_paste_mode_callback(

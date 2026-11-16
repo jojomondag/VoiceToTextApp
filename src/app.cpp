@@ -55,8 +55,15 @@
 // Attempts after which a result with only one of the two versions is kept.
 #define HISTORY_PARTIAL_RETRIES 2
 // A start pressed while the previous dictation finishes runs when that one is
-// handed off, if that happens within this time; later it is dropped.
+// handed off. Without the overlay showing it as queued the whole time, it only
+// runs if that happens within this time; later it is dropped, with a notice.
 #define DEFERRED_START_MAX_MS 3000
+// Linux start/stop commands closer than this to the previous one are the same
+// press seen twice (a double click). After a press that started or queued a
+// dictation the window is longer: stopping a recording that young is never
+// meant, while a quick stop and start again is.
+#define TOGGLE_REPEAT_MS 200
+#define TOGGLE_REPEAT_AFTER_START_MS 500
 
 #ifdef _WIN32
 static const wchar_t* APP_CLASS_NAME = L"VoiceToTextMainWindow";
@@ -1331,6 +1338,9 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (!self->shutting_down_ && !self->recording_ && !self->processing_) {
                 vtlog("on_hotkey: queued start runs now");
                 self->start_recording();
+            } else if (!self->shutting_down_) {
+                vtlog("on_hotkey: queued start not run (recording=%d processing=%d)",
+                      self->recording_.load(), self->processing_.load());
             }
             return 0;
 
@@ -1388,11 +1398,15 @@ void App::on_hotkey(HotkeyAction action) {
                 // hotkey repeats and would toggle the queued start.
 #ifndef _WIN32
                 if (live_session_active_ && !recording_.load() && !manual_output_requested_) {
+                    // The overlay shows the queued start until it runs or
+                    // is withdrawn, so the press is never lost unseen.
                     if (start_after_handoff_) {
                         start_after_handoff_ = 0;
+                        if (overlay_) overlay_->set_queued_start(false);
                         vtlog("on_hotkey: queued start withdrawn");
                     } else {
                         start_after_handoff_ = GetTickCount64();
+                        if (overlay_) overlay_->set_queued_start(true);
                         vtlog("on_hotkey: start queued until the previous dictation is handed off");
                     }
                     break;
@@ -1437,16 +1451,21 @@ void App::handle_command(const std::string& command, const std::string& source) 
     vtlog("command %s from %s", command.c_str(), source.empty() ? "unknown" : source.c_str());
     if (command == "toggle") {
         // Two start/stop commands this close together are one press seen
-        // twice (a double click, a bind and a bar button), not a start and a
-        // deliberate stop.
+        // twice (a double click, a bind and a bar button). The second one
+        // would undo the first, so it is dropped.
         const ULONGLONG now = GetTickCount64();
-        if (last_toggle_command_ && now - last_toggle_command_ < 500) {
-            vtlog("command toggle ignored: %llu ms after the previous one",
-                  static_cast<unsigned long long>(now - last_toggle_command_));
+        const ULONGLONG window = last_toggle_started_ ? TOGGLE_REPEAT_AFTER_START_MS
+                                                      : TOGGLE_REPEAT_MS;
+        if (last_toggle_command_ && now - last_toggle_command_ < window) {
+            vtlog("command toggle ignored: %llu ms after the previous one (window %llu ms)",
+                  static_cast<unsigned long long>(now - last_toggle_command_),
+                  static_cast<unsigned long long>(window));
             return;
         }
         last_toggle_command_ = now;
+        const bool was_idle = !recording_.load() && !start_after_handoff_;
         on_hotkey(HotkeyAction::ToggleRecording);
+        last_toggle_started_ = was_idle && (recording_.load() || start_after_handoff_ != 0);
     } else if (command == "cancel") {
         on_hotkey(HotkeyAction::CancelRecording);
     } else if (command == "language") {
@@ -2557,6 +2576,12 @@ void App::complete_live_capture() {
 void App::hand_off_dictation(const std::string& text) {
     processing_ = false;
     dictation_window_->set_busy(false);
+#ifndef _WIN32
+    // Asked before hide() takes the queued mark down with the overlay.
+    const bool queued_start_seen = start_after_handoff_ && overlay_ && overlay_->queued_start_shown();
+#else
+    const bool queued_start_seen = false;
+#endif
     if (overlay_) overlay_->hide();
     const bool delivered = external_dictation_->has_delivered();
     dictation_window_->set_status(text.empty() ? L"Inget tal uppt\u00e4cktes." :
@@ -2574,11 +2599,17 @@ void App::hand_off_dictation(const std::string& text) {
     if (start_after_handoff_) {
         const ULONGLONG waited = GetTickCount64() - start_after_handoff_;
         start_after_handoff_ = 0;
-        if (waited <= DEFERRED_START_MAX_MS) {
+        // Shown as queued on the overlay the whole time: the user saw it
+        // waiting (and could withdraw it), so it runs however long it took.
+        if (queued_start_seen || waited <= DEFERRED_START_MAX_MS) {
+            vtlog("on_hotkey: queued start runs after %llu ms (shown on the overlay=%d)",
+                  static_cast<unsigned long long>(waited), queued_start_seen ? 1 : 0);
             PostMessageW(hwnd_, WM_DEFERRED_START, 0, 0);
         } else {
-            vtlog("on_hotkey: queued start dropped (pressed %llu ms before the hand-off)",
+            vtlog("on_hotkey: queued start dropped (pressed %llu ms before the hand-off, not shown on the overlay)",
                   static_cast<unsigned long long>(waited));
+            tray_->show_notification("VoiceToText",
+                "Den nya dikteringen startade inte eftersom den förra tog för lång tid att slutföra. Tryck igen för att starta.");
         }
     }
 }

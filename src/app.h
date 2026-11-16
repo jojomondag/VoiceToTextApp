@@ -150,8 +150,10 @@ private:
     HINSTANCE hInstance_ = nullptr;
     UINT taskbar_created_msg_ = 0;
 #ifndef _WIN32
-    // When the last start/stop command arrived (for the double-press guard).
+    // When the last start/stop command arrived, and whether it started (or
+    // queued) a dictation (for the double-press guard).
     ULONGLONG last_toggle_command_ = 0;
+    bool last_toggle_started_ = false;
 #endif
     std::atomic<bool> recording_{false};
     std::atomic<bool> processing_{false};
