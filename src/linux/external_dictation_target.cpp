@@ -220,6 +220,12 @@ struct ExternalDictationTarget::Impl {
     std::size_t revised_typed = 0;
     std::wstring delivered_text;        // everything typed this session
     bool delivered = false;
+    // The speech typed this session, exactly as typed. Revisions leave it
+    // alone, so it is what the user said that landed in the window.
+    std::wstring typed_speech;
+    // Words were left untyped (dropped for a window without focus, or a
+    // failed write): typed_speech is then not the whole dictation.
+    bool speech_untyped = false;
     int operations = 0;                 // queued or running output jobs
     bool focus_job_queued = false;
     // One of this application's own windows has keyboard focus (set on the
@@ -423,6 +429,10 @@ struct ExternalDictationTarget::Impl {
             --operations;
         }
         if (!typed) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                speech_untyped = true;
+            }
             trace("output_failed", {{"utterance_id", update.utterance}});
             return true; // do not retry forever; the transcript window has it
         }
@@ -432,6 +442,7 @@ struct ExternalDictationTarget::Impl {
         {
             std::lock_guard<std::mutex> lock(mutex);
             delivered_text += replacement->text;
+            typed_speech += replacement->text;
             delivered = true;
             if (span_typed.size() + replacement->text.size() > kSpanLimit) {
                 revoke_locked("span limit reached");
@@ -726,6 +737,8 @@ void ExternalDictationTarget::begin_session() {
         impl_->revision_waiting = false;
         impl_->revoke_locked("new session");
         impl_->delivered_text.clear();
+        impl_->typed_speech.clear();
+        impl_->speech_untyped = false;
         impl_->delivered = false;
         impl_->have_target = false;
     }
@@ -790,9 +803,27 @@ void ExternalDictationTarget::cancel_session() {
 void ExternalDictationTarget::drop_held() {
     impl_->abandoned = true;
     impl_->enqueue([this]() {
+        // Would any of the held words have been typed?
+        bool untyped = false;
+        auto next = impl_->buffer;
+        std::wstring document;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            document = impl_->delivered_text;
+        }
+        for (const auto& held : impl_->deferred) {
+            next.seal_current_insertion();
+            const auto replacement = next.apply(held.utterance, held.hypothesis, held.final,
+                                                document, document.size(), document.size());
+            if (replacement && !replacement->text.empty()) {
+                untyped = true;
+                break;
+            }
+        }
         impl_->deferred.clear();
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->held_updates = 0;
+        if (untyped) impl_->speech_untyped = true;
     });
 }
 
@@ -841,6 +872,12 @@ bool ExternalDictationTarget::apply_revision(std::uint64_t token,
 std::string ExternalDictationTarget::text_utf8() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return to_utf8(impl_->delivered_text);
+}
+
+bool ExternalDictationTarget::typed_speech(std::string& text) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    text = to_utf8(impl_->typed_speech);
+    return impl_->delivered && !impl_->speech_untyped;
 }
 
 bool ExternalDictationTarget::has_delivered() const {

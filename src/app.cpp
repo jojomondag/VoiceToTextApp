@@ -2549,7 +2549,18 @@ void App::complete_live_capture() {
     KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
     external_dictation_->finish_session();
     dictation_window_->finish_session();
-    hand_off_dictation(dictation_window_->text_utf8());
+    // What the dictation leaves behind is the text that was typed, with no
+    // output pending now. The transcript window shows each phrase as the
+    // speech model's final result, which can differ from the words already
+    // typed from its previews (a final may even come back empty), so it is
+    // used only when nothing, or not everything, was typed.
+    std::string text;
+#ifndef _WIN32
+    if (!external_dictation_->typed_speech(text)) text = dictation_window_->text_utf8();
+#else
+    text = dictation_window_->text_utf8();
+#endif
+    hand_off_dictation(text);
 }
 
 // Everything the user sees of this dictation is done: free the hotkey now.
@@ -2567,9 +2578,18 @@ void App::hand_off_dictation(const std::string& text) {
         dictation_window_->show();
         tray_->show_notification("Pianissimo", "Focus a text field before dictating. Your transcript is available in the preview.");
     }
-    const std::uint64_t entry_id = history_entry_id_;
+    // The entry saved when capture finished holds the transcript window's
+    // text; History keeps what the dictation left behind.
+    std::uint64_t entry_id = history_entry_id_;
     history_entry_id_ = 0;
-    if (entry_id) enqueue_history_job(entry_id, text, 0, false);
+    if (!entry_id) {
+        entry_id = save_dictation_to_history(text);
+    } else if (transcript_history_ && transcript_history_->replace_recorded(entry_id, text)) {
+        vtlog("history: entry %llu now holds the typed text (%zu bytes)",
+              static_cast<unsigned long long>(entry_id), text.size());
+        if (history_window_) history_window_->refresh();
+    }
+    if (entry_id && config_->config().llm_cleanup_enabled) enqueue_history_job(entry_id, text, 0, false);
     vtlog("dictation handed off: session=%llu bytes=%zu history_entry=%llu",
           dictation_session_.load(), text.size(), static_cast<unsigned long long>(entry_id));
     if (start_after_handoff_) {
@@ -2587,15 +2607,13 @@ void App::hand_off_dictation(const std::string& text) {
 std::uint64_t App::save_dictation_to_history(const std::string& text) {
     if (text.empty() || !transcript_history_ || !config_) return 0;
     const auto started = std::chrono::steady_clock::now();
-    std::uint64_t entry_id = 0;
-    if (config_->config().llm_cleanup_enabled) {
-        entry_id = transcript_history_->append_pending(text);
-    } else {
-        // No language model: the entry is complete as it is.
-        transcript_history_->append(text, text, "", "general");
-    }
+    // The entry gets an id either way, so the hand-off can correct it.
+    const bool waits = config_->config().llm_cleanup_enabled;
+    const std::uint64_t entry_id = transcript_history_->append_pending(text);
+    // No language model: the entry is complete as it is.
+    if (!waits) transcript_history_->complete(entry_id, text, text, "", "general");
     vtlog("history: dictation saved (%zu bytes, entry=%llu, waiting for the language model=%d) in %lld ms",
-          text.size(), static_cast<unsigned long long>(entry_id), entry_id ? 1 : 0, elapsed_ms(started));
+          text.size(), static_cast<unsigned long long>(entry_id), waits ? 1 : 0, elapsed_ms(started));
     if (history_window_) history_window_->refresh();
     return entry_id;
 }
