@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <cwctype>
 #include <deque>
 #include <fstream>
@@ -480,9 +481,11 @@ struct ExternalDictationTarget::Impl {
         drain_deferred();
     }
 
-    // Selects `count` characters backwards from the caret and waits until the
-    // application reports exactly `expected` as selected. On failure `stage`
-    // says which step failed and `seen` describes the last selection read.
+    // Selects the `expected.size()` characters before the caret and waits
+    // until the application reports exactly `expected` as selected. The
+    // caret stays at the end of the selection. `stage` names the last step
+    // (on failure the one that failed; a "_forward" stage means the field
+    // was selected forwards) and `seen` describes the last selection read.
     bool select_and_verify(const std::wstring& expected, const char*& stage,
                            nlohmann::json& seen) {
         const std::wstring wanted = comparable(expected);
@@ -500,26 +503,62 @@ struct ExternalDictationTarget::Impl {
             }
         };
 
+        const auto clear_selection = []() {
+            wayland_input::run({"wl-copy", "--primary", "--clear"});
+        };
+        const auto press = [&](const char* key, const std::vector<std::string>& modifiers,
+                               std::size_t count) {
+            while (count > 0) {
+                const int batch = static_cast<int>((std::min)(count,
+                                                   static_cast<std::size_t>(kKeysPerBatch)));
+                if (!send_key(key, modifiers, batch)) return false;
+                count -= static_cast<std::size_t>(batch);
+            }
+            return true;
+        };
+        const std::wstring last = wanted.substr(wanted.size() - 1);
+        const int span_wait = 400 + static_cast<int>(expected.size());
+
         // An empty primary selection first, so a stale one cannot pass.
-        wayland_input::run({"wl-copy", "--primary", "--clear"});
+        clear_selection();
 
         // Probe with one character: a field that does not select this way
         // (a terminal inside an editor, a game) is left after a single key.
         stage = "key";
         if (!send_key("Left", {"shift"}, 1)) return false;
         stage = "probe";
-        if (!selection_is(wanted.substr(wanted.size() - 1), 250)) return false;
+        if (selection_is(last, 250)) {
+            stage = "key";
+            if (!press("Left", {"shift"}, expected.size() - 1)) return false;
+            stage = "span";
+            return selection_is(wanted, span_wait);
+        }
+
+        // GTK 4 single-line entries publish a selection made backwards (caret
+        // before the anchor) as an empty primary selection, and one made
+        // forwards with its text. Such a field claims the selection but
+        // serves nothing; select the same characters forwards there. Any
+        // other failure (nothing claimed, other text) is refused as before.
+        if (!(seen.value("readable", false) && seen.value("selected_chars", 1) == 0)) {
+            return false;
+        }
+        stage = "key";
+        if (!send_key("Right")) return false; // back to the caret
+        clear_selection();
+        if (!send_key("Left") || !send_key("Right", {"shift"})) return false;
+        stage = "probe_forward";
+        if (!selection_is(last, 250)) return false;
+        if (expected.size() == 1) return true;
 
         stage = "key";
-        std::size_t remaining = expected.size() - 1;
-        while (remaining > 0) {
-            const int batch = static_cast<int>((std::min)(remaining,
-                                               static_cast<std::size_t>(kKeysPerBatch)));
-            if (!send_key("Left", {"shift"}, batch)) return false;
-            remaining -= static_cast<std::size_t>(batch);
+        if (!send_key("Right")) return false; // back to the caret
+        clear_selection();
+        if (!press("Left", {}, expected.size()) ||
+            !press("Right", {"shift"}, expected.size())) {
+            return false;
         }
-        stage = "span";
-        return selection_is(wanted, 400 + static_cast<int>(expected.size()));
+        stage = "span_forward";
+        return selection_is(wanted, span_wait);
     }
 
     // Replaces the text of the owned span that came from `source` (a prefix
@@ -645,8 +684,10 @@ struct ExternalDictationTarget::Impl {
             return false;
         }
         const bool written = new_text.empty() ? send_key("BackSpace") : write_text(new_text);
+        const bool forward = std::strstr(stage, "forward") != nullptr;
         trace("selection_revision", {{"replaced_chars", old_text.size()},
-                                     {"typed_chars", new_text.size()}, {"written", written}});
+                                     {"typed_chars", new_text.size()}, {"written", written},
+                                     {"selected", forward ? "forward" : "backward"}});
         return written;
     }
 
