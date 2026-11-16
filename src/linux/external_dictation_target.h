@@ -75,6 +75,11 @@ public:
     // Only text delivered during this session, never the external document.
     std::string text_utf8() const;
     bool has_delivered() const;
+    // The speech typed this session, exactly as it was typed; language-mode
+    // revisions do not change it. False when nothing was typed, or when
+    // words were left untyped (dropped for a window that never got focus
+    // back, or a failed write) and `text` is not the whole dictation.
+    bool typed_speech(std::string& text) const;
 
 private:
     struct Impl;

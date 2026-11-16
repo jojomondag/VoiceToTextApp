@@ -44,6 +44,10 @@ public:
     // stops waiting and keeps the recorded text as its transcript. Returns
     // the attempt count, or -1 when the entry is gone or not pending.
     int mark_failed(std::uint64_t id, int max_attempts);
+    // Replaces the recorded text of an entry. An entry saved without the
+    // language model (its transcript is the recorded text) gets the new text
+    // as transcript too. True when the entry exists and changed.
+    bool replace_recorded(std::uint64_t id, const std::string& recorded);
     void clear();
 
     // Snapshot of all entries, oldest first.

@@ -158,6 +158,21 @@ int TranscriptHistory::mark_failed(std::uint64_t id, int max_attempts) {
     return entry->llm_attempts;
 }
 
+bool TranscriptHistory::replace_recorded(std::uint64_t id, const std::string& recorded) {
+    if (recorded.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    TranscriptHistoryEntry* entry = find_locked(id);
+    if (!entry || entry->recorded == recorded) return false;
+    if (!entry->llm_pending && entry->ai_language.empty() && entry->transcribed == entry->recorded) {
+        entry->transcribed = recorded;
+        entry->transcribed_tokens = estimate_token_count(recorded);
+    }
+    entry->recorded = recorded;
+    entry->recorded_tokens = estimate_token_count(recorded);
+    save_locked();
+    return true;
+}
+
 void TranscriptHistory::trim_locked() {
     if (static_cast<int>(entries_.size()) > max_entries_) {
         entries_.erase(entries_.begin(),
