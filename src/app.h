@@ -3,9 +3,13 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -70,6 +74,25 @@ private:
     void apply_live_mode_results();
     void refresh_live_mode_status();
     void complete_live_capture();
+    void hand_off_dictation(const std::string& text);
+
+    // History: the recorded text is saved at once; the language-model
+    // versions are filled in later by a background worker.
+    struct HistoryJob {
+        std::uint64_t entry_id = 0;
+        std::string recorded;
+        AppConfig cfg;
+        std::string corrections;
+        int attempts = 0;
+        bool backfill = false;
+    };
+    std::uint64_t save_dictation_to_history(const std::string& text);
+    void enqueue_history_job(std::uint64_t entry_id, const std::string& recorded,
+                             int attempts, bool backfill);
+    void schedule_history_backfill();
+    void history_worker_loop();
+    void run_history_job(const HistoryJob& job);
+    bool wait_for_live_llm_idle();
 
     // Language
     void switch_language();
@@ -165,7 +188,22 @@ private:
     std::thread process_thread_;
     std::thread model_download_thread_;
     std::thread warmup_thread_;
-    std::thread history_append_thread_;
+
+    // Background History worker. The queue is guarded by history_jobs_mutex_;
+    // the rest is used on the UI thread only, except history_llm_busy_.
+    std::mutex history_jobs_mutex_;
+    std::condition_variable history_jobs_cv_;
+    std::deque<HistoryJob> history_jobs_;
+    bool history_worker_stop_ = false;
+    std::thread history_thread_;
+    std::atomic<bool> history_llm_busy_{false};
+    std::unordered_set<std::uint64_t> history_jobs_queued_;
+    std::unordered_map<std::uint64_t, ULONGLONG> history_retry_at_;
+    // Entry of the current dictation: saved when capture finished, handed to
+    // the worker once its live output is done.
+    std::uint64_t history_entry_id_ = 0;
+    // A start pressed while the previous dictation was still finishing.
+    ULONGLONG start_after_handoff_ = 0;
 
 };
 

@@ -36,12 +36,27 @@
 #define WM_MODEL_READY (WM_APP + 7)
 #define WM_MODEL_STATUS (WM_APP + 8)
 #define WM_LIVE_MODE_RESULT (WM_APP + 9)
+#define WM_HISTORY_JOB_DONE (WM_APP + 10)
+#define WM_DEFERRED_START (WM_APP + 11)
 #define AUDIO_LEVEL_TIMER 1
 #define GEMMA_IDLE_TIMER 2
+#define HISTORY_BACKFILL_TIMER 3
 // Gemma gives its graphics memory back after this long without work; the next recording starts it again.
 #define GEMMA_IDLE_MS 300000
 // After Stop, how long held words wait for their window to get focus again.
 #define LIVE_FOCUS_WAIT_MS 10000
+// How often History entries still waiting for the language model are retried.
+#define HISTORY_BACKFILL_TICK_MS 15000
+// First retry delay of a failed History entry; doubles per failure up to the cap.
+#define HISTORY_RETRY_BASE_MS 15000
+#define HISTORY_RETRY_MAX_MS 3600000
+// Failed attempts after which an entry keeps its recorded text as transcript.
+#define HISTORY_MAX_ATTEMPTS 20
+// Attempts after which a result with only one of the two versions is kept.
+#define HISTORY_PARTIAL_RETRIES 2
+// A start pressed while the previous dictation finishes runs when that one is
+// handed off, if that happens within this time; later it is dropped.
+#define DEFERRED_START_MAX_MS 3000
 
 #ifdef _WIN32
 static const wchar_t* APP_CLASS_NAME = L"VoiceToTextMainWindow";
@@ -61,6 +76,15 @@ struct DictationFinished {
 struct OutputReady {
     unsigned long long session;
     std::string recorded, cleaned, ai_language, profile, paste, error;
+    bool learn = false;
+};
+struct HistoryJobDone {
+    std::uint64_t id = 0;
+    bool ok = false;       // filled in
+    bool skipped = false;  // not tried (the internal runtime is not running)
+    int attempts = 0;      // failed attempts so far
+    bool learn = false;    // learn corrections from recorded -> cleaned
+    std::string recorded, cleaned;
 };
 struct ModelReady {
     std::string id, error;
@@ -529,6 +553,102 @@ App::~App() {
     shutdown();
 }
 
+namespace {
+
+// The cleaner settings for the configured provider (the shared cleaner and
+// the History worker's private ones are built the same way).
+LlmCleanerConfig cleaner_config_for(const AppConfig& cfg, const std::string& config_path) {
+    std::string endpoint = cfg.llm_endpoint;
+    std::string model = cfg.llm_model;
+    if (cfg.llm_provider == "internal") {
+        endpoint = "http://127.0.0.1:" +
+                   std::to_string(cfg.llm_internal_port) +
+                   "/v1/chat/completions";
+        const GemmaModelInfo* info =
+            find_gemma_model(normalize_gemma_model_id(cfg.llm_internal_model));
+        model = info ? info->repo : recommended_gemma_model().repo;
+    }
+
+    LlmCleanerConfig cleaner_config{
+        cfg.llm_cleanup_enabled,
+        endpoint,
+        model,
+        cfg.llm_pre_prompt,
+        cfg.llm_timeout_ms,
+        cfg.llm_max_tokens,
+        cfg.llm_intent_profiles_enabled,
+        cfg.llm_intent_detection_prompt,
+        cfg.llm_profile_transform_prompt,
+    };
+    cleaner_config.profiles.clear();
+    for (const auto& profile : cfg.llm_profiles) {
+        cleaner_config.profiles.push_back({profile.name, profile.instructions});
+    }
+    cleaner_config.api_key = read_llm_api_key(cfg, config_path);
+    return cleaner_config;
+}
+
+// Timeout of one History request. Measured on the local server: a typical
+// dictation (100-150 bytes) takes 0.7-1.7 s per request, an 864-byte one
+// 9.9 s (about 30 tokens/s). 4 s + 16 ms per input byte keeps short ones at
+// the 6 s floor (3.5x the slowest measured) and gives long ones about 1.8x
+// their measured time. Retries get more time; the configured timeout is the
+// ceiling. A request that times out leaves the entry pending for a retry.
+int history_request_timeout_ms(const AppConfig& cfg, std::size_t input_bytes,
+                               int attempts, bool thinking) {
+    long long timeout = 4000 + 16LL * static_cast<long long>(input_bytes);
+    timeout = (std::max)(timeout, 6000LL);
+    timeout *= 1 + (std::min)(attempts, 3);
+    if (thinking) timeout *= 2;
+    if (cfg.llm_timeout_ms > 0) timeout = (std::min)(timeout, static_cast<long long>(cfg.llm_timeout_ms));
+    return static_cast<int>(timeout);
+}
+
+// Runs one language-model call on its own detached thread with a private
+// cleaner, and waits for it unless `abandon` turns true first (quit). An
+// abandoned call finishes on its own and touches nothing but its own state,
+// so quitting never waits for a slow server.
+bool run_abandonable_llm_call(const LlmCleanerConfig& cleaner_config,
+                              std::function<bool(const LlmCleaner&, std::string&, std::string&)> call,
+                              const std::atomic<bool>& abandon,
+                              std::string& text, std::string& profile) {
+    struct State {
+        std::mutex mutex;
+        std::condition_variable done_cv;
+        bool done = false;
+        bool ok = false;
+        std::string text, profile;
+    };
+    auto state = std::make_shared<State>();
+    try {
+        std::thread([state, cleaner_config, call = std::move(call)]() {
+            LlmCleaner cleaner;
+            cleaner.configure(cleaner_config);
+            std::string out_text, out_profile;
+            bool ok = false;
+            try { ok = call(cleaner, out_text, out_profile); } catch (...) { ok = false; }
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->ok = ok;
+            state->text = std::move(out_text);
+            state->profile = std::move(out_profile);
+            state->done = true;
+            state->done_cv.notify_all();
+        }).detach();
+    } catch (const std::exception&) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(state->mutex);
+    while (!state->done) {
+        if (abandon.load()) return false;
+        state->done_cv.wait_for(lock, std::chrono::milliseconds(50));
+    }
+    text = std::move(state->text);
+    profile = std::move(state->profile);
+    return state->ok;
+}
+
+} // namespace
+
 bool App::initialize(HINSTANCE hInstance) {
     hInstance_ = hInstance;
     configure_runtime_dll_search_path();
@@ -645,6 +765,10 @@ bool App::initialize(HINSTANCE hInstance) {
     }
     transcript_history_->initialize(history_path.string(),
                                     cfg.transcript_history_max_entries);
+    // Entries still waiting for the language model (also from an earlier
+    // run) are picked up by the backfill timer.
+    history_thread_ = std::thread([this]() { history_worker_loop(); });
+    SetTimer(hwnd_, HISTORY_BACKFILL_TIMER, HISTORY_BACKFILL_TICK_MS, nullptr);
 
     // --- 9. Initialize overlay ---
     overlay_ = std::make_unique<OverlayWindow>();
@@ -764,6 +888,19 @@ void App::shutdown() {
 #ifndef _WIN32
     if (hwnd_) KillTimer(hwnd_, GEMMA_IDLE_TIMER);
 #endif
+    if (hwnd_) KillTimer(hwnd_, HISTORY_BACKFILL_TIMER);
+    // The History worker abandons a request in flight (its entry stays
+    // pending and is retried at the next start), so this returns at once.
+    {
+        std::lock_guard<std::mutex> lock(history_jobs_mutex_);
+        history_worker_stop_ = true;
+    }
+    history_jobs_cv_.notify_all();
+    if (history_thread_.joinable()) {
+        const auto history_join_start = std::chrono::steady_clock::now();
+        history_thread_.join();
+        vtlog("shutdown: History worker stopped in %lld ms", elapsed_ms(history_join_start));
+    }
     // Stop capture before waiting for the live worker.
     if (process_thread_.joinable()) {
         process_thread_.join();
@@ -772,9 +909,6 @@ void App::shutdown() {
         model_download_thread_.join();
     }
     join_engine_warmup();
-    if (history_append_thread_.joinable()) {
-        history_append_thread_.join();
-    }
 
     if (audio_ && audio_->is_recording()) {
         audio_->stop_recording();
@@ -916,8 +1050,10 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 self->apply_live_mode_results();
                 self->complete_live_capture();
             }
+            if (wParam == HISTORY_BACKFILL_TIMER) self->schedule_history_backfill();
 #ifndef _WIN32
             if (wParam == GEMMA_IDLE_TIMER && !self->recording_ && !self->processing_ &&
+                !self->history_llm_busy_ &&
                 GetTickCount64() - self->gemma_last_used_ >= GEMMA_IDLE_MS) {
                 std::unique_lock<std::mutex> work_lock(self->llm_work_mutex_, std::try_to_lock);
                 if (work_lock.owns_lock() && self->gemma_runtime_ && self->gemma_runtime_->running()) {
@@ -1006,6 +1142,7 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 KillTimer(hwnd, AUDIO_LEVEL_TIMER);
                 vtlog("live Pianissimo failed: %s", done->error.c_str());
                 self->processing_ = false;
+                self->start_after_handoff_ = 0;
                 self->dictation_window_->set_busy(false);
                 self->dictation_window_->set_status(L"Transkriberingen misslyckades. Texten finns kvar.");
                 self->tray_->show_notification("Pianissimo", done->error);
@@ -1014,6 +1151,9 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             self->processing_ = true;
             self->live_capture_finished_ = true;
+            // The whole recorded text exists now: save it to History before
+            // the live mode and the language model are done with it.
+            self->history_entry_id_ = self->save_dictation_to_history(self->dictation_window_->text_utf8());
             self->dictation_window_->set_busy(true);
             // Flush final stable words, then keep ownership until their selected
             // language-mode result has been applied (or safely rejected).
@@ -1061,17 +1201,56 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 self->tray_->show_notification("Pianissimo", "Focus a text field before dictating. Your transcript is available in the preview.");
             }
             self->manual_output_requested_ = false;
+            // Only text accepted in the dictation window comes here (live
+            // dictations are handed off in hand_off_dictation()).
+            if (output->learn && self->config_->config().llm_corrections_enabled && self->correction_store_)
+                self->correction_store_->learn_from(output->recorded, output->cleaned);
             if (!output->recorded.empty() && self->transcript_history_) {
-                if (self->history_append_thread_.joinable()) self->history_append_thread_.join();
-                self->history_append_thread_ = std::thread([self,
-                    recorded = output->recorded, cleaned = output->cleaned,
-                    ai = output->ai_language, profile = output->profile]() {
-                    self->transcript_history_->append(recorded, cleaned, ai, profile);
-                    PostMessageW(self->hwnd_, WM_HISTORY_UPDATED, 0, 0);
-                });
+                self->transcript_history_->append(output->recorded, output->cleaned,
+                                                  output->ai_language, output->profile);
+                if (self->history_window_) self->history_window_->refresh();
             }
             return 0;
         }
+
+        case WM_HISTORY_JOB_DONE: {
+            std::unique_ptr<HistoryJobDone> done(reinterpret_cast<HistoryJobDone*>(lParam));
+            if (self->shutting_down_) return 0;
+            self->history_jobs_queued_.erase(done->id);
+            // Corrections are learned here, on the UI thread, where the live
+            // mode also reads them.
+            if (done->learn && self->config_->config().llm_corrections_enabled && self->correction_store_)
+                self->correction_store_->learn_from(done->recorded, done->cleaned);
+            const ULONGLONG now = GetTickCount64();
+            if (done->ok) {
+                self->history_retry_at_.erase(done->id);
+                // The server answers again: retry the waiting entries now.
+                if (!self->history_retry_at_.empty()) {
+                    for (auto& retry : self->history_retry_at_) retry.second = 0;
+                    self->schedule_history_backfill();
+                }
+            } else if (done->skipped) {
+                self->history_retry_at_[done->id] = now + HISTORY_RETRY_BASE_MS;
+            } else if (done->attempts > 0) {
+                ULONGLONG delay = HISTORY_RETRY_BASE_MS;
+                for (int i = 1; i < done->attempts && delay < HISTORY_RETRY_MAX_MS; ++i) delay *= 2;
+                delay = (std::min<ULONGLONG>)(delay, HISTORY_RETRY_MAX_MS);
+                self->history_retry_at_[done->id] = now + delay;
+                vtlog("history: entry %llu attempt %d failed; next try in %llu s",
+                      static_cast<unsigned long long>(done->id), done->attempts,
+                      static_cast<unsigned long long>(delay / 1000));
+            } else {
+                self->history_retry_at_.erase(done->id); // gone, or no longer waiting
+            }
+            return 0;
+        }
+
+        case WM_DEFERRED_START:
+            if (!self->shutting_down_ && !self->recording_ && !self->processing_) {
+                vtlog("on_hotkey: queued start runs now");
+                self->start_recording();
+            }
+            return 0;
 
         case WM_MODEL_STATUS: {
             std::unique_ptr<std::string> status(reinterpret_cast<std::string*>(lParam));
@@ -1117,9 +1296,30 @@ void App::on_hotkey(HotkeyAction action) {
     switch (action) {
         case HotkeyAction::ToggleRecording:
             if (processing_.load()) {
+                // Only the live dictation's own finishing holds processing_
+                // now (last words, text the editor has not confirmed, the
+                // selected mode's final rewrite); the History language model
+                // runs in the background. A start pressed meanwhile runs as
+                // soon as that dictation is handed off; a second press
+                // withdraws it. Linux only: commands arrive once per press
+                // there (with a double-press guard), while a held Win32
+                // hotkey repeats and would toggle the queued start.
+#ifndef _WIN32
+                if (live_session_active_ && !recording_.load() && !manual_output_requested_) {
+                    if (start_after_handoff_) {
+                        start_after_handoff_ = 0;
+                        vtlog("on_hotkey: queued start withdrawn");
+                    } else {
+                        start_after_handoff_ = GetTickCount64();
+                        vtlog("on_hotkey: start queued until the previous dictation is handed off");
+                    }
+                    break;
+                }
+#endif
                 vtlog("on_hotkey: ignored (processing in progress)");
                 break;
             }
+            start_after_handoff_ = 0;
             if (recording_.load()) {
                 stop_recording();
             } else {
@@ -1128,6 +1328,7 @@ void App::on_hotkey(HotkeyAction action) {
             break;
 
         case HotkeyAction::CancelRecording:
+            start_after_handoff_ = 0;
             if (live_session_active_) {
                 cancel_recording();
             }
@@ -1617,36 +1818,7 @@ bool App::ensure_llama_server_available(std::string& server_path) {
 
 void App::configure_llm_cleaner() {
     if (!config_ || !llm_cleaner_) return;
-
-    const auto& cfg = config_->config();
-    std::string endpoint = cfg.llm_endpoint;
-    std::string model = cfg.llm_model;
-    if (cfg.llm_provider == "internal") {
-        endpoint = "http://127.0.0.1:" +
-                   std::to_string(cfg.llm_internal_port) +
-                   "/v1/chat/completions";
-        const GemmaModelInfo* info =
-            find_gemma_model(normalize_gemma_model_id(cfg.llm_internal_model));
-        model = info ? info->repo : recommended_gemma_model().repo;
-    }
-
-    LlmCleanerConfig cleaner_config{
-        cfg.llm_cleanup_enabled,
-        endpoint,
-        model,
-        cfg.llm_pre_prompt,
-        cfg.llm_timeout_ms,
-        cfg.llm_max_tokens,
-        cfg.llm_intent_profiles_enabled,
-        cfg.llm_intent_detection_prompt,
-        cfg.llm_profile_transform_prompt,
-    };
-    cleaner_config.profiles.clear();
-    for (const auto& profile : cfg.llm_profiles) {
-        cleaner_config.profiles.push_back({profile.name, profile.instructions});
-    }
-    cleaner_config.api_key = read_llm_api_key(cfg, config_->get_config_path());
-    llm_cleaner_->configure(cleaner_config);
+    llm_cleaner_->configure(cleaner_config_for(config_->config(), config_->get_config_path()));
 }
 
 void App::select_model(const std::string& model_id) {
@@ -1686,7 +1858,8 @@ void App::download_and_select_model(const std::string& model_id) {
 void App::select_gemma_model(const std::string& model_id) {
     if (model_id.empty() || !config_) return;
 
-    if (recording_.load() || processing_.load() || live_llm_busy_.load()) {
+    // history_llm_busy_: a History request in the background would be cut off.
+    if (recording_.load() || processing_.load() || live_llm_busy_.load() || history_llm_busy_.load()) {
         if (tray_) {
             tray_->show_notification("VoiceToText",
                                      "Cannot switch Gemma model while recording or processing.");
@@ -1919,7 +2092,8 @@ void App::select_whisper_compute_mode(const std::string& mode) {
 void App::select_gemma_compute_mode(const std::string& mode) {
     if (mode != "gpu" && mode != "cpu") return;
 
-    if (recording_.load() || processing_.load() || downloading_model_.load() || live_llm_busy_.load()) {
+    if (recording_.load() || processing_.load() || downloading_model_.load() || live_llm_busy_.load() ||
+        history_llm_busy_.load()) {
         if (tray_) {
             tray_->show_notification("VoiceToText",
                                      "Cannot switch compute mode while recording or processing.");
@@ -2311,11 +2485,235 @@ void App::complete_live_capture() {
     KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
     external_dictation_->finish_session();
     dictation_window_->finish_session();
-    const std::string text = dictation_window_->text_utf8();
-    dictation_window_->set_busy(true);
-    dictation_window_->set_status(L"Sparar dikteringen i Historik...");
-    const auto session = dictation_session_.load();
-    process_thread_ = std::thread([this, text, session]() { process_text(text, session); });
+    hand_off_dictation(dictation_window_->text_utf8());
+}
+
+// Everything the user sees of this dictation is done: free the hotkey now.
+// The History versions (clean text, AI text, profile) are typed nowhere, so
+// the background worker fills them in later.
+void App::hand_off_dictation(const std::string& text) {
+    processing_ = false;
+    dictation_window_->set_busy(false);
+    if (overlay_) overlay_->hide();
+    const bool delivered = external_dictation_->has_delivered();
+    dictation_window_->set_status(text.empty() ? L"Inget tal uppt\u00e4cktes." :
+        delivered ? L"Dikteringen har skrivits vid mark\u00f6ren." :
+                    L"Kunde inte skriva i det aktiva textf\u00e4ltet. Texten finns h\u00e4r f\u00f6r kopiering.");
+    if (!text.empty() && !delivered) {
+        dictation_window_->show();
+        tray_->show_notification("Pianissimo", "Focus a text field before dictating. Your transcript is available in the preview.");
+    }
+    const std::uint64_t entry_id = history_entry_id_;
+    history_entry_id_ = 0;
+    if (entry_id) enqueue_history_job(entry_id, text, 0, false);
+    vtlog("dictation handed off: session=%llu bytes=%zu history_entry=%llu",
+          dictation_session_.load(), text.size(), static_cast<unsigned long long>(entry_id));
+    if (start_after_handoff_) {
+        const ULONGLONG waited = GetTickCount64() - start_after_handoff_;
+        start_after_handoff_ = 0;
+        if (waited <= DEFERRED_START_MAX_MS) {
+            PostMessageW(hwnd_, WM_DEFERRED_START, 0, 0);
+        } else {
+            vtlog("on_hotkey: queued start dropped (pressed %llu ms before the hand-off)",
+                  static_cast<unsigned long long>(waited));
+        }
+    }
+}
+
+std::uint64_t App::save_dictation_to_history(const std::string& text) {
+    if (text.empty() || !transcript_history_ || !config_) return 0;
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t entry_id = 0;
+    if (config_->config().llm_cleanup_enabled) {
+        entry_id = transcript_history_->append_pending(text);
+    } else {
+        // No language model: the entry is complete as it is.
+        transcript_history_->append(text, text, "", "general");
+    }
+    vtlog("history: dictation saved (%zu bytes, entry=%llu, waiting for the language model=%d) in %lld ms",
+          text.size(), static_cast<unsigned long long>(entry_id), entry_id ? 1 : 0, elapsed_ms(started));
+    if (history_window_) history_window_->refresh();
+    return entry_id;
+}
+
+void App::enqueue_history_job(std::uint64_t entry_id, const std::string& recorded,
+                              int attempts, bool backfill) {
+    if (!entry_id || recorded.empty() || !config_ ||
+        !history_jobs_queued_.insert(entry_id).second) return;
+    HistoryJob job;
+    job.entry_id = entry_id;
+    job.recorded = recorded;
+    job.cfg = config_->config();
+    job.attempts = attempts;
+    job.backfill = backfill;
+    if (job.cfg.llm_corrections_enabled && correction_store_)
+        job.corrections = correction_store_->build_prompt_block(job.cfg.llm_corrections_prompt_limit,
+                                                                job.cfg.llm_corrections_min_count);
+    {
+        std::lock_guard<std::mutex> lock(history_jobs_mutex_);
+        history_jobs_.push_back(std::move(job));
+    }
+    history_jobs_cv_.notify_one();
+}
+
+// Queues History entries still waiting for the language model whose retry
+// time has come. Runs on the UI thread (timer, and after a success).
+void App::schedule_history_backfill() {
+    if (!transcript_history_ || !config_ || shutting_down_ ||
+        !config_->config().llm_cleanup_enabled) return;
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& entry : transcript_history_->entries()) {
+        if (!entry.llm_pending || !entry.id) continue;
+        // The current dictation is handed to the worker when it is finished.
+        if (live_session_active_ && entry.id == history_entry_id_) continue;
+        if (history_jobs_queued_.count(entry.id)) continue;
+        const auto retry = history_retry_at_.find(entry.id);
+        if (retry != history_retry_at_.end() && now < retry->second) continue;
+        vtlog("history: retrying entry %llu (attempts so far %d)",
+              static_cast<unsigned long long>(entry.id), entry.llm_attempts);
+        enqueue_history_job(entry.id, entry.recorded, entry.llm_attempts, true);
+    }
+}
+
+void App::history_worker_loop() {
+    for (;;) {
+        HistoryJob job;
+        {
+            std::unique_lock<std::mutex> lock(history_jobs_mutex_);
+            history_jobs_cv_.wait(lock, [this]() { return history_worker_stop_ || !history_jobs_.empty(); });
+            if (history_worker_stop_) return;
+            // New dictations first, in the order they were made; retries after.
+            auto next = std::find_if(history_jobs_.begin(), history_jobs_.end(),
+                                     [](const HistoryJob& queued) { return !queued.backfill; });
+            if (next == history_jobs_.end()) next = history_jobs_.begin();
+            job = std::move(*next);
+            history_jobs_.erase(next);
+        }
+        history_llm_busy_ = true;
+        try {
+            run_history_job(job);
+        } catch (const std::exception& ex) {
+            vtlog("history: entry %llu failed: %s", static_cast<unsigned long long>(job.entry_id), ex.what());
+            auto done = std::make_unique<HistoryJobDone>();
+            done->id = job.entry_id;
+            if (PostMessageW(hwnd_, WM_HISTORY_JOB_DONE, 0, reinterpret_cast<LPARAM>(done.get()))) done.release();
+        }
+        history_llm_busy_ = false;
+    }
+}
+
+// Waits while a live dictation wants the language model, so a History job
+// never delays it with a new request. False when the app quits meanwhile.
+bool App::wait_for_live_llm_idle() {
+    for (;;) {
+        if (shutting_down_.load()) return false;
+        bool live_wants = live_llm_busy_.load() || processing_.load();
+        if (!live_wants && recording_.load()) {
+            std::lock_guard<std::mutex> lock(live_settings_mutex_);
+            live_wants = live_settings_.llm_cleanup_enabled &&
+                         normalize_paste_output_mode(live_settings_.paste_output_mode) != "recorded";
+        }
+        if (!live_wants) return true;
+        Sleep(50);
+    }
+}
+
+void App::run_history_job(const HistoryJob& job) {
+    const AppConfig& cfg = job.cfg;
+    auto done = std::make_unique<HistoryJobDone>();
+    done->id = job.entry_id;
+    const auto post_done = [this, &done]() {
+        if (PostMessageW(hwnd_, WM_HISTORY_JOB_DONE, 0, reinterpret_cast<LPARAM>(done.get()))) done.release();
+    };
+    if (!cfg.llm_cleanup_enabled) { done->skipped = true; post_done(); return; }
+
+    if (cfg.llm_provider == "internal") {
+        // Gemma is the app's own server: check (and for a new dictation
+        // start) it under the work lock, but never hold that lock during the
+        // requests, so live rewrites of a new dictation are not held up.
+        std::unique_lock<std::mutex> work_lock(llm_work_mutex_, std::defer_lock);
+        while (!work_lock.try_lock()) {
+            if (shutting_down_.load()) return;
+            Sleep(50);
+        }
+        if (!gemma_runtime_ || !gemma_runtime_->running()) {
+            // A retry never starts Gemma by itself (it would hold graphics
+            // memory nobody asked for); it waits until a dictation has.
+            if (job.backfill) { done->skipped = true; post_done(); return; }
+            if (GetTickCount64() >= gemma_retry_after_) ensure_internal_llm_runtime();
+        }
+        if (!gemma_runtime_ || !gemma_runtime_->running()) {
+            work_lock.unlock();
+            done->attempts = transcript_history_->mark_failed(job.entry_id, HISTORY_MAX_ATTEMPTS);
+            if (done->attempts >= HISTORY_MAX_ATTEMPTS) done->attempts = 0;
+            vtlog("history: entry %llu waits: Gemma is not running", static_cast<unsigned long long>(job.entry_id));
+            post_done();
+            return;
+        }
+        gemma_last_used_ = GetTickCount64();
+    }
+
+    const bool thinking = cfg.llm_provider == "internal";
+    LlmCleanerConfig cleaner_config = cleaner_config_for(cfg, config_->get_config_path());
+    cleaner_config.timeout_ms = history_request_timeout_ms(cfg, job.recorded.size(), job.attempts, false);
+    LlmCleanerConfig ai_config = cleaner_config;
+    ai_config.timeout_ms = history_request_timeout_ms(cfg, job.recorded.size(), job.attempts, thinking);
+    const auto started = std::chrono::steady_clock::now();
+
+    std::string cleaned, profile = "general", ai_language, unused;
+    if (!wait_for_live_llm_idle()) return;
+    const std::string recorded = job.recorded;
+    const std::string corrections = job.corrections;
+    const bool clean_ok = run_abandonable_llm_call(cleaner_config,
+        [recorded, corrections](const LlmCleaner& cleaner, std::string& text, std::string& label) {
+            LlmProfileResult result;
+            if (!cleaner.clean_text_with_profile(recorded, corrections, result)) return false;
+            text = result.text;
+            label = result.profile;
+            return true;
+        }, shutting_down_, cleaned, profile);
+    if (shutting_down_.load()) return;
+    const long long clean_ms = elapsed_ms(started);
+
+    // Build both versions from the original. Otherwise a proofreading guess
+    // becomes an apparently supplied requirement in the prompt.
+    bool ai_ok = false;
+    if (cfg.llm_ai_language_enabled) {
+        if (!wait_for_live_llm_idle()) return;
+        const std::string system_prompt = ai_language_system_prompt(cfg);
+        ai_ok = run_abandonable_llm_call(ai_config,
+            [recorded, system_prompt, thinking](const LlmCleaner& cleaner, std::string& text, std::string&) {
+                return cleaner.transform_text(recorded, system_prompt, text, thinking);
+            }, shutting_down_, ai_language, unused);
+        if (shutting_down_.load()) return;
+        if (!ai_ok) ai_language.clear();
+    }
+
+    // Both failing means the server did not answer (refused, timed out):
+    // keep the entry pending for a retry. One failing alone may be a
+    // timeout too, so it is retried (with more time) on the first attempts;
+    // after that it is taken for a rejected result and kept as before.
+    const bool both_failed = !clean_ok && (!cfg.llm_ai_language_enabled || !ai_ok);
+    const bool one_failed = !both_failed && (!clean_ok || (cfg.llm_ai_language_enabled && !ai_ok));
+    const bool failed = both_failed || (one_failed && job.attempts < HISTORY_PARTIAL_RETRIES);
+    if (failed) {
+        done->attempts = transcript_history_->mark_failed(job.entry_id, HISTORY_MAX_ATTEMPTS);
+        vtlog("history: entry %llu: language model failed after %lld ms (clean=%d ai=%d, timeouts %d/%d ms, attempt %d)",
+              static_cast<unsigned long long>(job.entry_id), elapsed_ms(started), clean_ok ? 1 : 0,
+              ai_ok ? 1 : 0, cleaner_config.timeout_ms, ai_config.timeout_ms, done->attempts);
+        if (done->attempts >= HISTORY_MAX_ATTEMPTS) done->attempts = 0;
+    } else {
+        if (!clean_ok) { cleaned = recorded; profile = "general"; }
+        done->ok = transcript_history_->complete(job.entry_id, recorded, cleaned, ai_language, profile);
+        done->learn = clean_ok;
+        done->recorded = recorded;
+        done->cleaned = cleaned;
+        vtlog("history: entry %llu filled in %lld ms (clean=%d in %lld ms, ai=%d, profile=%s, %s)",
+              static_cast<unsigned long long>(job.entry_id), elapsed_ms(started), clean_ok ? 1 : 0,
+              clean_ms, ai_ok ? 1 : 0, profile.c_str(), job.backfill ? "retry" : "new");
+    }
+    PostMessageW(hwnd_, WM_HISTORY_UPDATED, 0, 0);
+    post_done();
 }
 
 void App::start_recording() {
@@ -2478,6 +2876,8 @@ void App::transcribe_live(unsigned long long session) {
     if (PostMessageW(hwnd_, WM_DICTATION_FINISHED, 0, reinterpret_cast<LPARAM>(finished.get()))) finished.release();
 }
 
+// Text accepted in the dictation window: it is typed in the clean or AI
+// version, so this waits for the language model (the window shows it busy).
 void App::process_text(std::string text, unsigned long long session) {
     auto output = std::make_unique<OutputReady>();
     output->session = session;
@@ -2491,28 +2891,31 @@ void App::process_text(std::string text, unsigned long long session) {
             std::lock_guard<std::mutex> settings_lock(live_settings_mutex_);
             cfg = live_settings_;
         }
-        if (!output->recorded.empty() && cfg.llm_cleanup_enabled && llm_cleaner_) {
+        if (!output->recorded.empty() && cfg.llm_cleanup_enabled) {
             gemma_last_used_ = GetTickCount64();
             if (cfg.llm_provider == "internal" && (!gemma_runtime_ || !gemma_runtime_->running()) &&
                 GetTickCount64() >= gemma_retry_after_)
                 ensure_internal_llm_runtime();
-            configure_llm_cleaner();
+            // A private cleaner from the settings snapshot: the shared one
+            // and config_ belong to the UI thread.
+            LlmCleaner cleaner;
+            cleaner.configure(cleaner_config_for(cfg, config_->get_config_path()));
             std::string corrections;
-            if (cfg.llm_corrections_enabled && correction_store_)
-                corrections = correction_store_->build_prompt_block(cfg.llm_corrections_prompt_limit,
-                                                                     cfg.llm_corrections_min_count);
+            {
+                std::lock_guard<std::mutex> settings_lock(live_settings_mutex_);
+                corrections = live_corrections_;
+            }
             LlmProfileResult result;
-            if (llm_cleaner_->clean_text_with_profile(output->recorded, corrections, result)) {
+            if (cleaner.clean_text_with_profile(output->recorded, corrections, result)) {
                 output->cleaned = result.text;
                 output->profile = result.profile;
-                if (cfg.llm_corrections_enabled && correction_store_)
-                    correction_store_->learn_from(output->recorded, output->cleaned);
+                output->learn = true; // learned on the UI thread
             }
             // Build both versions from the original. Otherwise a proofreading
             // guess becomes an apparently supplied requirement in the prompt.
             if (cfg.llm_ai_language_enabled)
-                llm_cleaner_->transform_text(output->recorded, ai_language_system_prompt(cfg),
-                                             output->ai_language, cfg.llm_provider == "internal");
+                cleaner.transform_text(output->recorded, ai_language_system_prompt(cfg),
+                                       output->ai_language, cfg.llm_provider == "internal");
         }
         const std::string mode = normalize_paste_output_mode(cfg.paste_output_mode);
         output->paste = mode == "recorded" ? output->recorded :

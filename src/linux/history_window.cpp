@@ -295,6 +295,13 @@ public:
                     cursor.insertBlock(body, plain);
                     cursor.insertText(line, plain);
                 }
+            } else if (kind != Kind::Recorded && item.llm_pending) {
+                // Shown, not copied: the language model has not answered yet.
+                QTextBlockFormat body = header;
+                body.setTopMargin(0);
+                cursor.insertBlock(body, plain);
+                cursor.insertText(QString::fromUtf8(u8"Väntar på språkmodellen..."),
+                                  tokens);
             }
             entry.end = cursor.position();
             entries_.push_back(entry);
