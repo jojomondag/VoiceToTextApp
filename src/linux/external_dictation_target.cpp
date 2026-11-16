@@ -557,8 +557,10 @@ struct ExternalDictationTarget::Impl {
             !press("Right", {"shift"}, expected.size())) {
             return false;
         }
+        // Twice the keys, and such an entry handles a long line slowly (about
+        // 1 s for 190 characters of a 700-character line): wait longer.
         stage = "span_forward";
-        return selection_is(wanted, span_wait);
+        return selection_is(wanted, 400 + 8 * static_cast<int>(expected.size()));
     }
 
     // Replaces the text of the owned span that came from `source` (a prefix
