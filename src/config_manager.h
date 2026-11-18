@@ -57,6 +57,15 @@ struct AppConfig {
     // endpoint and model): a file holding the API key, relative to the
     // directory of config.json. The key itself is never stored in config.json.
     std::string llm_api_key_file;
+    // Linux, external model only: a model started on demand. When History
+    // finds the endpoint not answering, this command is run through /bin/sh;
+    // exit status 0 means the model answers now, anything else that it cannot
+    // be started now (History then waits without counting an attempt).
+    std::string llm_start_command;
+    // Run once History has had nothing to do for a minute after the app
+    // started the model with llm_start_command (and no dictation runs), e.g. a
+    // command that stops it unless something else uses it.
+    std::string llm_stop_command;
     std::string llm_internal_model = "auto";
     std::string llm_internal_model_path = "models/llm/gemma-4-E2B-it-Q8_0.gguf";
     std::string llm_internal_compute_mode = "auto";
@@ -188,7 +197,7 @@ struct AppConfig {
         injection_method, keystroke_delay_ms, pre_injection_delay_ms,
         paste_output_mode, dictation_debug_logging,
         llm_cleanup_enabled, llm_provider, llm_endpoint, llm_model,
-        llm_api_key_file,
+        llm_api_key_file, llm_start_command, llm_stop_command,
         llm_internal_model, llm_internal_model_path,
         llm_internal_compute_mode, llm_internal_server_path,
         llm_internal_port, llm_internal_auto_start, llm_pre_prompt,

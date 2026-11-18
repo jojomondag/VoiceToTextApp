@@ -20,6 +20,7 @@
 #include "platform.h"
 #include <csignal>
 #include <cstdlib>
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -57,6 +58,12 @@
 #define HISTORY_RETRY_MAX_MS 3600000
 // Failed attempts after which an entry keeps its recorded text as transcript.
 #define HISTORY_MAX_ATTEMPTS 20
+// While the model is down and cannot be started (graphics card busy), entries
+// are tried again this often, without counting an attempt.
+#define HISTORY_UNAVAILABLE_RETRY_MS 120000
+// A model the app started for History is stopped this long after History's
+// last work (llm_stop_command).
+#define HISTORY_LLM_STOP_AFTER_MS 60000
 // Attempts after which a result with only one of the two versions is kept.
 #define HISTORY_PARTIAL_RETRIES 2
 // A start pressed while the previous dictation finishes runs when that one is
@@ -94,6 +101,7 @@ struct HistoryJobDone {
     std::uint64_t id = 0;
     bool ok = false;       // filled in
     bool skipped = false;  // not tried (the internal runtime is not running)
+    bool unavailable = false; // not tried: the model is down and cannot be started now
     int attempts = 0;      // failed attempts so far
     bool learn = false;    // learn corrections from recorded -> cleaned
     std::string recorded, cleaned;
@@ -1356,6 +1364,8 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 }
             } else if (done->skipped) {
                 self->history_retry_at_[done->id] = now + HISTORY_RETRY_BASE_MS;
+            } else if (done->unavailable) {
+                self->history_retry_at_[done->id] = now + HISTORY_UNAVAILABLE_RETRY_MS;
             } else if (done->attempts > 0) {
                 ULONGLONG delay = HISTORY_RETRY_BASE_MS;
                 for (int i = 1; i < done->attempts && delay < HISTORY_RETRY_MAX_MS; ++i) delay *= 2;
@@ -2751,12 +2761,140 @@ void App::schedule_history_backfill() {
     }
 }
 
+#ifndef _WIN32
+// ".../v1/chat/completions" -> ".../v1/models"; empty for other endpoints.
+static std::string llm_models_url(const std::string& endpoint) {
+    static const std::string suffix = "/chat/completions";
+    if (endpoint.size() <= suffix.size() ||
+        endpoint.compare(endpoint.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return {};
+    }
+    return endpoint.substr(0, endpoint.size() - suffix.size()) + "/models";
+}
+
+// Runs `command` through /bin/sh, in a session of its own, and waits for it:
+// at most `timeout_ms`, and never past the app's shutdown (it is then left
+// running). Returns its exit status; -1 when it could not run, ran too long
+// or was left. `said` gets the last line it printed.
+static int run_shell_command(const std::string& command, int timeout_ms,
+                             const std::atomic<bool>& quit, std::string& said) {
+    said.clear();
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return -1;
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        // Only async-signal-safe calls between fork and exec.
+        setsid();
+        dup2(fds[1], STDOUT_FILENO);
+        dup2(fds[1], STDERR_FILENO);
+        const int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0) dup2(null_fd, STDIN_FILENO);
+        execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    std::string output;
+    char buffer[4096];
+    const auto drain = [&]() {
+        for (ssize_t n; (n = read(fds[0], buffer, sizeof(buffer))) > 0;) {
+            output.append(buffer, static_cast<std::size_t>(n));
+            if (output.size() > 8192) output.erase(0, output.size() - 8192);
+        }
+    };
+    int status = 0;
+    bool exited = false;
+    const auto started = std::chrono::steady_clock::now();
+    for (;;) {
+        drain();
+        const pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid) {
+            exited = true;
+            drain();
+            break;
+        }
+        if (done < 0 || quit.load() ||
+            std::chrono::steady_clock::now() - started > std::chrono::milliseconds(timeout_ms)) {
+            break;
+        }
+        platform::sleep_ms(100);
+    }
+    close(fds[0]);
+    while (!output.empty() && std::isspace(static_cast<unsigned char>(output.back()))) output.pop_back();
+    const auto line = output.rfind('\n');
+    said = line == std::string::npos ? output : output.substr(line + 1);
+    if (said.size() > 200) said.resize(200);
+    if (!exited) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+
+// The external language model answers, or is brought up now with
+// llm_start_command. History worker only.
+bool App::start_llm_for_history(const AppConfig& cfg) {
+#ifdef _WIN32
+    (void)cfg;
+    return true; // not supported here: the requests find out by themselves
+#else
+    const std::string probe = llm_models_url(cfg.llm_endpoint);
+    if (probe.empty() || platform::http_get_ok(probe, 2000)) return true;
+    // Refused a moment ago (graphics card busy): not asked again for every
+    // waiting entry.
+    static ULONGLONG refused_at = 0;
+    if (refused_at && GetTickCount64() - refused_at < 60000) return false;
+    const auto started = std::chrono::steady_clock::now();
+    std::string said;
+    const int status = run_shell_command(cfg.llm_start_command, 10 * 60 * 1000, shutting_down_, said);
+    if (status == 0 && platform::http_get_ok(probe, 2000)) {
+        vtlog("llm: started on demand for History in %lld ms (%s)", elapsed_ms(started), said.c_str());
+        refused_at = 0;
+        history_started_llm_ = true;
+        history_llm_stop_command_ = cfg.llm_stop_command;
+        return true;
+    }
+    refused_at = GetTickCount64();
+    vtlog("llm: not started for History (status %d after %lld ms): %s", status,
+          elapsed_ms(started), said.c_str());
+    return false;
+#endif
+}
+
+void App::stop_llm_started_for_history() {
+    history_started_llm_ = false;
+#ifndef _WIN32
+    if (history_llm_stop_command_.empty()) return;
+    std::string said;
+    const int status = run_shell_command(history_llm_stop_command_, 60 * 1000, shutting_down_, said);
+    vtlog("llm: History idle for %d s: stop command ran (status %d): %s",
+          HISTORY_LLM_STOP_AFTER_MS / 1000, status, said.c_str());
+#endif
+}
+
 void App::history_worker_loop() {
     for (;;) {
         HistoryJob job;
         {
             std::unique_lock<std::mutex> lock(history_jobs_mutex_);
-            history_jobs_cv_.wait(lock, [this]() { return history_worker_stop_ || !history_jobs_.empty(); });
+            const auto has_work = [this]() { return history_worker_stop_ || !history_jobs_.empty(); };
+            // A model the app started for History goes again once History has
+            // had nothing to do for a while, but not during a dictation (its
+            // live rewrites may use the same model).
+            while (history_started_llm_ && !has_work()) {
+                if (history_jobs_cv_.wait_for(lock, std::chrono::milliseconds(HISTORY_LLM_STOP_AFTER_MS),
+                                              has_work)) {
+                    break;
+                }
+                if (recording_.load() || processing_.load()) continue;
+                lock.unlock();
+                stop_llm_started_for_history();
+                lock.lock();
+            }
+            history_jobs_cv_.wait(lock, has_work);
             if (history_worker_stop_) return;
             // New dictations first, in the order they were made; retries after.
             auto next = std::find_if(history_jobs_.begin(), history_jobs_.end(),
@@ -2827,6 +2965,17 @@ void App::run_history_job(const HistoryJob& job) {
             return;
         }
         gemma_last_used_ = GetTickCount64();
+    }
+
+    // An external model started on demand (llm_start_command): bring it up,
+    // or wait without counting an attempt while that is not possible now.
+    if (cfg.llm_provider != "internal" && !cfg.llm_start_command.empty() &&
+        !start_llm_for_history(cfg)) {
+        done->unavailable = true;
+        vtlog("history: entry %llu waits: the language model is down and cannot be started now",
+              static_cast<unsigned long long>(job.entry_id));
+        post_done();
+        return;
     }
 
     const bool thinking = cfg.llm_provider == "internal";

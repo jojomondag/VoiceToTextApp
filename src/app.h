@@ -206,6 +206,12 @@ private:
     bool history_worker_stop_ = false;
     std::thread history_thread_;
     std::atomic<bool> history_llm_busy_{false};
+    // History worker only: it started the external model (llm_start_command)
+    // and stops it with this command once History has idled for a minute.
+    bool history_started_llm_ = false;
+    std::string history_llm_stop_command_;
+    bool start_llm_for_history(const AppConfig& cfg);
+    void stop_llm_started_for_history();
     std::unordered_set<std::uint64_t> history_jobs_queued_;
     std::unordered_map<std::uint64_t, ULONGLONG> history_retry_at_;
     // Entry of the current dictation: saved when capture finished, handed to
