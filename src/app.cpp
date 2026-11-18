@@ -101,6 +101,7 @@ struct HistoryJobDone {
 struct ModelReady {
     std::string id, error;
     bool use_gpu = false;
+    bool announce = true;
 };
 #ifdef _WIN32
 // Diagnostic logging — writes to voicetotext.log next to the exe so the user
@@ -944,13 +945,20 @@ bool App::initialize(HINSTANCE hInstance) {
     std::string toggle_desc = hotkeys_->get_binding_description(HotkeyAction::ToggleRecording);
     bool active_gpu = effective_use_gpu(current_model_size(), cfg.compute_mode);
 
-    tray_->show_notification("VoiceToText - Pianissimo",
-        "Preparing the selected model. Use " + toggle_desc + " when ready.\n"
-        "Language: " + lang_name + "\n"
-        "Compute: " + cfg.compute_mode + (active_gpu ? " (GPU)" : " (CPU)"));
+    // The speech model is loaded at every start (a couple of seconds). Only a
+    // start that has to download it first says so; with the model installed
+    // the app starts quietly (a press of the hotkey meanwhile says to wait).
+    const bool model_installed =
+        speech_model_files_exist(resolve_model_path(cfg.model_dir), current_model_size());
+    if (!model_installed) {
+        tray_->show_notification("VoiceToText - Pianissimo",
+            "Preparing the selected model. Use " + toggle_desc + " when ready.\n"
+            "Language: " + lang_name + "\n"
+            "Compute: " + cfg.compute_mode + (active_gpu ? " (GPU)" : " (CPU)"));
+    }
     if (!toggle_registered) tray_->show_notification("VoiceToText",
         "The recording shortcut is already in use. Start recording from the tray menu.");
-    download_and_select_model(current_model_size());
+    download_and_select_model(current_model_size(), !model_installed);
 
     return true;
 }
@@ -1396,7 +1404,7 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             self->config_->save();
             self->tray_->set_current_model(model->id);
             self->tray_->set_current_compute_mode(self->current_compute_mode(), self->current_gemma_compute_mode());
-            self->tray_->show_notification("Pianissimo", "Selected: " + info->label);
+            if (model->announce) self->tray_->show_notification("Pianissimo", "Selected: " + info->label);
             if (self->dictation_diagnostics_) self->dictation_diagnostics_->write("speech_model_ready", {
                 {"model_id", model->id}, {"use_gpu", model->use_gpu}});
             return 0;
@@ -1969,21 +1977,24 @@ void App::select_model(const std::string& model_id) {
     download_and_select_model(model_id);
 }
 
-void App::download_and_select_model(const std::string& model_id) {
+void App::download_and_select_model(const std::string& model_id, bool announce) {
     // Cancellation invalidates publications immediately, but native inference
     // still has to unwind before another worker can reload or join its warmup.
     if (process_thread_.joinable()) process_thread_.join();
     if (model_download_thread_.joinable()) model_download_thread_.join();
     downloading_model_ = true;
-    if (overlay_) overlay_->show(OverlayState::Downloading, "Preparing Pianissimo...");
+    if (overlay_ && announce) overlay_->show(OverlayState::Downloading, "Preparing Pianissimo...");
     const std::string root = resolve_model_path(config_->config().model_dir);
     const bool gpu = effective_use_gpu(model_id, current_compute_mode());
-    model_download_thread_ = std::thread([this, model_id, root, gpu]() {
+    model_download_thread_ = std::thread([this, model_id, root, gpu, announce]() {
         auto ready = std::make_unique<ModelReady>();
         ready->id = model_id;
         ready->use_gpu = gpu;
+        ready->announce = announce;
         try {
-            if (ensure_speech_model(root, model_id, [this](const std::string& status) {
+            if (ensure_speech_model(root, model_id, [this, announce](const std::string& status) {
+                // A quiet start still shows a download, never the routine checks.
+                if (!announce && status.rfind("Downloading", 0) != 0) return;
                 auto message = std::make_unique<std::string>(status);
                 if (PostMessageW(hwnd_, WM_MODEL_STATUS, 0, reinterpret_cast<LPARAM>(message.get()))) message.release();
             }, &shutting_down_, ready->error)) {

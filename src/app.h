@@ -106,7 +106,9 @@ private:
     void select_model(const std::string& model_size);
     void select_whisper_compute_mode(const std::string& mode);
     void select_gemma_compute_mode(const std::string& mode);
-    void download_and_select_model(const std::string& model_id);
+    // `announce`: show the overlay and a notification while it prepares and
+    // when it is ready. A start with the model already installed is quiet.
+    void download_and_select_model(const std::string& model_id, bool announce = true);
     void select_gemma_model(const std::string& model_id);
     void download_and_select_gemma_model(const std::string& model_id,
                                          const std::string& model_path);
