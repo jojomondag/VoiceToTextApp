@@ -21,6 +21,8 @@
     "llm_provider": "lmstudio",
     "llm_endpoint": "http://127.0.0.1:1234/v1/chat/completions",
     "llm_model": "local-model",
+    "llm_start_command": "",
+    "llm_stop_command": "",
     "llm_internal_model": "auto",
     "llm_internal_model_path": "models/llm/gemma-4-E2B-it-Q8_0.gguf",
     "llm_internal_compute_mode": "auto",

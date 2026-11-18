@@ -412,6 +412,28 @@ works on Windows too). The dictated text is then sent to that service.
 key; the key is never written to `config.json` or the log. For DeepSeek's API
 reasoning is switched off, which keeps the answers fast.
 
+### Local Model Started On Demand
+
+A local OpenAI-compatible server that is not always running (it may give the
+graphics card back when idle) can be started for History by a command of
+your own:
+
+```json
+{
+  "llm_start_command": "/home/you/.local/bin/my-model-up",
+  "llm_stop_command": "/home/you/.local/bin/my-model-down"
+}
+```
+
+When the endpoint's `/models` does not answer before History asks it, the app
+runs `llm_start_command` through `/bin/sh` and waits for it (at most 10
+minutes). Exit status 0 means the model answers now. Anything else means it
+cannot be started now, for instance while a game holds the graphics card:
+History then waits and tries again every 2 minutes, without counting a failed
+attempt. Once History has had nothing to do for a minute and no dictation
+runs, the app runs `llm_stop_command`, if it started the model itself. Live
+rewrites never start the model.
+
 ### File Locations
 
 | What | Where |
@@ -474,6 +496,8 @@ Common settings:
 | `llm_provider` | `internal` for Gemma, or `lmstudio` for an external server. |
 | `llm_endpoint` | OpenAI-compatible chat completions endpoint. |
 | `llm_model` | Model name sent to the LLM endpoint. |
+| `llm_start_command` | Linux: command that brings an external model up for History when it does not answer; exit 0 = it answers now. Default empty. |
+| `llm_stop_command` | Linux: run after History has idled for a minute when the app started the model with `llm_start_command`. Default empty. |
 | `llm_internal_model` | `auto`, `e2b`, `e4b`, `12b`, `26b-a4b`, or `31b`. |
 | `llm_internal_model_path` | Gemma GGUF path used by internal mode. |
 | `llm_internal_server_path` | Path to `llama-server.exe`. |
