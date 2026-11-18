@@ -302,9 +302,10 @@ the running one:
 | --- | --- |
 | `--toggle` | Start or stop recording |
 | `--cancel` | Stop recording; text already written stays |
+| `--submit` | Finish the recording, then press Enter in its window |
 | `--mode-recorded`, `--mode-clean`, `--mode-ai` | Switch live mode while recording |
 | `--dictation` | Open the live dictation window |
-| `--history` | Open History |
+| `--history` | Open History, or close it when it is in view |
 | `--settings` | Open `config.json` |
 | `--quit` | Exit |
 
@@ -314,6 +315,14 @@ Under Hyprland the app registers `Ctrl+Shift+Space` itself while it runs, and
 `Escape` only during a recording, and switches them off when it exits
 (`toggle_key`, `toggle_modifiers`, `cancel_key`, `cancel_modifiers`). If your
 Hyprland config binds the same key, both binds fire: remove one of them.
+
+While a dictation writes, plain `Enter` is taken too
+(`enter_finishes_dictation`, on by default). Pressed in the window being
+dictated into, it ends the dictation like the recording hotkey does, and the
+app presses Enter there itself once the last words (and the Städa text /
+AI-språk result) are written, so the whole text is sent. Enter in any other
+window is passed on at once and the dictation goes on. `Shift+Enter` and other
+combinations are never taken.
 
 ### How Text Is Written
 
@@ -337,11 +346,42 @@ AI-språk, or back to Rösttext) is applied like this instead:
 If you typed, moved the caret, or the field does not select text that way, the
 texts differ, nothing is replaced, and the overlay shows **Texten behålls**.
 
-Dictation stays with the window it started in. If you switch to another window
-while speaking, the words are held (the overlay shows **Väntar på fönstret**)
-and typed into the original window as soon as it has focus again; nothing is
-typed into the window you switched to. Keys cannot be sent to a window without
-focus: Hyprland can address one, but Chromium ignores such keys.
+Dictation stays with the window it started in. A kitty window (Omarchy starts
+every kitty with `allow_remote_control socket-only` and a `listen_on` socket)
+is written to through kitty's socket: the words land in that window even while
+another one has focus, as the exact characters, and so do language-mode
+rewrites and the Enter that ends a dictation. In any other window the words
+are typed as keys, and only when they arrive as typed: the window has had
+focus for a moment, no layer (the Alt+Tab switcher, a launcher) holds the
+keyboard, and no modifier key is down, nor has either just stopped (the
+switcher moves focus about 100 ms after it closes). Until then they are held (the overlay
+shows **Väntar på** and the window's name) and typed as soon as that window
+can take them; nothing is typed into the window you switched to. Keys cannot
+be sent to a window without focus: Hyprland can address one, but Chromium
+ignores such keys.
+
+Hyprland adds the modifiers held on any keyboard to every key the app types,
+so a word typed while Alt or Super is down would turn into shortcuts. The app
+learns which modifier keys are down from `~/.config/hypr/voicetotext.lua`,
+loaded last in `hyprland.lua` with `pcall(require, "hypr.voicetotext")`:
+
+```lua
+local modifier_keys = { [37] = true, [105] = true, [50] = true, [62] = true,
+                        [64] = true, [108] = true, [133] = true, [134] = true }
+__voicetotext_mods = {}
+hl.on("input.keyboard.key", function(keycode, _, state)
+  if modifier_keys[keycode] then __voicetotext_mods[keycode] = (state ~= 0) or nil end
+end)
+```
+
+Without it the app types without that check. A modifier reported held for
+more than 5 s, or a layer holding the keyboard for more than 30 s, is typed
+through anyway.
+
+Words still held when the dictation ends wait for their window with no time
+limit, and the next dictation can start at once; they are dropped (History
+has them) only when that window is closed. A language-mode result for a
+terminal typed into by keys waits at most 10 s, since it deletes by length.
 In a terminal there is no selection to check, so the dictated words are deleted
 by their length and the new text is typed on the same line, flattened to one
 line (a line break would be Enter). This is only right while you leave that
@@ -426,6 +466,7 @@ Common settings:
 | `vad_threshold` | Voice activity sensitivity. Lower is more sensitive. |
 | `toggle_key` | Virtual-key code for the recording hotkey key. |
 | `cancel_key` | Virtual-key code to stop further dictation; text already written stays in place. |
+| `enter_finishes_dictation` | Linux (Hyprland): Enter in the window being dictated into ends the dictation and is pressed there after the last words. Default `true`. |
 | `injection_method` | `auto`, `clipboard`, or `keystrokes`. |
 | `paste_output_mode` | Active live mode: `recorded` (Rösttext), `clean` (Städa text), or `ai` (AI-språk). The selected mode transforms the current owned dictation and subsequent speech. Also chooses the optional manual insertion version. |
 | `dictation_debug_logging` | Local dictation/insertion JSONL diagnostics. Default `true`; set `false` and restart to disable. Contains dictated text. |

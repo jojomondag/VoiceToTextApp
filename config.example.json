@@ -11,6 +11,7 @@
     "vad_threshold": 0.01,
     "toggle_key": 32,
     "cancel_key": 27,
+    "enter_finishes_dictation": true,
     "injection_method": "auto",
     "keystroke_delay_ms": 5,
     "pre_injection_delay_ms": 25,

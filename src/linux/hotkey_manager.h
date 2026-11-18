@@ -14,6 +14,8 @@ namespace vtt {
 enum class HotkeyAction {
     ToggleRecording,
     CancelRecording,
+    // Enter during a dictation: finish it, then press Enter in the window.
+    SubmitRecording,
     SwitchLanguage,
     OpenSettings
 };
@@ -30,7 +32,8 @@ using HotkeyCallback = std::function<void(HotkeyAction)>;
 // and are disabled again when the hotkey is unregistered or the app exits.
 //
 // On other compositors nothing is registered: bind the same commands
-// (`VoiceToText --toggle`, `--cancel`, `--language`) in the compositor config.
+// (`VoiceToText --toggle`, `--cancel`, `--submit`, `--language`) in the
+// compositor config.
 class HotkeyManager {
 public:
     ~HotkeyManager();
@@ -74,5 +77,10 @@ private:
     std::thread reload_thread_;
     std::atomic<bool> stop_{false};
 };
+
+// For a `--submit` that finds no running instance: the app went away with the
+// Enter bind still on, and Enter would be dead in every window. Switches that
+// bind off and presses the key the bind swallowed.
+void pass_on_orphaned_submit();
 
 } // namespace vtt

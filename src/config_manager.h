@@ -36,6 +36,9 @@ struct AppConfig {
     unsigned int toggle_key = VK_SPACE;
     unsigned int cancel_modifiers = 0;
     unsigned int cancel_key = VK_ESCAPE;
+    // Linux (Hyprland): Enter pressed in the window being dictated into ends
+    // the dictation, and is pressed there once the last words are written.
+    bool enter_finishes_dictation = true;
 
     // Text injection
     std::string injection_method = "auto"; // "auto", "clipboard", "keystrokes"
@@ -181,7 +184,7 @@ struct AppConfig {
         model_id, model_dir, model_path, language, use_gpu, compute_mode, n_threads,
         warm_up_model_on_load,
         audio_device, vad_threshold,
-        toggle_key, cancel_key,
+        toggle_key, cancel_key, enter_finishes_dictation,
         injection_method, keystroke_delay_ms, pre_injection_delay_ms,
         paste_output_mode, dictation_debug_logging,
         llm_cleanup_enabled, llm_provider, llm_endpoint, llm_model,

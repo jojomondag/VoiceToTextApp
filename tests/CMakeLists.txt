@@ -41,3 +41,17 @@ target_compile_definitions(ClipboardTransactionTests PRIVATE NOMINMAX)
 target_compile_options(ClipboardTransactionTests PRIVATE /utf-8 /W4)
 target_link_libraries(ClipboardTransactionTests PRIVATE user32 gdi32)
 add_test(NAME ClipboardTransactionTests COMMAND ClipboardTransactionTests)
+
+add_executable(LlmWinHttpTests llm_winhttp_tests.cpp)
+target_include_directories(LlmWinHttpTests PRIVATE "${VTT_REPO}/src" "${VTT_JSON_INCLUDE}")
+target_compile_definitions(LlmWinHttpTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(LlmWinHttpTests PRIVATE /utf-8 /W4)
+target_link_libraries(LlmWinHttpTests PRIVATE winhttp user32 ws2_32)
+add_test(NAME LlmWinHttpTests COMMAND LlmWinHttpTests)
+
+add_executable(TranscriptHistoryTests transcript_history_tests.cpp
+    "${VTT_REPO}/src/transcript_history.cpp")
+target_include_directories(TranscriptHistoryTests PRIVATE "${VTT_REPO}/src" "${VTT_JSON_INCLUDE}")
+target_compile_definitions(TranscriptHistoryTests PRIVATE NOMINMAX)
+target_compile_options(TranscriptHistoryTests PRIVATE /utf-8 /W4)
+add_test(NAME TranscriptHistoryTests COMMAND TranscriptHistoryTests)

@@ -20,6 +20,12 @@ public:
                     ConfigManager* config);
     void shutdown();
     void show();
+    // Closes the window; when it had focus, the window used before it gets
+    // focus back.
+    void hide();
+    // True when the window is open where the user can see it: on a workspace
+    // that a monitor is showing. Open on another workspace does not count.
+    bool on_screen() const;
     void refresh();
 
 private:

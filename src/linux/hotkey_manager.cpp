@@ -3,6 +3,7 @@
 #include "hyprland_ipc.h"
 #include "log.h"
 #include "platform.h"
+#include "virtual_keyboard.h"
 
 #include <cctype>
 #include <chrono>
@@ -24,6 +25,16 @@ namespace {
 const char* const LUA_TABLE = "__voicetotext_binds";
 const char* const LUA_SPECS = "__voicetotext_bind_specs";
 
+// A handle outlives its bind: `hl.unbind(...)`, another script's
+// `bind:remove()` on the same keys and the like drop the bind but leave the
+// handle in the table above. Hyprland 0.56 then dereferences null in
+// set_enabled, is_enabled, remove and every field read, and the whole session
+// dies (pcall cannot catch a segfault). Only tostring() checks for that, so
+// every request defines live() and touches a handle only when it says so.
+const char* const LUA_LIVE =
+    "local function live(b) return b ~= nil and "
+    "tostring(b) ~= \"HL.Keybind(expired)\" end; ";
+
 // The binds must not react to the keys this app sends itself: Hyprland
 // matches binds by keycode against the user's layout, whatever the virtual
 // keyboard's own keymap says. (wtype, used by earlier versions, typed its
@@ -36,6 +47,7 @@ const char* command_name(HotkeyAction action) {
     switch (action) {
         case HotkeyAction::ToggleRecording: return "toggle";
         case HotkeyAction::CancelRecording: return "cancel";
+        case HotkeyAction::SubmitRecording: return "submit";
         case HotkeyAction::SwitchLanguage:  return "language";
         case HotkeyAction::OpenSettings:    return "settings";
     }
@@ -46,6 +58,7 @@ const char* command_description(HotkeyAction action) {
     switch (action) {
         case HotkeyAction::ToggleRecording: return "VoiceToText: start/stop recording";
         case HotkeyAction::CancelRecording: return "VoiceToText: cancel recording";
+        case HotkeyAction::SubmitRecording: return "VoiceToText: finish recording, then Enter";
         case HotkeyAction::SwitchLanguage:  return "VoiceToText: switch language";
         case HotkeyAction::OpenSettings:    return "VoiceToText: open settings";
     }
@@ -155,6 +168,20 @@ bool send(const std::string& command) {
 
 } // namespace
 
+void pass_on_orphaned_submit() {
+    if (hyprland::available() && hyprland::uses_lua()) {
+        std::string table = LUA_TABLE;
+        std::string id = hyprland::lua_quote(command_name(HotkeyAction::SubmitRecording));
+        send("eval " + std::string(LUA_LIVE) + "local t = " + table +
+             "; if t and live(t[" + id + "]) then "
+             "pcall(function() t[" + id + "]:set_enabled(false) end) end");
+    }
+    if (virtual_keyboard::press_key("Return")) {
+        // The compositor drops the key when its keyboard goes away at once.
+        platform::sleep_ms(500);
+    }
+}
+
 HotkeyManager::~HotkeyManager() {
     shutdown();
 }
@@ -173,9 +200,9 @@ bool HotkeyManager::initialize(HWND /*hwnd*/) {
     if (hyprland::uses_lua()) {
         // Binds a previous run left switched on (it crashed or was killed).
         std::string table = LUA_TABLE;
-        send("eval local t = " + table + "; "
-             "if t then for _, b in pairs(t) do "
-             "pcall(function() b:set_enabled(false) end) end end");
+        send("eval " + std::string(LUA_LIVE) + "local t = " + table + "; "
+             "if t then for _, b in pairs(t) do if live(b) then "
+             "pcall(function() b:set_enabled(false) end) end end end");
     }
 
     stop_ = false;
@@ -277,9 +304,11 @@ bool HotkeyManager::apply_locked(HotkeyAction action, HotkeyBinding& binding) {
         // when it is for the same keys and command, otherwise retire it and
         // bind anew.
         ok = send(
-            "eval local t = " + table + " or {}; " + table + " = t; "
+            "eval " + std::string(LUA_LIVE) +
+            "local t = " + table + " or {}; " + table + " = t; "
             "local s = " + specs + " or {}; " + specs + " = s; "
             "local old = t[" + id + "]; "
+            "if not live(old) then old = nil end; "
             "if old and s[" + id + "] == " + spec + " then old:set_enabled(true) "
             "else "
             "if old then pcall(function() old:set_enabled(false) end) end; "
@@ -314,7 +343,8 @@ void HotkeyManager::remove_locked(HotkeyAction action, HotkeyBinding& binding) {
     if (hyprland::uses_lua()) {
         std::string table = LUA_TABLE;
         std::string id = hyprland::lua_quote(command_name(action));
-        send("eval local t = " + table + "; if t and t[" + id + "] then "
+        send("eval " + std::string(LUA_LIVE) + "local t = " + table +
+             "; if t and live(t[" + id + "]) then "
              "pcall(function() t[" + id + "]:set_enabled(false) end) end");
     } else {
         send("keyword unbind " + key_spec(binding.modifiers, key, false));

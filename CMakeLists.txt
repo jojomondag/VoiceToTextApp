@@ -135,7 +135,9 @@ else()
         src/linux/main.cpp
         src/linux/win_compat.cpp
         src/linux/platform_linux.cpp
+        src/linux/process_priority.cpp
         src/linux/hyprland_ipc.cpp
+        src/linux/kitty_remote.cpp
         src/linux/wayland_input.cpp
         src/linux/virtual_keyboard.cpp
         "${VTT_PROTOCOL_DIR}/virtual-keyboard-unstable-v1-protocol.c"

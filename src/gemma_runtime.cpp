@@ -275,8 +275,6 @@ bool GemmaRuntime::start(const std::string& llama_server_path,
         llama_server_path, "-m", model_path, "--host", "127.0.0.1",
         "--port", std::to_string(port), "--ctx-size", "4096", "--parallel", "1",
         "--n-gpu-layers", gpu ? "999" : "0",
-        // Frees the GPU memory after 5 idle minutes; the next request reloads the model (~1 s).
-        "--sleep-idle-seconds", "300",
     };
     std::vector<char*> argv;
     for (auto& argument : arguments) argv.push_back(argument.data());

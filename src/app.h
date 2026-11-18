@@ -3,9 +3,13 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -59,6 +63,11 @@ private:
     void start_recording();
     void stop_recording();
     void cancel_recording();
+#ifndef _WIN32
+    // Enter pressed during a dictation (see submit_recording in app.cpp).
+    void submit_recording();
+    void finish_submit(bool press_enter);
+#endif
 
     // Transcription
     void transcribe_live(unsigned long long session);
@@ -70,6 +79,25 @@ private:
     void apply_live_mode_results();
     void refresh_live_mode_status();
     void complete_live_capture();
+    void hand_off_dictation(const std::string& text);
+
+    // History: the recorded text is saved at once; the language-model
+    // versions are filled in later by a background worker.
+    struct HistoryJob {
+        std::uint64_t entry_id = 0;
+        std::string recorded;
+        AppConfig cfg;
+        std::string corrections;
+        int attempts = 0;
+        bool backfill = false;
+    };
+    std::uint64_t save_dictation_to_history(const std::string& text);
+    void enqueue_history_job(std::uint64_t entry_id, const std::string& recorded,
+                             int attempts, bool backfill);
+    void schedule_history_backfill();
+    void history_worker_loop();
+    void run_history_job(const HistoryJob& job);
+    bool wait_for_live_llm_idle();
 
     // Language
     void switch_language();
@@ -78,7 +106,9 @@ private:
     void select_model(const std::string& model_size);
     void select_whisper_compute_mode(const std::string& mode);
     void select_gemma_compute_mode(const std::string& mode);
-    void download_and_select_model(const std::string& model_id);
+    // `announce`: show the overlay and a notification while it prepares and
+    // when it is ready. A start with the model already installed is quiet.
+    void download_and_select_model(const std::string& model_id, bool announce = true);
     void select_gemma_model(const std::string& model_id);
     void download_and_select_gemma_model(const std::string& model_id,
                                          const std::string& model_path);
@@ -127,8 +157,10 @@ private:
     HINSTANCE hInstance_ = nullptr;
     UINT taskbar_created_msg_ = 0;
 #ifndef _WIN32
-    // When the last start/stop command arrived (for the double-press guard).
+    // When the last start/stop command arrived, and whether it started (or
+    // queued) a dictation (for the double-press guard).
     ULONGLONG last_toggle_command_ = 0;
+    bool last_toggle_started_ = false;
 #endif
     std::atomic<bool> recording_{false};
     std::atomic<bool> processing_{false};
@@ -146,6 +178,8 @@ private:
     std::string applied_live_raw_;
     std::string live_status_key_;
     ULONGLONG live_result_wait_started_ = 0;
+    // The dictation's held last words were left waiting for their window.
+    bool live_output_parked_ = false;
     ULONGLONG last_live_mode_poll_ = 0;
     bool live_session_active_ = false;
     bool live_capture_finished_ = false;
@@ -157,11 +191,35 @@ private:
     AppConfig live_settings_;
     std::string live_corrections_;
     std::mutex llm_work_mutex_;
+    std::atomic<ULONGLONG> gemma_last_used_{0};
+    ULONGLONG gemma_retry_after_ = 0; // guarded by llm_work_mutex_
     std::atomic<bool> live_llm_busy_{false};
     std::thread process_thread_;
     std::thread model_download_thread_;
     std::thread warmup_thread_;
-    std::thread history_append_thread_;
+
+    // Background History worker. The queue is guarded by history_jobs_mutex_;
+    // the rest is used on the UI thread only, except history_llm_busy_.
+    std::mutex history_jobs_mutex_;
+    std::condition_variable history_jobs_cv_;
+    std::deque<HistoryJob> history_jobs_;
+    bool history_worker_stop_ = false;
+    std::thread history_thread_;
+    std::atomic<bool> history_llm_busy_{false};
+    std::unordered_set<std::uint64_t> history_jobs_queued_;
+    std::unordered_map<std::uint64_t, ULONGLONG> history_retry_at_;
+    // Entry of the current dictation: saved when capture finished, handed to
+    // the worker once its live output is done.
+    std::uint64_t history_entry_id_ = 0;
+    // A start pressed while the previous dictation was still finishing.
+    ULONGLONG start_after_handoff_ = 0;
+#ifndef _WIN32
+    // Enter was pressed during the dictation and is owed to its window once
+    // the last words are written.
+    bool submit_pending_ = false;
+    // When an Enter from another window was last passed on.
+    ULONGLONG submit_passed_on_ = 0;
+#endif
 
 };
 

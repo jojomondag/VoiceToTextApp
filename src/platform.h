@@ -44,6 +44,11 @@ bool http_post_json(const std::string& url, const std::string& body,
 // True when a GET answers 2xx within the timeout.
 bool http_get_ok(const std::string& url, int timeout_ms);
 
+// Blocking GET. Returns the HTTP status (any), 0 when nothing answered within
+// the timeout. `bearer_token`, when not empty, is sent as the Authorization header.
+long http_get(const std::string& url, int timeout_ms, std::string& response,
+              const std::string& bearer_token = {});
+
 // Full path of a program on PATH, empty when it is not there.
 std::string find_program(const std::string& name);
 
