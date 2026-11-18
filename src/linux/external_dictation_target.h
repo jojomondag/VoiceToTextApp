@@ -65,6 +65,15 @@ public:
     // without focus; they are not written. Lasts until the next session.
     void drop_held();
 
+    // The window dictation writes to has keyboard focus right now (asks the
+    // compositor; false while no window has been chosen yet).
+    bool target_has_focus();
+    // Presses Enter, after everything queued before it has been written.
+    // With `into_target` only when the window dictation writes to still has
+    // focus and its output was not given up (drop_held); otherwise the key
+    // goes to whatever has focus.
+    void press_return(bool into_target);
+
     // Only the last contiguous insertion belongs to dictation. A background
     // result may revise its raw prefix while later speech remains intact.
     DictationRevision revision_context();

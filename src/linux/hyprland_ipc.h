@@ -39,6 +39,14 @@ bool active_window(Window& window);
 bool find_window(std::uintptr_t address, Window& window);
 // Gives a window keyboard focus.
 bool focus_window(std::uintptr_t address);
+// Whether a window of process `pid` whose title starts with `title_prefix` is
+// on a workspace that a monitor is showing right now. Returns false, and
+// leaves `shown` alone, when Hyprland cannot be asked.
+bool window_shown(long pid, const std::string& title_prefix, bool& shown);
+// When that window has keyboard focus: gives focus back to the window that
+// had it before (going to its workspace) and leaves the mouse pointer where it
+// is. Returns false when nothing was done.
+bool focus_previous_window(long pid, const std::string& title_prefix);
 
 
 } // namespace hyprland

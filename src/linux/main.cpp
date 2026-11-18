@@ -1,5 +1,6 @@
 #include "app.h"
 #include "app_icon.h"
+#include "hotkey_manager.h"
 #include "process_priority.h"
 
 #include <QApplication>
@@ -150,11 +151,12 @@ void print_usage() {
         "passed to the instance that is already running:\n"
         "  --toggle     start or stop recording\n"
         "  --cancel     cancel the current recording\n"
+        "  --submit     finish the recording, then press Enter in its window\n"
         "  --mode-recorded | --mode-clean | --mode-ai\n"
         "               switch the live mode while recording\n"
         "               (Rösttext, Städa text, AI-språk)\n"
         "  --dictation  open the live dictation window\n"
-        "  --history    open the History window\n"
+        "  --history    open the History window, or close it when it is in view\n"
         "  --settings   open config.json\n"
         "  --quit       exit the running instance");
 }
@@ -169,7 +171,8 @@ int main(int argc, char** argv) {
             print_usage();
             return 0;
         }
-        if (arg == "--toggle" || arg == "--cancel" || arg == "--language" ||
+        if (arg == "--toggle" || arg == "--cancel" || arg == "--submit" ||
+            arg == "--language" ||
             arg == "--history" || arg == "--settings" || arg == "--quit" ||
             arg == "--dictation" || arg == "--mode-recorded" ||
             arg == "--mode-clean" || arg == "--mode-ai") {
@@ -179,6 +182,7 @@ int main(int argc, char** argv) {
 
     if (!command.empty()) {
         if (send_command(command)) return 0;
+        if (command == "submit") vtt::pass_on_orphaned_submit();
         std::fprintf(stderr, "VoiceToText is not running.\n");
         return 1;
     }

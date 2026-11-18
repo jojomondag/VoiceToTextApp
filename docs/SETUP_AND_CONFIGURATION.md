@@ -302,9 +302,10 @@ the running one:
 | --- | --- |
 | `--toggle` | Start or stop recording |
 | `--cancel` | Stop recording; text already written stays |
+| `--submit` | Finish the recording, then press Enter in its window |
 | `--mode-recorded`, `--mode-clean`, `--mode-ai` | Switch live mode while recording |
 | `--dictation` | Open the live dictation window |
-| `--history` | Open History |
+| `--history` | Open History, or close it when it is in view |
 | `--settings` | Open `config.json` |
 | `--quit` | Exit |
 
@@ -314,6 +315,14 @@ Under Hyprland the app registers `Ctrl+Shift+Space` itself while it runs, and
 `Escape` only during a recording, and switches them off when it exits
 (`toggle_key`, `toggle_modifiers`, `cancel_key`, `cancel_modifiers`). If your
 Hyprland config binds the same key, both binds fire: remove one of them.
+
+While a dictation writes, plain `Enter` is taken too
+(`enter_finishes_dictation`, on by default). Pressed in the window being
+dictated into, it ends the dictation like the recording hotkey does, and the
+app presses Enter there itself once the last words (and the Städa text /
+AI-språk result) are written, so the whole text is sent. Enter in any other
+window is passed on at once and the dictation goes on. `Shift+Enter` and other
+combinations are never taken.
 
 ### How Text Is Written
 
@@ -426,6 +435,7 @@ Common settings:
 | `vad_threshold` | Voice activity sensitivity. Lower is more sensitive. |
 | `toggle_key` | Virtual-key code for the recording hotkey key. |
 | `cancel_key` | Virtual-key code to stop further dictation; text already written stays in place. |
+| `enter_finishes_dictation` | Linux (Hyprland): Enter in the window being dictated into ends the dictation and is pressed there after the last words. Default `true`. |
 | `injection_method` | `auto`, `clipboard`, or `keystrokes`. |
 | `paste_output_mode` | Active live mode: `recorded` (Rösttext), `clean` (Städa text), or `ai` (AI-språk). The selected mode transforms the current owned dictation and subsequent speech. Also chooses the optional manual insertion version. |
 | `dictation_debug_logging` | Local dictation/insertion JSONL diagnostics. Default `true`; set `false` and restart to disable. Contains dictated text. |

@@ -381,6 +381,19 @@ struct ExternalDictationTarget::Impl {
         return now_focused;
     }
 
+    // The window dictation writes to has keyboard focus at this moment.
+    bool target_focused_now() {
+        if (!hyprland::available()) return !own_window_focused.load();
+        std::uintptr_t address = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!have_target || target_is_own) return false;
+            address = target.address;
+        }
+        hyprland::Window focused;
+        return hyprland::active_window(focused) && focused.address == address;
+    }
+
     bool send_key(const std::string& key, const std::vector<std::string>& modifiers = {},
                   int count = 1) {
         return wayland_input::press_key(key, modifiers, count);
@@ -877,6 +890,28 @@ void ExternalDictationTarget::drop_held() {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->held_updates = 0;
         if (untyped) impl_->speech_untyped = true;
+    });
+}
+
+bool ExternalDictationTarget::target_has_focus() {
+    return impl_->target_focused_now();
+}
+
+void ExternalDictationTarget::press_return(bool into_target) {
+    impl_->enqueue_output([this, into_target]() {
+        if (into_target) {
+            const char* reason = impl_->abandoned.load() ? "its output was given up"
+                : !impl_->target_focused_now() ? "the window lost focus" : nullptr;
+            if (reason) {
+                vtlog("dictation target: Enter not pressed (%s)", reason);
+                impl_->trace("submit_key_dropped", {{"reason", reason}});
+                return;
+            }
+        }
+        const bool pressed = impl_->send_key("Return");
+        vtlog("dictation target: Enter %s%s", pressed ? "pressed" : "could NOT be pressed",
+              into_target ? " after the dictation" : " (passed on)");
+        impl_->trace("submit_key", {{"pressed", pressed}, {"into_target", into_target}});
     });
 }
 

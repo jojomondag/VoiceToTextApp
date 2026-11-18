@@ -46,6 +46,8 @@
 #define GEMMA_IDLE_MS 300000
 // After Stop, how long held words wait for their window to get focus again.
 #define LIVE_FOCUS_WAIT_MS 10000
+// An Enter this soon after one was passed on is taken for the same key.
+#define SUBMIT_ECHO_MS 300
 // How often History entries still waiting for the language model are retried.
 #define HISTORY_BACKFILL_TICK_MS 15000
 // First retry delay of a failed History entry; doubles per failure up to the cap.
@@ -1224,6 +1226,10 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             self->dictation_window_->finish_session();
             if (!done->error.empty()) {
                 self->hotkeys_->unregister_hotkey(HotkeyAction::CancelRecording);
+#ifndef _WIN32
+                // The text may be incomplete: Enter is not pressed for the user.
+                self->finish_submit(false);
+#endif
                 self->live_session_active_ = false;
                 self->mode_switch_policy_.clear();
                 self->live_results_.clear();
@@ -1469,10 +1475,20 @@ void App::handle_command(const std::string& command, const std::string& source) 
         last_toggle_started_ = was_idle && (recording_.load() || start_after_handoff_ != 0);
     } else if (command == "cancel") {
         on_hotkey(HotkeyAction::CancelRecording);
+    } else if (command == "submit") {
+        submit_recording();
     } else if (command == "language") {
         on_hotkey(HotkeyAction::SwitchLanguage);
     } else if (command == "history") {
-        on_tray_action(TrayAction::OpenHistory);
+        // A bar button sends this: pressed while the window is in view it
+        // closes it again and the window used before it comes back. A window
+        // left on another workspace is brought over.
+        if (history_window_ && history_window_->on_screen()) {
+            history_window_->hide();
+            vtlog("history window closed");
+        } else {
+            on_tray_action(TrayAction::OpenHistory);
+        }
     } else if (command == "dictation") {
         on_tray_action(TrayAction::OpenDictation);
     } else if (command == "settings") {
@@ -2568,6 +2584,10 @@ void App::complete_live_capture() {
     KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
     external_dictation_->finish_session();
     dictation_window_->finish_session();
+#ifndef _WIN32
+    // Everything is written: now the Enter that ended the dictation, if any.
+    finish_submit(true);
+#endif
     // What the dictation leaves behind is the text that was typed, with no
     // output pending now. The transcript window shows each phrase as the
     // speech model's final result, which can differ from the words already
@@ -2900,6 +2920,14 @@ void App::start_recording() {
     manual_output_requested_ = false;
     recording_ = true;
     hotkeys_->register_hotkey(HotkeyAction::CancelRecording, cfg.cancel_modifiers, cfg.cancel_key);
+#ifndef _WIN32
+    // Enter is ours for as long as this dictation writes: see submit_recording().
+    submit_pending_ = false;
+    submit_passed_on_ = 0;
+    if (cfg.enter_finishes_dictation) {
+        hotkeys_->register_hotkey(HotkeyAction::SubmitRecording, 0, VK_RETURN);
+    }
+#endif
     dictation_window_->begin_session();
     external_dictation_->begin_session();
     const auto context = external_dictation_->revision_context();
@@ -2955,6 +2983,9 @@ void App::cancel_recording() {
     recording_ = false;
     processing_ = false;
     hotkeys_->unregister_hotkey(HotkeyAction::CancelRecording);
+#ifndef _WIN32
+    finish_submit(false);
+#endif
     KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
     dictation_window_->finish_session();
     external_dictation_->cancel_session();
@@ -2963,6 +2994,59 @@ void App::cancel_recording() {
     if (overlay_) overlay_->hide();
     if (tray_) tray_->set_recording(false);
 }
+
+#ifndef _WIN32
+// Enter, taken by the compositor bind while a dictation writes. Pressed in
+// the window being dictated into it means "I am done, send this": the
+// dictation is finished as with the recording hotkey, and Enter is pressed
+// there only after the last words (and the language-mode result) are written,
+// so nothing lands in the field after the message is gone. Enter in any other
+// window has nothing to do with the dictation and is passed on at once.
+void App::submit_recording() {
+    if (!live_session_active_) {
+        // The bind outlived its dictation: never swallow the key.
+        hotkeys_->unregister_hotkey(HotkeyAction::SubmitRecording);
+        external_dictation_->press_return(false);
+        return;
+    }
+    if (submit_pending_) {
+        vtlog("submit: Enter ignored, one is already waiting for the last words");
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (submit_passed_on_ && now - submit_passed_on_ < SUBMIT_ECHO_MS) {
+        // Right after an Enter was passed on: most likely that very key,
+        // caught by the bind again. Give the key up for this dictation
+        // rather than go round in circles with it.
+        vtlog("submit: Enter came back %llu ms after it was passed on; Enter is left alone for this dictation",
+              static_cast<unsigned long long>(now - submit_passed_on_));
+        submit_passed_on_ = 0;
+        hotkeys_->unregister_hotkey(HotkeyAction::SubmitRecording);
+        external_dictation_->press_return(false);
+        return;
+    }
+    if (!external_dictation_->target_has_focus()) {
+        submit_passed_on_ = now;
+        external_dictation_->press_return(false);
+        return;
+    }
+    submit_pending_ = true;
+    vtlog("submit: Enter in the dictation window (recording=%d); pressed there once the text is written",
+          recording_.load() ? 1 : 0);
+    if (dictation_diagnostics_) dictation_diagnostics_->write("submit_requested", {
+        {"capture_session", dictation_session_.load()}, {"recording", recording_.load()}});
+    if (recording_.load()) stop_recording();
+}
+
+// The dictation is over: Enter goes back to the applications, and the one
+// taken by submit_recording() is pressed now, or deliberately not.
+void App::finish_submit(bool press_enter) {
+    hotkeys_->unregister_hotkey(HotkeyAction::SubmitRecording);
+    if (submit_pending_ && press_enter) external_dictation_->press_return(true);
+    else if (submit_pending_) vtlog("submit: Enter not pressed (dictation cancelled or failed)");
+    submit_pending_ = false;
+}
+#endif
 
 void App::transcribe_live(unsigned long long session) {
     auto finished = std::make_unique<DictationFinished>();

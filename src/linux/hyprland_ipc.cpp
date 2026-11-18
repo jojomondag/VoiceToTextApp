@@ -184,5 +184,95 @@ bool focus_window(std::uintptr_t address) {
     return request(command, reply) && trim(reply) == "ok";
 }
 
+bool window_shown(long pid, const std::string& title_prefix, bool& shown) {
+    std::string clients_reply;
+    std::string monitors_reply;
+    if (!request("j/clients", clients_reply) || !request("j/monitors", monitors_reply)) {
+        return false;
+    }
+    try {
+        auto clients = nlohmann::json::parse(clients_reply);
+        auto monitors = nlohmann::json::parse(monitors_reply);
+        if (!clients.is_array() || !monitors.is_array()) return false;
+
+        // The ordinary workspace of every monitor plus an open special one.
+        std::vector<long long> showing;
+        for (const auto& monitor : monitors) {
+            if (!monitor.is_object()) continue;
+            for (const char* key : {"activeWorkspace", "specialWorkspace"}) {
+                auto workspace = monitor.find(key);
+                if (workspace == monitor.end() || !workspace->is_object()) continue;
+                // No special workspace open is reported as id 0.
+                const long long id = workspace->value("id", 0LL);
+                if (id != 0) showing.push_back(id);
+            }
+        }
+
+        bool found = false;
+        for (const auto& client : clients) {
+            if (!client.is_object() || client.value("pid", 0L) != pid) continue;
+            if (client.value("title", std::string()).rfind(title_prefix, 0) != 0) continue;
+            if (!client.value("mapped", true) || client.value("hidden", false)) continue;
+            auto workspace = client.find("workspace");
+            if (workspace == client.end() || !workspace->is_object()) continue;
+            const long long id = workspace->value("id", 0LL);
+            if (std::find(showing.begin(), showing.end(), id) != showing.end()) {
+                found = true;
+                break;
+            }
+        }
+        shown = found;
+        return true;
+    } catch (const nlohmann::json::exception&) {
+        return false;
+    }
+}
+
+bool focus_previous_window(long pid, const std::string& title_prefix) {
+    std::string reply;
+    if (!request("j/clients", reply)) return false;
+    std::uintptr_t previous = 0;
+    try {
+        auto clients = nlohmann::json::parse(reply);
+        if (!clients.is_array()) return false;
+
+        // focusHistoryID: 0 is the focused window, 1 the one before it, ...
+        bool focused = false;
+        long long best = 0;
+        for (const auto& client : clients) {
+            if (!client.is_object()) continue;
+            if (!client.value("mapped", true) || client.value("hidden", false)) continue;
+            const long long order = client.value("focusHistoryID", -1LL);
+            const bool own = client.value("pid", 0L) == pid &&
+                client.value("title", std::string()).rfind(title_prefix, 0) == 0;
+            if (own) {
+                if (order == 0) focused = true;
+                continue;
+            }
+            Window candidate;
+            if (order < 1 || (previous && order >= best)) continue;
+            if (!parse_window(client, candidate)) continue;
+            previous = candidate.address;
+            best = order;
+        }
+        if (!focused || !previous) return false;
+    } catch (const nlohmann::json::exception&) {
+        return false;
+    }
+
+    if (uses_lua()) {
+        // One request, so the pointer is back before a frame shows it moved.
+        const std::string focus =
+            "hl.dsp.focus({ window = " + lua_quote(address_selector(previous)) + " })";
+        if (request("eval local p = hl.get_cursor_pos(); hl.dispatch(" + focus +
+                    "); if p then hl.dispatch(hl.dsp.cursor.move({ x = p.x, y = p.y })) end",
+                    reply) &&
+            trim(reply) == "ok") {
+            return true;
+        }
+    }
+    return focus_window(previous);
+}
+
 } // namespace hyprland
 } // namespace vtt

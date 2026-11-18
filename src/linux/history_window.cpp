@@ -2,6 +2,7 @@
 
 #include "app_icon.h"
 #include "config_manager.h"
+#include "hyprland_ipc.h"
 #include "transcript_history.h"
 
 #include <QAbstractTextDocumentLayout>
@@ -41,6 +42,9 @@ constexpr int HISTORY_TEXT_RIGHT_MARGIN = 8;
 constexpr int ENTRY_TEXT_INSET = 8;
 constexpr int ENTRY_GAP = 10;
 constexpr qreal PANEL_RADIUS = 7.0;
+
+// Also how the window is found among the windows Hyprland lists.
+const QString HISTORY_TITLE = QStringLiteral("VoiceToText History");
 
 const QColor COLOR_BG(17, 23, 31);
 const QColor COLOR_PANEL(31, 40, 52);
@@ -548,7 +552,7 @@ class HistoryWindow::Widget : public QWidget {
 public:
     Widget(TranscriptHistory* history, ConfigManager* config)
         : history_(history), config_(config) {
-        setWindowTitle(QStringLiteral("VoiceToText History"));
+        setWindowTitle(HISTORY_TITLE);
         setWindowIcon(create_app_icon(QColor(0, 120, 215)));
         setStyleSheet(QString::fromUtf8(CONTROL_STYLE));
         setMinimumSize(720, 360);
@@ -1045,6 +1049,27 @@ void HistoryWindow::show() {
     widget_->raise();
     widget_->activateWindow();
     widget_->scroll_to_top();
+}
+
+void HistoryWindow::hide() {
+    if (!widget_) return;
+    // First, so the view goes straight back instead of to an empty workspace.
+    if (widget_->isVisible()) {
+        hyprland::focus_previous_window(static_cast<long>(QCoreApplication::applicationPid()),
+                                        HISTORY_TITLE.toStdString());
+    }
+    widget_->hide();
+}
+
+bool HistoryWindow::on_screen() const {
+    if (!widget_ || !widget_->isVisible()) return false;
+    bool shown = false;
+    if (hyprland::window_shown(static_cast<long>(QCoreApplication::applicationPid()),
+                               HISTORY_TITLE.toStdString(), shown)) {
+        return shown;
+    }
+    // Not under Hyprland: open is all that can be known.
+    return true;
 }
 
 void HistoryWindow::refresh() {

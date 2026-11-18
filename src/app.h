@@ -63,6 +63,11 @@ private:
     void start_recording();
     void stop_recording();
     void cancel_recording();
+#ifndef _WIN32
+    // Enter pressed during a dictation (see submit_recording in app.cpp).
+    void submit_recording();
+    void finish_submit(bool press_enter);
+#endif
 
     // Transcription
     void transcribe_live(unsigned long long session);
@@ -206,6 +211,13 @@ private:
     std::uint64_t history_entry_id_ = 0;
     // A start pressed while the previous dictation was still finishing.
     ULONGLONG start_after_handoff_ = 0;
+#ifndef _WIN32
+    // Enter was pressed during the dictation and is owed to its window once
+    // the last words are written.
+    bool submit_pending_ = false;
+    // When an Enter from another window was last passed on.
+    ULONGLONG submit_passed_on_ = 0;
+#endif
 
 };
 
