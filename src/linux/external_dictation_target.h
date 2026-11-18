@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -32,6 +33,14 @@ class DictationDiagnostics;
 // Window focus is tracked through Hyprland; on other compositors words are
 // typed but never revised. Calls come from the UI thread; all input is sent
 // from one worker thread.
+//
+// A kitty window (Omarchy starts every kitty with remote control, see
+// kitty_remote.h) is written to through kitty's socket instead: the words reach that window
+// even while another one has focus, and no keys are pressed. Everywhere else
+// keys are typed only when they arrive as typed: the window has had focus for
+// a moment, no layer (Alt+Tab switcher, launcher) holds the keyboard and no
+// modifier key is down (Hyprland adds held modifiers to every key, see
+// ~/.config/hypr/voicetotext.lua). Until then words are held.
 class ExternalDictationTarget {
 public:
     struct DictationRevision {
@@ -46,6 +55,11 @@ public:
         // Words or a language-mode result are held because the window they
         // belong in lacks focus.
         bool waiting_for_focus = false;
+        // Words or a language-mode result are held for any reason (no focus,
+        // or keys would not arrive as typed right now).
+        bool output_held = false;
+        // The window they wait for, as the overlay names it.
+        std::string waiting_for;
     };
 
     ExternalDictationTarget();
@@ -64,14 +78,28 @@ public:
     // Gives up on words and language-mode results waiting for a window
     // without focus; they are not written. Lasts until the next session.
     void drop_held();
+    // The dictation is over while its last words are held: they wait for
+    // their window with no time limit and are written when it can take keys
+    // again (dropped only when it is closed), and the next dictation does not
+    // wait for them. A held language-mode result keeps waiting the same way
+    // until the next dictation begins. typed_speech() counts the waiting
+    // words. Blocks until the worker has taken them over (at most a second).
+    bool park_held();
+    // The window that held text waits for, as the overlay names it; empty
+    // when nothing waits.
+    std::string waiting_for() const;
+    // Called on the worker thread with the window's name when text waiting
+    // for a window is dropped because that window was closed.
+    void set_parcel_dropped_callback(std::function<void(const std::string&)> callback);
 
     // The window dictation writes to has keyboard focus right now (asks the
     // compositor; false while no window has been chosen yet).
     bool target_has_focus();
     // Presses Enter, after everything queued before it has been written.
-    // With `into_target` only when the window dictation writes to still has
-    // focus and its output was not given up (drop_held); otherwise the key
-    // goes to whatever has focus.
+    // With `into_target` only into the window dictation writes to: through
+    // kitty's socket for an agent window, otherwise only while it still has
+    // focus and no menu holds the keyboard; never when its output was given
+    // up (drop_held). Without `into_target` the key goes to whatever has focus.
     void press_return(bool into_target);
 
     // Only the last contiguous insertion belongs to dictation. A background

@@ -346,11 +346,41 @@ AI-språk, or back to Rösttext) is applied like this instead:
 If you typed, moved the caret, or the field does not select text that way, the
 texts differ, nothing is replaced, and the overlay shows **Texten behålls**.
 
-Dictation stays with the window it started in. If you switch to another window
-while speaking, the words are held (the overlay shows **Väntar på fönstret**)
-and typed into the original window as soon as it has focus again; nothing is
-typed into the window you switched to. Keys cannot be sent to a window without
-focus: Hyprland can address one, but Chromium ignores such keys.
+Dictation stays with the window it started in. A kitty window (Omarchy starts
+every kitty with `allow_remote_control socket-only` and a `listen_on` socket)
+is written to through kitty's socket: the words land in that window even while
+another one has focus, as the exact characters, and so do language-mode
+rewrites and the Enter that ends a dictation. In any other window the words
+are typed as keys, and only when they arrive as typed: the window has had
+focus for a moment, no layer (the Alt+Tab switcher, a launcher) holds the
+keyboard, and no modifier key is down. Until then they are held (the overlay
+shows **Väntar på** and the window's name) and typed as soon as that window
+can take them; nothing is typed into the window you switched to. Keys cannot
+be sent to a window without focus: Hyprland can address one, but Chromium
+ignores such keys.
+
+Hyprland adds the modifiers held on any keyboard to every key the app types,
+so a word typed while Alt or Super is down would turn into shortcuts. The app
+learns which modifier keys are down from `~/.config/hypr/voicetotext.lua`,
+loaded last in `hyprland.lua` with `pcall(require, "hypr.voicetotext")`:
+
+```lua
+local modifier_keys = { [37] = true, [105] = true, [50] = true, [62] = true,
+                        [64] = true, [108] = true, [133] = true, [134] = true }
+__voicetotext_mods = {}
+hl.on("input.keyboard.key", function(keycode, _, state)
+  if modifier_keys[keycode] then __voicetotext_mods[keycode] = (state ~= 0) or nil end
+end)
+```
+
+Without it the app types without that check. A modifier reported held for
+more than 5 s, or a layer holding the keyboard for more than 30 s, is typed
+through anyway.
+
+Words still held when the dictation ends wait for their window with no time
+limit, and the next dictation can start at once; they are dropped (History
+has them) only when that window is closed. A language-mode result for a
+terminal typed into by keys waits at most 10 s, since it deletes by length.
 In a terminal there is no selection to check, so the dictated words are deleted
 by their length and the new text is typed on the same line, flattened to one
 line (a line break would be Enter). This is only right while you leave that

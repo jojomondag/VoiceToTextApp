@@ -176,8 +176,8 @@ private:
     std::string applied_live_raw_;
     std::string live_status_key_;
     ULONGLONG live_result_wait_started_ = 0;
-    ULONGLONG live_focus_wait_started_ = 0;
-    bool live_focus_wait_expired_ = false;
+    // The dictation's held last words were left waiting for their window.
+    bool live_output_parked_ = false;
     ULONGLONG last_live_mode_poll_ = 0;
     bool live_session_active_ = false;
     bool live_capture_finished_ = false;

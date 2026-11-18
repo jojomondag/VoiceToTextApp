@@ -135,6 +135,7 @@ bool parse_window(const nlohmann::json& json, Window& window) {
     }
     window.pid = json.value("pid", 0L);
     window.window_class = lower(json.value("class", std::string()));
+    window.title = json.value("title", std::string());
     return window.address != 0;
 }
 
@@ -147,6 +148,45 @@ std::string address_selector(std::uintptr_t address) {
 
 } // namespace
 
+bool keyboard_state(KeyboardState& state) {
+    if (!uses_lua()) return false;
+    // "repl" returns what the code returns. Layers with exclusive keyboard
+    // interactivity (1) get every key while they are mapped.
+    static const std::string query =
+        "repl local n = 0 "
+        "for _ in pairs(__voicetotext_mods or {}) do n = n + 1 end "
+        "local grab = \"-\" "
+        "for _, l in ipairs(hl.get_layers()) do "
+        "if l.mapped and l.interactivity == 1 then grab = \"=\" .. tostring(l.namespace) break end "
+        "end "
+        "return \"vtt \" .. (__voicetotext_mods and 1 or 0) .. \" \" .. n .. \" \" .. grab";
+    std::string reply;
+    if (!request(query, reply)) return false;
+    // "vtt <tracked 0|1> <held modifiers> <-|=namespace>"
+    const std::string answer = trim(reply);
+    if (answer.rfind("vtt ", 0) != 0) return false;
+    std::size_t at = 4;
+    const auto next_field = [&]() {
+        const std::size_t end = answer.find(' ', at);
+        std::string field = answer.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        at = end == std::string::npos ? answer.size() : end + 1;
+        return field;
+    };
+    const std::string tracked = next_field();
+    const std::string held = next_field();
+    const std::string grab = answer.substr((std::min)(at, answer.size()));
+    if ((tracked != "0" && tracked != "1") || held.empty() ||
+        !std::all_of(held.begin(), held.end(), [](unsigned char c) { return std::isdigit(c); }) ||
+        grab.empty() || (grab[0] != '-' && grab[0] != '=')) {
+        return false;
+    }
+    state.tracked = tracked == "1";
+    state.held_modifiers = std::atoi(held.c_str());
+    state.grabbed = grab[0] == '=';
+    state.grabbed_by = state.grabbed ? grab.substr(1) : std::string();
+    return true;
+}
+
 bool active_window(Window& window) {
     std::string reply;
     if (!request("j/activewindow", reply)) return false;
@@ -158,6 +198,12 @@ bool active_window(Window& window) {
 }
 
 bool find_window(std::uintptr_t address, Window& window) {
+    bool exists = false;
+    return lookup_window(address, window, exists) && exists;
+}
+
+bool lookup_window(std::uintptr_t address, Window& window, bool& exists) {
+    exists = false;
     std::string reply;
     if (!request("j/clients", reply)) return false;
     try {
@@ -167,9 +213,11 @@ bool find_window(std::uintptr_t address, Window& window) {
             Window candidate;
             if (parse_window(client, candidate) && candidate.address == address) {
                 window = candidate;
+                exists = true;
                 return true;
             }
         }
+        return true;
     } catch (const nlohmann::json::exception&) {
     }
     return false;

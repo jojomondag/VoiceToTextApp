@@ -42,10 +42,12 @@
 #define AUDIO_LEVEL_TIMER 1
 #define GEMMA_IDLE_TIMER 2
 #define HISTORY_BACKFILL_TIMER 3
+#define PARKED_NOTICE_TIMER 4
 // Gemma gives its graphics memory back after this long without work; the next recording starts it again.
 #define GEMMA_IDLE_MS 300000
-// After Stop, how long held words wait for their window to get focus again.
-#define LIVE_FOCUS_WAIT_MS 10000
+// How long the overlay names the window a finished dictation's last words
+// wait for (the words themselves wait without a time limit).
+#define PARKED_NOTICE_MS 5000
 // An Enter this soon after one was passed on is taken for the same key.
 #define SUBMIT_ECHO_MS 300
 // How often History entries still waiting for the language model are retried.
@@ -895,6 +897,14 @@ bool App::initialize(HINSTANCE hInstance) {
     external_dictation_->set_toggle_hotkey(cfg.toggle_modifiers, cfg.toggle_key);
     external_dictation_->set_diagnostics(dictation_diagnostics_);
     if (!external_dictation_->initialize(hwnd_)) return false;
+#ifndef _WIN32
+    // Runs on the dictation worker; the tray may be used from any thread.
+    external_dictation_->set_parcel_dropped_callback([this](const std::string& window) {
+        if (tray_) tray_->show_notification("VoiceToText",
+            "Fönstret \"" + window + "\" stängdes innan de sista orden skrevs in. "
+            "Hela dikteringen finns i Historik.");
+    });
+#endif
     refresh_live_mode_settings();
     live_mode_processor_ = std::make_unique<LiveModeProcessor>(
         [this](const LiveModeProcessor::Request& request) { return transform_live_mode(request); },
@@ -979,6 +989,9 @@ void App::shutdown() {
     if (hwnd_) KillTimer(hwnd_, AUDIO_LEVEL_TIMER);
 #ifndef _WIN32
     if (hwnd_) KillTimer(hwnd_, GEMMA_IDLE_TIMER);
+    if (hwnd_) KillTimer(hwnd_, PARKED_NOTICE_TIMER);
+    // The tray goes before the dictation worker does: no more notices from it.
+    if (external_dictation_) external_dictation_->set_parcel_dropped_callback(nullptr);
 #endif
     if (hwnd_) KillTimer(hwnd_, HISTORY_BACKFILL_TIMER);
     // The History worker abandons a request in flight (its entry stays
@@ -1143,6 +1156,14 @@ LRESULT CALLBACK App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 self->complete_live_capture();
             }
             if (wParam == HISTORY_BACKFILL_TIMER) self->schedule_history_backfill();
+            if (wParam == PARKED_NOTICE_TIMER) {
+                KillTimer(hwnd, PARKED_NOTICE_TIMER);
+                // Only the notice goes; a dictation started meanwhile keeps its pill.
+                if (!self->recording_ && !self->processing_ && !self->live_session_active_ &&
+                    self->overlay_) {
+                    self->overlay_->hide();
+                }
+            }
 #ifndef _WIN32
             if (wParam == GEMMA_IDLE_TIMER && !self->recording_ && !self->processing_ &&
                 !self->history_llm_busy_ &&
@@ -2506,7 +2527,9 @@ void App::refresh_live_mode_status() {
     };
 #ifndef _WIN32
     if (context.waiting_for_focus) {
-        show("waiting_for_focus", "Väntar på fönstret",
+        const std::string window = context.waiting_for.empty() ? std::string("fönstret")
+                                                               : context.waiting_for;
+        show("waiting_for_focus:" + window, "Väntar på " + window,
              L"Orden skrivs in när du går tillbaka till fönstret där du började.");
     } else
 #endif
@@ -2540,28 +2563,21 @@ void App::complete_live_capture() {
         const auto context = external_dictation_->revision_context();
         if (!context.pending_output) return false;
 #ifndef _WIN32
-        if (context.waiting_for_focus) {
-            // Stop was pressed (or the last words or the language-mode result
-            // arrived) while another window had focus. Wait a short while for
-            // the user to come back, then let go: what was not written stays in
-            // History, and the next dictation is not blocked by a window the
-            // user may never return to.
-            const ULONGLONG now = GetTickCount64();
-            if (!live_focus_wait_started_) live_focus_wait_started_ = now;
-            if (!live_focus_wait_expired_ && now - live_focus_wait_started_ >= LIVE_FOCUS_WAIT_MS) {
-                live_focus_wait_expired_ = true;
-                vtlog("dictation target: gave up waiting for the window after %d s; unwritten text goes to History only",
-                      LIVE_FOCUS_WAIT_MS / 1000);
-                if (dictation_diagnostics_) dictation_diagnostics_->write("held_output_dropped", {
-                    {"capture_session", dictation_session_.load()}});
-                external_dictation_->drop_held();
-                tray_->show_notification("VoiceToText",
-                    "Fönstret där du dikterade fick inte fokus, så det sista skrevs inte in. Hela dikteringen finns i Historik.");
+        if (context.output_held) {
+            // Stop came (or the last words arrived) while the window they
+            // belong in could not take them: it lacks focus, or keys would not
+            // arrive as typed right now (a menu, a held modifier). They wait
+            // for that window with no time limit and the dictation ends now,
+            // so the next one is not held up. History gets all of it.
+            if (!live_output_parked_) {
+                live_output_parked_ = true;
+                const bool taken = external_dictation_->park_held();
+                vtlog("dictation target: last words left waiting for their window%s",
+                      taken ? "" : " (the writer was busy; History may lack them)");
+                if (dictation_diagnostics_) dictation_diagnostics_->write("held_output_parked", {
+                    {"capture_session", dictation_session_.load()}, {"taken", taken}});
             }
-            overlay_->set_status_text("Väntar på fönstret");
-            dictation_window_->set_status(
-                L"Väntar på fönstret där du började. Går du inte tillbaka sparas texten bara i Historik.");
-            return true;
+            return false;
         }
 #endif
         overlay_->set_status_text("Väntar på textfältet...");
@@ -2611,10 +2627,26 @@ void App::hand_off_dictation(const std::string& text) {
 #ifndef _WIN32
     // Asked before hide() takes the queued mark down with the overlay.
     const bool queued_start_seen = start_after_handoff_ && overlay_ && overlay_->queued_start_shown();
+    // Last words left waiting for a window the user is not in: the overlay
+    // names it for a moment and the tray keeps a note (the words themselves
+    // wait without a time limit). Held only for a key or a menu, they go in
+    // within a moment by themselves.
+    std::string waiting_for = external_dictation_->waiting_for();
+    if (!waiting_for.empty() && external_dictation_->target_has_focus()) waiting_for.clear();
+    if (overlay_ && !waiting_for.empty() && !start_after_handoff_) {
+        overlay_->show(OverlayState::Processing, "Väntar på " + waiting_for);
+        SetTimer(hwnd_, PARKED_NOTICE_TIMER, PARKED_NOTICE_MS, nullptr);
+    } else if (overlay_) {
+        overlay_->hide();
+    }
+    if (!waiting_for.empty() && tray_) {
+        tray_->show_notification("VoiceToText",
+            "De sista orden skrivs in när du går tillbaka till " + waiting_for + ".");
+    }
 #else
     const bool queued_start_seen = false;
-#endif
     if (overlay_) overlay_->hide();
+#endif
     const bool delivered = external_dictation_->has_delivered();
     dictation_window_->set_status(text.empty() ? L"Inget tal uppt\u00e4cktes." :
         delivered ? L"Dikteringen har skrivits vid mark\u00f6ren." :
@@ -2912,8 +2944,8 @@ void App::start_recording() {
     mode_switch_policy_.clear();
     live_results_.clear();
     live_result_wait_started_ = 0;
-    live_focus_wait_started_ = 0;
-    live_focus_wait_expired_ = false;
+    live_output_parked_ = false;
+    if (hwnd_) KillTimer(hwnd_, PARKED_NOTICE_TIMER);
     vtlog("direct dictation started: session=%llu", session);
     if (dictation_diagnostics_) dictation_diagnostics_->write("capture_started", {
         {"capture_session", session}, {"model", current_model_size()}});
