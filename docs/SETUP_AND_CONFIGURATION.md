@@ -353,7 +353,8 @@ another one has focus, as the exact characters, and so do language-mode
 rewrites and the Enter that ends a dictation. In any other window the words
 are typed as keys, and only when they arrive as typed: the window has had
 focus for a moment, no layer (the Alt+Tab switcher, a launcher) holds the
-keyboard, and no modifier key is down. Until then they are held (the overlay
+keyboard, and no modifier key is down, nor has either just stopped (the
+switcher moves focus about 100 ms after it closes). Until then they are held (the overlay
 shows **Väntar på** and the window's name) and typed as soon as that window
 can take them; nothing is typed into the window you switched to. Keys cannot
 be sent to a window without focus: Hyprland can address one, but Chromium

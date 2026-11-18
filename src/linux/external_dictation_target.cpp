@@ -341,6 +341,10 @@ struct ExternalDictationTarget::Impl {
     bool modifier_limit_logged = false;
     bool grab_limit_logged = false;
     bool keyboard_unknown_logged = false;
+    // The keyboard check last saw a block (menu, held key), and when it saw
+    // it end (keys wait kSettleMs after that).
+    bool keyboard_blocked = false;
+    std::uint64_t keyboard_freed_at = 0;
     bool modifiers_untracked_logged = false;
 
     std::shared_ptr<DictationDiagnostics> diagnostics;
@@ -541,10 +545,10 @@ struct ExternalDictationTarget::Impl {
     }
 
     // Keys typed now arrive as typed: no layer (Alt+Tab switcher, launcher,
-    // menu) holds the keyboard, and no modifier key is down, which Hyprland
-    // would add to every key the app types. Fails open: when Hyprland cannot
-    // tell, or a block lasts far longer than a menu or a key press does, keys
-    // are typed anyway and the log says so.
+    // menu) holds the keyboard, no modifier key is down (Hyprland would add
+    // it to every key the app types), and neither has just ended. Fails open:
+    // when Hyprland cannot tell, or a block lasts far longer than a menu or a
+    // key press does, keys are typed anyway and the log says so.
     bool keyboard_free(std::string& reason) {
         if (!hyprland::available()) return true;
         hyprland::KeyboardState state;
@@ -554,18 +558,19 @@ struct ExternalDictationTarget::Impl {
                 vtlog("dictation target: Hyprland did not report the keyboard state; typing without that check");
             }
             modifiers_since = grab_since = 0;
+            keyboard_blocked = false;
+            keyboard_freed_at = 0;
             return true;
         }
         keyboard_unknown_logged = false;
         const std::uint64_t now = steady_ms();
+        std::string blocked_by;
         if (state.grabbed) {
             if (!grab_since) grab_since = now;
             if (now - grab_since < kGrabLimitMs) {
-                reason = "keyboard held by " +
+                blocked_by = "keyboard held by " +
                     (state.grabbed_by.empty() ? std::string("a layer") : state.grabbed_by);
-                return false;
-            }
-            if (!grab_limit_logged) {
+            } else if (!grab_limit_logged) {
                 grab_limit_logged = true;
                 vtlog("dictation target: %s has held the keyboard for %llu s; typing anyway",
                       state.grabbed_by.c_str(),
@@ -583,10 +588,8 @@ struct ExternalDictationTarget::Impl {
         if (state.tracked && state.held_modifiers > 0) {
             if (!modifiers_since) modifiers_since = now;
             if (now - modifiers_since < kModifierLimitMs) {
-                reason = "a modifier key is held";
-                return false;
-            }
-            if (!modifier_limit_logged) {
+                if (blocked_by.empty()) blocked_by = "a modifier key is held";
+            } else if (!modifier_limit_logged) {
                 modifier_limit_logged = true;
                 vtlog("dictation target: a modifier key has been reported held for %llu s; "
                       "taking it for a lost release and typing anyway",
@@ -596,6 +599,24 @@ struct ExternalDictationTarget::Impl {
             modifiers_since = 0;
             modifier_limit_logged = false;
         }
+        if (!blocked_by.empty()) {
+            keyboard_blocked = true;
+            reason = blocked_by;
+            return false;
+        }
+        // Just ended: the Alt+Tab switcher hands focus back to the previous
+        // window when it closes (on Alt's release) and moves it to the chosen
+        // one about 100 ms later, so keys wait a moment, as after a change of
+        // focus.
+        if (keyboard_blocked) {
+            keyboard_blocked = false;
+            keyboard_freed_at = now;
+        }
+        if (keyboard_freed_at && now - keyboard_freed_at < kSettleMs) {
+            reason = "a menu just closed or a key came up";
+            return false;
+        }
+        keyboard_freed_at = 0;
         return true;
     }
 
